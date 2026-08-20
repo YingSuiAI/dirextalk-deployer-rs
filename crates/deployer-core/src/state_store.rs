@@ -19,8 +19,10 @@ use crate::{CoreError, DeploymentState, NodePaths, PlanDigest, Result, canonical
 /// a canonical SHA-256 integrity digest.
 pub struct StateStore {
     paths: NodePaths,
-    _lock: File,
+    lock: File,
     seal_key: Zeroizing<[u8; 32]>,
+    directory_identity: FilesystemIdentity,
+    lock_identity: FilesystemIdentity,
 }
 
 impl StateStore {
@@ -44,12 +46,18 @@ impl StateStore {
         })?;
         validate_owner(paths.root())?;
         validate_owner_file(&lock)?;
+        let directory_identity = path_identity(paths.root())?;
+        let lock_identity = file_identity(&lock)?;
         let seal_key = load_or_create_seal_key(&paths)?;
-        Ok(Self {
+        let store = Self {
             paths,
-            _lock: lock,
+            lock,
             seal_key,
-        })
+            directory_identity,
+            lock_identity,
+        };
+        store.revalidate_filesystem_identity()?;
+        Ok(store)
     }
 
     #[must_use]
@@ -64,6 +72,7 @@ impl StateStore {
     /// Returns an error for unsafe files, wrong ownership, malformed state,
     /// broken invariants, failed integrity, or filesystem failure.
     pub fn read(&self) -> Result<Option<DeploymentState>> {
+        self.revalidate_filesystem_identity()?;
         let path = self.paths.state_file();
         reject_symlink(&path)?;
         let mut file = match open_read_restricted(&path) {
@@ -95,6 +104,7 @@ impl StateStore {
     /// Returns an error if state invariants fail, the service id differs from
     /// the locked path, or an atomic filesystem operation fails.
     pub fn write(&self, state: &DeploymentState) -> Result<()> {
+        self.revalidate_filesystem_identity()?;
         state.validate()?;
         if state.service_id
             != self
@@ -133,6 +143,66 @@ impl StateStore {
         sync_directory(self.paths.root())?;
         Ok(())
     }
+
+    fn revalidate_filesystem_identity(&self) -> Result<()> {
+        reject_symlink(self.paths.root())?;
+        reject_symlink(&self.paths.lock_file())?;
+        if path_identity(self.paths.root())? != self.directory_identity
+            || path_identity(&self.paths.lock_file())? != self.lock_identity
+        {
+            return Err(CoreError::UnsafeFilesystemObject);
+        }
+        validate_owner(self.paths.root())?;
+        validate_owner_file(&self.lock)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilesystemIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilesystemIdentity;
+
+#[cfg(unix)]
+fn path_identity(path: &Path) -> Result<FilesystemIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).map_err(|error| CoreError::io("inspect identity", error))?;
+    Ok(FilesystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn path_identity(path: &Path) -> Result<FilesystemIdentity> {
+    fs::metadata(path).map_err(|error| CoreError::io("inspect identity", error))?;
+    Ok(FilesystemIdentity)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &File) -> Result<FilesystemIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| CoreError::io("inspect identity", error))?;
+    Ok(FilesystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(file: &File) -> Result<FilesystemIdentity> {
+    file.metadata()
+        .map_err(|error| CoreError::io("inspect identity", error))?;
+    Ok(FilesystemIdentity)
 }
 
 #[derive(Serialize)]
@@ -484,6 +554,22 @@ mod tests {
         assert_eq!(state_mode, 0o600);
         assert_eq!(lock_mode, 0o600);
         assert_eq!(key_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_same_name_directory_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let service_id = "production-0123456789ab";
+        let store = StateStore::open(temporary.path(), service_id).unwrap();
+        let original = temporary.path().join(service_id);
+        let displaced = temporary.path().join("displaced-service");
+        fs::rename(&original, &displaced).unwrap();
+        fs::create_dir(&original).unwrap();
+        assert!(matches!(
+            store.write(&state(service_id)),
+            Err(CoreError::UnsafeFilesystemObject)
+        ));
     }
 
     #[test]
