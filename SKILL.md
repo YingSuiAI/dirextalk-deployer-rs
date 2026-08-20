@@ -27,7 +27,7 @@ plan digest. Never infer approval from an older plan.
    must fail closed when local Agent detection is ambiguous or unknown; resolve
    the ambiguity or use one exact supported Agent name instead of guessing.
 2. Run `auth login`, let the operator finish OAuth only in Google's browser,
-   then use `auth status` and `project inspect` to verify the principal and
+   then use `auth status` and `project inspect` to verify authentication and
    immutable project identity.
 3. Run `deploy plan --config <deployment.toml>`. Review identity, location,
    DNS, exact release, estimate, and effects.

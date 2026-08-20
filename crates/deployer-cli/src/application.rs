@@ -121,12 +121,13 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                         .flatten();
                     let plan = build_plan(&config, observations, existing_state.as_ref())?;
                     let digest = plan.digest()?;
+                    let public_plan = privacy_minimized_output(&plan)?;
                     CommandEnvelope::success(
                         command_name(cli),
                         "DEPLOY_PLAN_READY",
                         "Deployment plan is ready for explicit approval.",
                     )
-                    .with_data(json!({ "plan_id": digest, "plan": plan }))
+                    .with_data(json!({ "plan_id": digest, "plan": public_plan }))
                     .map_err(|_| EngineError::Backend("plan output could not be encoded".into()))
                 }
                 DeployCommand::Apply(args) => {
@@ -165,12 +166,13 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                     let config = load_config(&args.config)?;
                     let store = self.stores.open_for_config(&config)?;
                     let state = Orchestrator::new(self.control, &store).status()?;
+                    let public_state = privacy_minimized_output(&state)?;
                     CommandEnvelope::success(
                         command_name(cli),
                         "DEPLOY_STATUS",
                         "Deployment status loaded from authenticated local state.",
                     )
-                    .with_data(json!({ "state": state }))
+                    .with_data(json!({ "state": public_state }))
                     .map_err(|_| EngineError::Backend("status output could not be encoded".into()))
                 }
                 DeployCommand::Verify(args) => {
@@ -192,12 +194,13 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                     let plan = orchestrator.plan_destroy(args.purge_disk).await?;
                     let digest = plan.digest()?;
                     let Some(approval) = &args.approve else {
+                        let public_plan = privacy_minimized_output(&plan)?;
                         return CommandEnvelope::waiting(
                             command_name(cli),
                             "DESTROY_APPROVAL_REQUIRED",
                             "Review the exact destroy plan and approve its SHA-256 digest.",
                         )
-                        .with_data(json!({ "plan_id": digest, "plan": plan }))
+                        .with_data(json!({ "plan_id": digest, "plan": public_plan }))
                         .map_err(|_| {
                             EngineError::Backend("destroy plan output could not be encoded".into())
                         });
@@ -294,6 +297,26 @@ fn success(command: &str, result: SafeResult) -> EngineResult<CommandEnvelope> {
     CommandEnvelope::success(command, result.code, result.message)
         .with_data(result.data)
         .map_err(|_| EngineError::Backend("command output could not be encoded".into()))
+}
+
+fn privacy_minimized_output(value: &impl Serialize) -> EngineResult<Value> {
+    let mut value = serde_json::to_value(value)
+        .map_err(|_| EngineError::Backend("command output could not be encoded".into()))?;
+    remove_oauth_principal(&mut value);
+    Ok(value)
+}
+
+fn remove_oauth_principal(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.remove("oauth_principal");
+            for value in fields.values_mut() {
+                remove_oauth_principal(value);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(remove_oauth_principal),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn completion_envelope(command: &str, completion: Completion) -> EngineResult<CommandEnvelope> {
@@ -406,5 +429,19 @@ mod tests {
                 .expect("JSON")
                 .contains("secret")
         );
+    }
+
+    #[test]
+    fn public_output_recursively_omits_opaque_oauth_subjects() {
+        let output = privacy_minimized_output(&json!({
+            "project_identity": { "oauth_principal": "opaque-subject", "project_id": "p" },
+            "nested": [{ "oauth_principal": "other-subject" }]
+        }))
+        .expect("redacted output");
+        let encoded = serde_json::to_string(&output).expect("JSON");
+
+        assert!(!encoded.contains("oauth_principal"));
+        assert!(!encoded.contains("opaque-subject"));
+        assert!(!encoded.contains("other-subject"));
     }
 }

@@ -51,9 +51,11 @@ installed-public-client
 loopback-redirect
 pkce-s256
 openid
-email
 https://www.googleapis.com/auth/cloud-platform
 ```
+
+This exact scope-review input hashes to
+`fa675cfc945cff1bba0f69617589fe3d867947d7af61e065926b320252d8e50e`.
 
 The only release secret is
 `DIREXTALK_RELEASE_ED25519_SEED_HEX`: one raw 32-byte Ed25519 seed encoded as

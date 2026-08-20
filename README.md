@@ -77,13 +77,18 @@ dirextalk-deployer project inspect --project <project-id>
 Google authentication only in that browser. Do not paste authorization codes
 or tokens into chat, configuration, shell arguments, or issue reports. Tokens
 are kept in the operating-system credential facility, not deployment state.
+The product-owned OAuth client ID is compiled into the release; end users
+supply neither an OAuth client ID nor a client secret. Authorization requests
+only `openid` and Google Cloud access—never email, name, or profile scopes. The
+opaque Google subject is retained only for account continuity and is not
+emitted by CLI output.
 Use `dirextalk-deployer auth logout` to remove the local OAuth session.
 
 ## Plan and apply
 
-Planning is read-only. Review the authenticated principal, project id and
-number, location, observed DNS, exact releases, estimated cost, and every
-resource effect before approving it.
+Planning is read-only. Review the authentication status, project id and number,
+location, observed DNS, exact releases, estimated cost, and every resource
+effect before approving it.
 
 ```text
 dirextalk-deployer deploy plan --config <deployment.toml>

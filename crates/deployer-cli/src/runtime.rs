@@ -75,7 +75,7 @@ pub struct LiveControlPlane {
 impl LiveControlPlane {
     pub fn new() -> Result<Self> {
         crate::ensure_tls_provider();
-        let config = InstalledAppConfig::from_environment().map_err(gcp_error)?;
+        let config = InstalledAppConfig::from_build().map_err(gcp_error)?;
         let base = BaseDirs::new()
             .ok_or_else(|| EngineError::State("current user home is unavailable".into()))?;
         let service = "dirextalk-deployer-gcp-v1";
@@ -287,10 +287,7 @@ impl ControlPlane for LiveControlPlane {
         Ok(SafeResult::new(
             "AUTH_LOGIN_COMPLETE",
             "Browser OAuth login completed and the refresh credential was stored securely.",
-            json!({
-                "principal": token.principal,
-                "verified_email": token.verified_email,
-            }),
+            json!({ "authenticated": !token.principal.is_empty() }),
         ))
     }
 
@@ -299,10 +296,7 @@ impl ControlPlane for LiveControlPlane {
         Ok(SafeResult::new(
             "AUTHENTICATED",
             "A usable Google OAuth session is available.",
-            json!({
-                "principal": token.principal,
-                "verified_email": token.verified_email,
-            }),
+            json!({ "authenticated": !token.principal.is_empty() }),
         ))
     }
 

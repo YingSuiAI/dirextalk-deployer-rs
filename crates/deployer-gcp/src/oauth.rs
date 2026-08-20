@@ -30,16 +30,10 @@ pub struct InstalledAppConfig {
 }
 
 impl InstalledAppConfig {
-    /// Resolves the native public client id without embedding a credential.
-    /// Release builds may provide `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID` at compile
-    /// time; development may set the same name at runtime.
-    pub fn from_environment() -> Result<Self> {
-        let compiled = option_env!("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID");
-        let runtime = compiled
-            .is_none()
-            .then(|| std::env::var("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID").ok())
-            .flatten();
-        let client_id = resolve_client_id(compiled, runtime.as_deref())?;
+    /// Resolves the product-owned native public client id embedded by the
+    /// build. Runtime user input and environment overrides are never accepted.
+    pub fn from_build() -> Result<Self> {
+        let client_id = resolve_client_id(option_env!("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID"))?;
         Self::google(client_id)
     }
 
@@ -49,7 +43,6 @@ impl InstalledAppConfig {
             client_secret: None,
             scopes: vec![
                 "openid".into(),
-                "email".into(),
                 "https://www.googleapis.com/auth/cloud-platform".into(),
             ],
             authorization_endpoint: Url::parse("https://accounts.google.com/o/oauth2/v2/auth")?,
@@ -61,21 +54,15 @@ impl InstalledAppConfig {
     }
 }
 
-fn resolve_client_id(compiled: Option<&str>, runtime: Option<&str>) -> Result<String> {
+fn resolve_client_id(compiled: Option<&str>) -> Result<String> {
     match compiled {
         Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
         Some(_) => Err(GcpError::Contract(
             "embedded Google OAuth client id is empty".into(),
         )),
-        None => runtime
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                GcpError::Contract(
-                    "Google OAuth client id is not configured; set DIREXTALK_GOOGLE_OAUTH_CLIENT_ID for development or embed it in the release build"
-                        .into(),
-                )
-            }),
+        None => Err(GcpError::Contract(
+            "Google OAuth client id is not embedded in this product build".into(),
+        )),
     }
 }
 
@@ -128,8 +115,6 @@ pub struct OAuthToken {
     /// Stable Google OIDC subject (`sub`) used for authorization
     /// and persisted identity comparisons.
     pub principal: String,
-    /// Verified Google account email for human-readable output only.
-    pub verified_email: String,
     pub expires_at: Option<Instant>,
 }
 
@@ -143,8 +128,7 @@ impl std::fmt::Debug for OAuthToken {
         formatter
             .debug_struct("OAuthToken")
             .field("access_token", &"[REDACTED]")
-            .field("principal", &self.principal)
-            .field("verified_email", &self.verified_email)
+            .field("principal", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -161,20 +145,12 @@ struct TokenResponse {
 struct UserInfo {
     #[serde(default)]
     sub: String,
-    email: String,
-    email_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum TokenFlow {
     Login,
     Refresh,
-}
-
-#[derive(Debug)]
-struct ValidatedUserIdentity {
-    principal: String,
-    verified_email: String,
 }
 
 impl GoogleInstalledApp {
@@ -406,7 +382,7 @@ impl GoogleInstalledApp {
         user: UserInfo,
         flow: TokenFlow,
     ) -> Result<OAuthToken> {
-        let identity = validate_user_info(user)?;
+        let principal = validate_user_info(user)?;
         match (flow, token.refresh_token.as_ref()) {
             (TokenFlow::Login, None) => {
                 return Err(GcpError::Authentication(
@@ -422,8 +398,7 @@ impl GoogleInstalledApp {
         }
         Ok(OAuthToken {
             access_token: token.access_token,
-            principal: identity.principal,
-            verified_email: identity.verified_email,
+            principal,
             expires_at: token
                 .expires_in
                 .map(|seconds| Instant::now() + Duration::from_secs(seconds)),
@@ -482,21 +457,13 @@ fn token_is_usable(token: &OAuthToken, now: Instant) -> bool {
         .is_some_and(|expires_at| expires_at > now + ACCESS_TOKEN_EXPIRY_MARGIN)
 }
 
-fn validate_user_info(user: UserInfo) -> Result<ValidatedUserIdentity> {
+fn validate_user_info(user: UserInfo) -> Result<String> {
     if user.sub.trim().is_empty() {
         return Err(GcpError::Authentication(
             "Google userinfo subject was missing".into(),
         ));
     }
-    if user.email_verified != Some(true) || user.email.trim().is_empty() {
-        return Err(GcpError::Authentication(
-            "Google account email is not verified".into(),
-        ));
-    }
-    Ok(ValidatedUserIdentity {
-        principal: user.sub,
-        verified_email: user.email,
-    })
+    Ok(user.sub)
 }
 
 fn unique_parameter(values: &[(String, String)], key: &str) -> Result<Option<String>> {
@@ -716,11 +683,9 @@ mod tests {
         }
     }
 
-    fn user(sub: &str, email: &str) -> UserInfo {
+    fn user(sub: &str) -> UserInfo {
         UserInfo {
             sub: sub.to_owned(),
-            email: email.to_owned(),
-            email_verified: Some(true),
         }
     }
 
@@ -753,18 +718,13 @@ mod tests {
     }
 
     #[test]
-    fn compiled_client_id_is_authoritative_over_runtime_environment() {
+    fn client_id_must_be_embedded_by_the_product_build() {
         assert_eq!(
-            resolve_client_id(Some("audited-compiled-id"), Some("runtime-override"))
-                .expect("compiled id"),
+            resolve_client_id(Some("audited-compiled-id")).expect("compiled id"),
             "audited-compiled-id"
         );
-        assert_eq!(
-            resolve_client_id(None, Some("development-runtime-id")).expect("development id"),
-            "development-runtime-id"
-        );
-        assert!(resolve_client_id(Some(""), Some("runtime-override")).is_err());
-        assert!(resolve_client_id(None, None).is_err());
+        assert!(resolve_client_id(Some("")).is_err());
+        assert!(resolve_client_id(None).is_err());
     }
 
     #[test]
@@ -818,28 +778,18 @@ mod tests {
 
     #[test]
     fn userinfo_rejects_missing_and_empty_subject() {
-        for raw in [
-            r#"{"email":"operator@example.com","email_verified":true}"#,
-            r#"{"sub":"","email":"operator@example.com","email_verified":true}"#,
-        ] {
+        for raw in [r"{}", r#"{"sub":""}"#] {
             let user: UserInfo = serde_json::from_str(raw).expect("userinfo shape");
             let error = validate_user_info(user).expect_err("subject is required");
             assert!(matches!(error, GcpError::Authentication(_)));
-            assert!(!format!("{error:?}").contains("operator@example.com"));
         }
     }
 
     #[test]
-    fn oauth_principal_is_stable_subject_not_mutable_email() {
-        let before = validate_user_info(user("stable-subject-123", "old@example.com"))
-            .expect("valid identity");
-        let after = validate_user_info(user("stable-subject-123", "new@example.com"))
-            .expect("valid identity");
+    fn oauth_principal_is_the_opaque_stable_subject() {
+        let principal = validate_user_info(user("stable-subject-123")).expect("valid identity");
 
-        assert_eq!(before.principal, "stable-subject-123");
-        assert_eq!(before.principal, after.principal);
-        assert_eq!(before.verified_email, "old@example.com");
-        assert_eq!(after.verified_email, "new@example.com");
+        assert_eq!(principal, "stable-subject-123");
     }
 
     #[test]
@@ -850,7 +800,7 @@ mod tests {
         let error = app
             .complete_token(
                 token(Some("new-account-refresh")),
-                user("", "new@example.com"),
+                user(""),
                 TokenFlow::Login,
             )
             .expect_err("invalid subject must fail");
@@ -868,11 +818,7 @@ mod tests {
         let app = app_with_secrets(secrets.clone());
 
         let error = app
-            .complete_token(
-                token(None),
-                user("new-subject", "new@example.com"),
-                TokenFlow::Login,
-            )
+            .complete_token(token(None), user("new-subject"), TokenFlow::Login)
             .expect_err("login without refresh token must fail");
 
         assert_eq!(secrets.value().as_deref(), Some("old-account-refresh"));
@@ -886,11 +832,7 @@ mod tests {
         let app = app_with_secrets(secrets.clone());
 
         let refreshed = app
-            .complete_token(
-                token(None),
-                user("stable-subject", "operator@example.com"),
-                TokenFlow::Refresh,
-            )
+            .complete_token(token(None), user("stable-subject"), TokenFlow::Refresh)
             .expect("refresh without token rotation");
 
         assert_eq!(refreshed.principal, "stable-subject");
@@ -903,12 +845,12 @@ mod tests {
         let token = OAuthToken {
             access_token: SecretString::from("access-token-secret"),
             principal: "stable-subject".into(),
-            verified_email: "operator@example.com".into(),
             expires_at: None,
         };
 
         let debug = format!("{token:?}");
         assert!(!debug.contains("access-token-secret"));
+        assert!(!debug.contains("stable-subject"));
         assert!(debug.contains("[REDACTED]"));
     }
 
@@ -918,7 +860,6 @@ mod tests {
         let token = |expires_at| OAuthToken {
             access_token: SecretString::from("access-token-secret"),
             principal: "stable-subject".into(),
-            verified_email: "operator@example.com".into(),
             expires_at,
         };
 
