@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YingSuiAI/dirextalk-deployer-rs/blob/main/packaging/release-manifest.schema.json",
+  "title": "Dirextalk Deployer release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release",
+    "source_repository",
+    "source_revision",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "release": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source_repository": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["component", "file", "sha256", "size_bytes", "target"],
+        "properties": {
+          "component": {
+            "enum": ["cli", "host-installer"]
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "target": {
+            "enum": [
+              "x86_64-pc-windows-msvc",
+              "x86_64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,147 @@
+name: Stable release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-amd64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - label: windows-amd64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - label: macos-amd64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar
+          - label: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate stable tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-list -n 1 "${tag}")" = "${GITHUB_SHA}"
+
+      - name: Install pinned Rust toolchain and target
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build CLI
+        run: cargo build --locked --release -p deployer-cli --target ${{ matrix.target }}
+
+      - name: Build Linux host installer
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --locked --release -p deployer-host --bin dirextalk-host-installer --target ${{ matrix.target }}
+
+      - name: Package Unix artifacts
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/release"
+          cli_dir="${RUNNER_TEMP}/dirextalk-deployer"
+          mkdir -p "${release_dir}" "${cli_dir}"
+          cp "target/${{ matrix.target }}/release/dirextalk-deployer" "${cli_dir}/"
+          cp LICENSE README.md "${cli_dir}/"
+          tar -C "${cli_dir}" -czf "${release_dir}/dirextalk-deployer-${GITHUB_REF_NAME}-${{ matrix.label }}.tar.gz" .
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            host_dir="${RUNNER_TEMP}/dirextalk-host-installer"
+            mkdir -p "${host_dir}"
+            cp "target/${{ matrix.target }}/release/dirextalk-host-installer" "${host_dir}/"
+            cp LICENSE "${host_dir}/"
+            tar -C "${host_dir}" -czf "${release_dir}/dirextalk-host-installer-${GITHUB_REF_NAME}-linux-amd64.tar.gz" .
+          fi
+
+      - name: Package Windows artifact
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:RUNNER_TEMP "release"
+          $cliDir = Join-Path $env:RUNNER_TEMP "dirextalk-deployer"
+          New-Item -ItemType Directory -Force -Path $releaseDir, $cliDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/dirextalk-deployer.exe" $cliDir
+          Copy-Item "LICENSE", "README.md" $cliDir
+          $archive = Join-Path $releaseDir "dirextalk-deployer-$env:GITHUB_REF_NAME-${{ matrix.label }}.zip"
+          Compress-Archive -Path (Join-Path $cliDir "*") -DestinationPath $archive
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.label }}
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish immutable release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate artifacts and create checksums and manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          test "${RELEASE_TAG}" = "v${manifest_version}"
+          python3 packaging/create_release_manifest.py release-assets
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} already exists; refusing to mutate it" >&2
+            exit 1
+          fi
+          printf 'Source revision: %s\n\nVerify every archive with SHA256SUMS and release-manifest.json before use.\n' "${GITHUB_SHA}" > release-notes.md
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --verify-tag \
+            --title "Dirextalk Deployer ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            --latest

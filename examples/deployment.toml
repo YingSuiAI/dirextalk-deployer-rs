@@ -1,0 +1,33 @@
+# Configuration schema version. Unknown fields are rejected.
+schema_version = 1
+
+# Replace every example value. The project must already exist and have billing.
+deployment_name = "production"
+project_id = "existing-paid-project"
+region = "us-central1"
+zone = "us-central1-a"
+domain = "chat.example.com"
+
+# auto uses an existing matching public Cloud DNS zone and otherwise waits for
+# one external A record. Other allowed values are cloud_dns and external.
+dns_mode = "auto"
+
+machine_type = "e2-custom-2-4096"
+boot_disk_size_gib = 50
+boot_disk_type = "pd-balanced"
+
+# Use the operator's real public IPv4 as a single-host /32; never use 0.0.0.0/0.
+operator_ssh_cidr = "203.0.113.42/32"
+
+# Planning stops above this estimate. This is not a GCP billing cap.
+maximum_monthly_usd = 150.0
+
+# stable is resolved and pinned by the plan; an exact supported release is also
+# accepted. Never use a mutable or development identifier for production.
+release = "stable"
+
+# Install and verify the service-scoped dirextalk-connect bridge on this host.
+local_connect_agent = true
+
+# This file must contain no OAuth token, app code, Matrix/agent token, SSH key,
+# service-account key, payment information, or other secret.
