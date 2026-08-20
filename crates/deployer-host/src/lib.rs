@@ -14,7 +14,9 @@ use std::io::Write;
 use std::io::{Cursor, Read};
 use std::net::Ipv4Addr;
 #[cfg(target_family = "unix")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(target_family = "unix")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -44,7 +46,6 @@ const RUNTIME_ROOT: &str = "/var/dirextalk-message-server";
 const COMPOSE_PATH: &str = "/var/dirextalk-message-server/docker-compose.yml";
 #[cfg(target_os = "linux")]
 const COMPOSE_PROJECT: &str = "dirextalk-p2p";
-#[cfg(target_os = "linux")]
 const UPDATER_CONFIG: &[u8] = br#"{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","caddy_mode":"compose","compose_project":"dirextalk-p2p","watchdog_enabled":false}"#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -418,6 +419,7 @@ impl ImageReference {
         self.validate_repository_and_tag()
     }
 
+    #[cfg(target_os = "linux")]
     fn digest_reference(&self) -> String {
         self.tag.as_ref().map_or_else(
             || format!("{}@sha256:{}", self.repository, self.digest.as_str()),
@@ -633,6 +635,7 @@ pub struct RuntimeSpec<'a> {
 }
 
 impl<'a> StepInput<'a> {
+    #[cfg(target_os = "linux")]
     fn artifact(self) -> Result<&'a [u8], BackendError> {
         match self {
             Self::Artifact(bytes) => Ok(bytes),
@@ -642,6 +645,7 @@ impl<'a> StepInput<'a> {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn image(self) -> Result<&'a ImageReference, BackendError> {
         match self {
             Self::Image(image) => Ok(image),
@@ -651,6 +655,7 @@ impl<'a> StepInput<'a> {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn runtime(self) -> Result<RuntimeSpec<'a>, BackendError> {
         match self {
             Self::Runtime(runtime) => Ok(runtime),
