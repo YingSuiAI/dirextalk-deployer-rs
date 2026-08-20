@@ -23,7 +23,9 @@ plan digest. Never infer approval from an older plan.
 ## Lifecycle
 
 1. Copy `examples/deployment.toml` outside the repository and replace all
-   example values. Never add secrets to the config.
+   example values. Never add secrets to the config. `connect_agent = "auto"`
+   must fail closed when local Agent detection is ambiguous or unknown; resolve
+   the ambiguity or use one exact supported Agent name instead of guessing.
 2. Run `auth login`, let the operator finish OAuth only in Google's browser,
    then use `auth status` and `project inspect` to verify the principal and
    immutable project identity.
@@ -38,8 +40,8 @@ plan digest. Never infer approval from an older plan.
    record, wait for propagation, and resume. A conflicting record requires a
    new plan and approval.
 7. Run `deploy verify`, then `connect install`, `connect status`, and
-   `connect doctor`. Verification must remain read-only and must not send
-   normal chat.
+   `connect doctor` when `install_connect = true`. Verification must remain
+   read-only and must not send normal chat.
 8. To stop the node, run unapproved `deploy destroy` to obtain the destroy
    plan, explain retained resources, then use its exact digest only after
    authorization. Confirm deletion with status and GCP read-back.

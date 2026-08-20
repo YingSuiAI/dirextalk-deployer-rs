@@ -46,6 +46,13 @@ an exact supported release identifier when reproducibility requires a specific
 version. `maximum_monthly_usd` makes planning fail when the estimate exceeds
 the operator's limit; it does not cap the GCP bill.
 
+`connect_agent = "auto"` detects one supported local Agent runtime. Detection
+fails closed when the result is ambiguous or unknown; it never guesses or
+generates a generic fallback. Resolve the ambiguity or set the exact supported
+Agent name, then rerun. `install_connect = true` installs and verifies the
+service-scoped `dirextalk-connect` bridge; set it to `false` only when local
+installation is intentionally deferred.
+
 ## Authenticate and inspect the project
 
 ```text
@@ -104,7 +111,7 @@ plan if replacement is intended.
 ## Verify and connect locally
 
 After apply or resume completes, run the product verification and install the
-service-scoped local `dirextalk-connect` bridge enabled by the config:
+service-scoped local `dirextalk-connect` bridge enabled by `install_connect`:
 
 ```text
 dirextalk-deployer deploy verify --config <deployment.toml>

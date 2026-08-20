@@ -26,8 +26,12 @@ maximum_monthly_usd = 150.0
 # accepted. Never use a mutable or development identifier for production.
 release = "stable"
 
+# Detect exactly one supported local Agent. Auto detection fails closed instead
+# of guessing when the result is ambiguous or unknown.
+connect_agent = "auto"
+
 # Install and verify the service-scoped dirextalk-connect bridge on this host.
-local_connect_agent = true
+install_connect = true
 
 # This file must contain no OAuth token, app code, Matrix/agent token, SSH key,
 # service-account key, payment information, or other secret.
