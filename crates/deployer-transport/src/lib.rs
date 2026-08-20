@@ -118,7 +118,6 @@ pub enum FixedRemoteCommand {
     RunHostInstaller { request_sha256: Sha256Digest },
     VerifyCanonicalRuntime,
     VerifyHttps { name: DnsName },
-    VerifyTurnTls { name: DnsName },
     VerifyUpdater,
     AuthoritativeDns { server: IpAddr, name: DnsName },
     RecursiveDns { resolver: IpAddr, name: DnsName },
@@ -137,11 +136,6 @@ impl FixedRemoteCommand {
             ),
             Self::VerifyHttps { name } => format!(
                 "/usr/bin/curl --fail --silent --show-error --max-time 10 https://{}/_matrix/client/versions",
-                name.hostname()
-            ),
-            Self::VerifyTurnTls { name } => format!(
-                "/usr/bin/timeout 10 /usr/bin/openssl s_client -connect {}:5349 -servername {} -brief",
-                name.hostname(),
                 name.hostname()
             ),
             Self::VerifyUpdater => String::from(
@@ -329,6 +323,28 @@ impl HostTransport for SshClient {
         file.fsync()?;
         drop(file);
         sftp.rename(&temporary, final_path, None)?;
+        let mut uploaded = sftp.open(final_path)?;
+        let mut hasher = Sha256::new();
+        let mut total = 0usize;
+        let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let count = uploaded.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            total = total
+                .checked_add(count)
+                .ok_or(TransportError::UploadVerification)?;
+            if total > bytes.len() {
+                return Err(TransportError::UploadVerification);
+            }
+            hasher.update(&buffer[..count]);
+        }
+        if total != bytes.len()
+            || format!("{:x}", hasher.finalize()) != Sha256Digest::calculate(bytes).as_str()
+        {
+            return Err(TransportError::UploadVerification);
+        }
         Ok(())
     }
 
@@ -468,6 +484,8 @@ pub enum TransportError {
     UnsupportedHostKeyAlgorithm,
     #[error("SSH authentication failed")]
     Authentication,
+    #[error("uploaded artifact size or digest verification failed")]
+    UploadVerification,
     #[error("invalid SHA-256 digest")]
     InvalidDigest,
     #[error("invalid DNS name")]

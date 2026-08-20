@@ -35,6 +35,12 @@ fn main() -> ExitCode {
             },
         },
     };
+    if matches!(outcome, InstallOutcome::Success(_))
+        && let Err(error) = fs::remove_file(RECEIPT_KEY_PATH)
+    {
+        eprintln!("infrastructure_failure: remove staged receipt key: {error}");
+        return ExitCode::from(1);
+    }
     match &outcome {
         InstallOutcome::Success(receipt) => print_json(receipt),
         InstallOutcome::WaitingUser { reason } => eprintln!("waiting_user: {reason}"),
@@ -80,8 +86,6 @@ fn load_inputs() -> Result<StagedInputs, String> {
         )
         .map_err(|error| format!("read receipt key: {error}"))?,
     );
-    fs::remove_file(RECEIPT_KEY_PATH)
-        .map_err(|error| format!("remove staged receipt key: {error}"))?;
     Ok(StagedInputs {
         request,
         bundle,

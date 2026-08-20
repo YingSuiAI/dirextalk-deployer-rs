@@ -9,9 +9,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Cursor, Read, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
@@ -21,11 +22,18 @@ pub const REQUEST_PATH: &str = "/var/tmp/dirextalk-install-request.json";
 pub const BUNDLE_PATH: &str = "/var/tmp/dirextalk-release-bundle.tar";
 pub const RECEIPT_KEY_PATH: &str = "/var/tmp/dirextalk-receipt.key";
 pub const RECEIPT_PATH: &str = "/var/lib/dirextalk/install-receipt.json";
+pub const POSTGRES_UTILITY_DIGEST: &str =
+    "691673308c99d2161ba298736f3147f1f22d79de2fb7ec93ae9b4afcab870b62";
+pub const CADDY_DIGEST: &str = "844f60b64e4724a5aa8245e019dace0d3f199f7433ce6c57676cb30a920dbad9";
+pub const COTURN_DIGEST: &str = "e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346be";
 
 pub const MAX_RELEASE_BUNDLE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_INSTALL_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RECEIPT_KEY_BYTES: usize = 4 * 1024;
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+const RUNTIME_ROOT: &str = "/var/dirextalk-message-server";
+const COMPOSE_PATH: &str = "/var/dirextalk-message-server/docker-compose.yml";
+const COMPOSE_PROJECT: &str = "dirextalk-p2p";
 const UPDATER_CONFIG: &[u8] = br#"{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","caddy_mode":"compose","compose_project":"dirextalk-p2p","watchdog_enabled":false}"#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,6 +48,14 @@ pub struct InstallRequest {
     pub manifest_sha256: DigestHex,
     pub release_signing_public_key: PublicKeyHex,
     pub receipt_key_sha256: DigestHex,
+    pub domain: String,
+    pub public_ipv4: Ipv4Addr,
+    pub region: String,
+    pub release_catalog_origin: String,
+    pub account_generation: u64,
+    pub authoritative_dns_ipv4: Ipv4Addr,
+    pub public_recursive_dns_ipv4: Ipv4Addr,
+    pub updater: UpdaterIdentity,
 }
 
 impl InstallRequest {
@@ -52,6 +68,22 @@ impl InstallRequest {
         if self.target != HostTarget::LinuxAmd64 {
             return Err(InstallError::InvalidRequest("target must be linux_amd64"));
         }
+        validate_dns_name(&self.domain)?;
+        if !is_public_ipv4(self.public_ipv4) {
+            return Err(InstallError::InvalidRequest("public_ipv4"));
+        }
+        validate_region(&self.region)?;
+        validate_https_origin(&self.release_catalog_origin)?;
+        if self.account_generation == 0 || self.account_generation > i64::MAX as u64 {
+            return Err(InstallError::InvalidRequest("account_generation"));
+        }
+        if self.authoritative_dns_ipv4 == self.public_recursive_dns_ipv4
+            || !is_public_ipv4(self.authoritative_dns_ipv4)
+            || !is_public_ipv4(self.public_recursive_dns_ipv4)
+        {
+            return Err(InstallError::InvalidRequest("dns proof policy"));
+        }
+        self.updater.validate()?;
         Ok(())
     }
 }
@@ -176,6 +208,7 @@ pub struct BundleManifest {
     pub release: String,
     pub target: HostTarget,
     pub images: Vec<ImageReference>,
+    pub updater: UpdaterIdentity,
     pub files: Vec<BundleFile>,
 }
 
@@ -197,6 +230,18 @@ impl BundleManifest {
         {
             return Err(InstallError::NonCanonicalTopology);
         }
+        let updater_file = self
+            .files
+            .iter()
+            .find(|file| file.role == BundleRole::UpdaterBinary)
+            .ok_or(InstallError::NonCanonicalTopology)?;
+        self.updater.validate()?;
+        if self.updater != request.updater {
+            return Err(InstallError::UpdaterIdentityMismatch);
+        }
+        if updater_file.sha256 != self.updater.sha256 {
+            return Err(InstallError::UpdaterIdentityMismatch);
+        }
         let expected_images = ImageRole::required();
         if self.images.len() != expected_images.len()
             || self
@@ -206,6 +251,28 @@ impl BundleManifest {
                 .any(|(image, role)| image.role != *role || image.validate(&self.release).is_err())
         {
             return Err(InstallError::NonCanonicalImages);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdaterIdentity {
+    pub version: String,
+    pub source_url: String,
+    pub sha256: DigestHex,
+}
+
+impl UpdaterIdentity {
+    fn validate(&self) -> Result<(), InstallError> {
+        if !valid_product_version(&self.version)
+            || self.source_url.len() > 2048
+            || !self.source_url.starts_with("https://")
+            || self.source_url.contains('@')
+            || self.source_url.chars().any(char::is_whitespace)
+        {
+            return Err(InstallError::InvalidUpdaterIdentity);
         }
         Ok(())
     }
@@ -224,12 +291,30 @@ pub struct BundleFile {
 #[serde(rename_all = "snake_case")]
 pub enum BundleRole {
     ComposeFile,
+    Caddyfile,
+    MessageServerInitializer,
+    AgentSecretMaterializer,
+    MessageServerEntrypoint,
+    CapabilityCaInitializer,
+    PostgresEntrypoint,
+    PostgresInitializer,
     UpdaterBinary,
     UpdaterUnit,
 }
 
 impl BundleRole {
-    const REQUIRED: [Self; 3] = [Self::ComposeFile, Self::UpdaterBinary, Self::UpdaterUnit];
+    const REQUIRED: [Self; 10] = [
+        Self::ComposeFile,
+        Self::Caddyfile,
+        Self::MessageServerInitializer,
+        Self::AgentSecretMaterializer,
+        Self::MessageServerEntrypoint,
+        Self::CapabilityCaInitializer,
+        Self::PostgresEntrypoint,
+        Self::PostgresInitializer,
+        Self::UpdaterBinary,
+        Self::UpdaterUnit,
+    ];
 
     #[must_use]
     pub const fn required() -> &'static [Self] {
@@ -240,6 +325,13 @@ impl BundleRole {
     pub const fn archive_path(self) -> &'static str {
         match self {
             Self::ComposeFile => "runtime/docker-compose.yml",
+            Self::Caddyfile => "runtime/Caddyfile",
+            Self::MessageServerInitializer => "runtime/initialize-message-server.sh",
+            Self::AgentSecretMaterializer => "runtime/materialize-agent-secrets.sh",
+            Self::MessageServerEntrypoint => "runtime/message-server-entrypoint.sh",
+            Self::CapabilityCaInitializer => "runtime/initialize-capability-ca.sh",
+            Self::PostgresEntrypoint => "runtime/postgres-entrypoint.sh",
+            Self::PostgresInitializer => "runtime/initialize-postgres.sh",
             Self::UpdaterBinary => "updater/dirextalk-updater",
             Self::UpdaterUnit => "updater/dirextalk-updater.service",
         }
@@ -248,6 +340,13 @@ impl BundleRole {
     const fn mode(self) -> u32 {
         match self {
             Self::UpdaterBinary => 0o755,
+            Self::MessageServerInitializer
+            | Self::AgentSecretMaterializer
+            | Self::MessageServerEntrypoint
+            | Self::CapabilityCaInitializer
+            | Self::PostgresEntrypoint
+            | Self::PostgresInitializer => 0o555,
+            Self::Caddyfile => 0o444,
             _ => 0o644,
         }
     }
@@ -257,7 +356,7 @@ impl BundleRole {
 #[serde(rename_all = "snake_case")]
 pub enum ImageRole {
     Postgres,
-    Matrix,
+    Utility,
     MessageServer,
     Agent,
     Caddy,
@@ -267,7 +366,7 @@ pub enum ImageRole {
 impl ImageRole {
     const REQUIRED: [Self; 6] = [
         Self::Postgres,
-        Self::Matrix,
+        Self::Utility,
         Self::MessageServer,
         Self::Agent,
         Self::Caddy,
@@ -282,17 +381,12 @@ impl ImageRole {
     #[must_use]
     pub const fn allowed_repository(self) -> &'static str {
         match self {
-            Self::Postgres => "docker.io/library/postgres",
-            Self::Matrix => "docker.io/matrixdotorg/synapse",
-            Self::MessageServer => "ghcr.io/yingsuiai/dirextalk-message-server",
-            Self::Agent => "ghcr.io/yingsuiai/dirextalk-agent",
+            Self::Postgres | Self::Utility => "docker.io/pgvector/pgvector",
+            Self::MessageServer => "docker.io/dirextalk/message-server",
+            Self::Agent => "docker.io/dirextalk/agent",
             Self::Caddy => "docker.io/library/caddy",
             Self::Coturn => "docker.io/coturn/coturn",
         }
-    }
-
-    const fn is_application(self) -> bool {
-        matches!(self, Self::MessageServer | Self::Agent)
     }
 }
 
@@ -301,35 +395,71 @@ impl ImageRole {
 pub struct ImageReference {
     pub role: ImageRole,
     pub repository: String,
-    pub tag: String,
+    pub tag: Option<String>,
     pub digest: DigestHex,
+    pub source_revision: Option<String>,
 }
 
 impl ImageReference {
-    fn validate(&self, release: &str) -> Result<(), InstallError> {
-        if self.repository != self.role.allowed_repository() || !valid_tag(&self.tag) {
-            return Err(InstallError::InvalidImageReference(self.role));
-        }
-        if self.role.is_application() && self.tag != release {
-            return Err(InstallError::ApplicationImageReleaseMismatch(self.role));
-        }
-        Ok(())
+    fn validate(&self, _release: &str) -> Result<(), InstallError> {
+        self.validate_repository_and_tag()
     }
 
     fn digest_reference(&self) -> String {
-        format!("{}@sha256:{}", self.repository, self.digest.as_str())
-    }
-
-    fn tagged_reference(&self) -> String {
-        format!("{}:{}", self.repository, self.tag)
+        self.tag.as_ref().map_or_else(
+            || format!("{}@sha256:{}", self.repository, self.digest.as_str()),
+            |tag| {
+                format!(
+                    "{}:{}@sha256:{}",
+                    self.repository,
+                    tag,
+                    self.digest.as_str()
+                )
+            },
+        )
     }
 
     fn validate_repository_and_tag(&self) -> Result<(), InstallError> {
-        if self.repository != self.role.allowed_repository() || !valid_tag(&self.tag) {
-            Err(InstallError::InvalidImageReference(self.role))
-        } else {
-            Ok(())
+        if self.repository != self.role.allowed_repository() {
+            return Err(InstallError::InvalidImageReference(self.role));
         }
+        match self.role {
+            ImageRole::MessageServer | ImageRole::Agent => {
+                if !self.tag.as_deref().is_some_and(valid_product_version)
+                    || !self
+                        .source_revision
+                        .as_deref()
+                        .is_some_and(valid_source_revision)
+                {
+                    return Err(InstallError::InvalidImageReference(self.role));
+                }
+            }
+            ImageRole::Postgres | ImageRole::Utility => {
+                if self.source_revision.is_some()
+                    || self.tag.as_deref() != Some("pg18")
+                    || self.digest.as_str() != POSTGRES_UTILITY_DIGEST
+                {
+                    return Err(InstallError::ThirdPartyImagePinMismatch(self.role));
+                }
+            }
+            ImageRole::Caddy => {
+                if self.source_revision.is_some()
+                    || self.tag.is_some()
+                    || self.digest.as_str() != CADDY_DIGEST
+                {
+                    return Err(InstallError::ThirdPartyImagePinMismatch(self.role));
+                }
+            }
+            ImageRole::Coturn => {
+                if self.source_revision.is_some()
+                    || self.tag.as_deref() != Some("4.6.3-alpine")
+                    || self.digest.as_str() != COTURN_DIGEST
+                {
+                    return Err(InstallError::ThirdPartyImagePinMismatch(self.role));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -360,32 +490,68 @@ impl PlatformInfo {
 pub enum FixedStep {
     InstallDocker,
     PullPostgresImage,
-    PullMatrixImage,
+    PullUtilityImage,
     PullMessageServerImage,
     PullAgentImage,
     PullCaddyImage,
     PullCoturnImage,
     InstallComposeFile,
+    InstallCaddyfile,
+    InstallMessageServerInitializer,
+    InstallAgentSecretMaterializer,
+    InstallMessageServerEntrypoint,
+    InstallCapabilityCaInitializer,
+    InstallPostgresEntrypoint,
+    InstallPostgresInitializer,
     InstallUpdaterBinary,
     InstallUpdaterConfig,
     InstallUpdaterControlToken,
     InstallUpdaterUnit,
+    MaterializeRuntime,
+    ValidateCompose,
+    StartMessageServer,
+    RefreshAgentToken,
+    StartAgent,
+    VerifyDns,
+    StartCaddy,
+    VerifyRuntime,
+    VerifyHttps,
+    VerifyTurn,
+    VerifyUpdater,
 }
 
 impl FixedStep {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 30] = [
         Self::InstallDocker,
         Self::PullPostgresImage,
-        Self::PullMatrixImage,
+        Self::PullUtilityImage,
         Self::PullMessageServerImage,
         Self::PullAgentImage,
         Self::PullCaddyImage,
         Self::PullCoturnImage,
         Self::InstallComposeFile,
+        Self::InstallCaddyfile,
+        Self::InstallMessageServerInitializer,
+        Self::InstallAgentSecretMaterializer,
+        Self::InstallMessageServerEntrypoint,
+        Self::InstallCapabilityCaInitializer,
+        Self::InstallPostgresEntrypoint,
+        Self::InstallPostgresInitializer,
         Self::InstallUpdaterBinary,
         Self::InstallUpdaterConfig,
         Self::InstallUpdaterControlToken,
         Self::InstallUpdaterUnit,
+        Self::MaterializeRuntime,
+        Self::ValidateCompose,
+        Self::StartMessageServer,
+        Self::RefreshAgentToken,
+        Self::StartAgent,
+        Self::VerifyDns,
+        Self::StartCaddy,
+        Self::VerifyRuntime,
+        Self::VerifyHttps,
+        Self::VerifyTurn,
+        Self::VerifyUpdater,
     ];
 
     #[must_use]
@@ -396,6 +562,13 @@ impl FixedStep {
     const fn bundle_role(self) -> Option<BundleRole> {
         match self {
             Self::InstallComposeFile => Some(BundleRole::ComposeFile),
+            Self::InstallCaddyfile => Some(BundleRole::Caddyfile),
+            Self::InstallMessageServerInitializer => Some(BundleRole::MessageServerInitializer),
+            Self::InstallAgentSecretMaterializer => Some(BundleRole::AgentSecretMaterializer),
+            Self::InstallMessageServerEntrypoint => Some(BundleRole::MessageServerEntrypoint),
+            Self::InstallCapabilityCaInitializer => Some(BundleRole::CapabilityCaInitializer),
+            Self::InstallPostgresEntrypoint => Some(BundleRole::PostgresEntrypoint),
+            Self::InstallPostgresInitializer => Some(BundleRole::PostgresInitializer),
             Self::InstallUpdaterBinary => Some(BundleRole::UpdaterBinary),
             Self::InstallUpdaterUnit => Some(BundleRole::UpdaterUnit),
             _ => None,
@@ -405,13 +578,30 @@ impl FixedStep {
     const fn image_role(self) -> Option<ImageRole> {
         match self {
             Self::PullPostgresImage => Some(ImageRole::Postgres),
-            Self::PullMatrixImage => Some(ImageRole::Matrix),
+            Self::PullUtilityImage => Some(ImageRole::Utility),
             Self::PullMessageServerImage => Some(ImageRole::MessageServer),
             Self::PullAgentImage => Some(ImageRole::Agent),
             Self::PullCaddyImage => Some(ImageRole::Caddy),
             Self::PullCoturnImage => Some(ImageRole::Coturn),
             _ => None,
         }
+    }
+
+    const fn uses_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::MaterializeRuntime
+                | Self::ValidateCompose
+                | Self::StartMessageServer
+                | Self::RefreshAgentToken
+                | Self::StartAgent
+                | Self::VerifyDns
+                | Self::StartCaddy
+                | Self::VerifyRuntime
+                | Self::VerifyHttps
+                | Self::VerifyTurn
+                | Self::VerifyUpdater
+        )
     }
 }
 
@@ -420,6 +610,13 @@ pub enum StepInput<'a> {
     None,
     Artifact(&'a [u8]),
     Image(&'a ImageReference),
+    Runtime(RuntimeSpec<'a>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeSpec<'a> {
+    pub request: &'a InstallRequest,
+    pub images: &'a BTreeMap<ImageRole, ImageReference>,
 }
 
 impl<'a> StepInput<'a> {
@@ -435,6 +632,15 @@ impl<'a> StepInput<'a> {
     fn image(self) -> Result<&'a ImageReference, BackendError> {
         match self {
             Self::Image(image) => Ok(image),
+            _ => Err(BackendError::Infrastructure(
+                "fixed step received the wrong input type".into(),
+            )),
+        }
+    }
+
+    fn runtime(self) -> Result<RuntimeSpec<'a>, BackendError> {
+        match self {
+            Self::Runtime(runtime) => Ok(runtime),
             _ => Err(BackendError::Infrastructure(
                 "fixed step received the wrong input type".into(),
             )),
@@ -457,10 +663,23 @@ pub struct InstallReceipt {
     pub release: String,
     pub request_sha256: DigestHex,
     pub bundle_sha256: DigestHex,
+    pub manifest_sha256: DigestHex,
+    pub domain: String,
+    pub public_ipv4: Ipv4Addr,
+    pub region: String,
+    pub account_generation: u64,
+    pub updater: UpdaterIdentity,
     pub platform: PlatformInfo,
     pub completed_steps: Vec<FixedStep>,
     pub cloud_worker: CloudWorkerStatus,
+    pub runtime_status: RuntimeStatus,
     pub completed_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStatus {
+    RuntimeHealthy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -673,6 +892,10 @@ impl<B: InstallBackend> Installer<B> {
                             .expect("verified canonical manifest contains every image"),
                     )
                 }
+                _ if step.uses_runtime() => StepInput::Runtime(RuntimeSpec {
+                    request: &request,
+                    images: &bundle.images,
+                }),
                 _ => StepInput::None,
             };
             self.backend
@@ -686,9 +909,16 @@ impl<B: InstallBackend> Installer<B> {
             release: request.release,
             request_sha256: expected_request_sha256.clone(),
             bundle_sha256: request.bundle_sha256,
+            manifest_sha256: request.manifest_sha256,
+            domain: request.domain,
+            public_ipv4: request.public_ipv4,
+            region: request.region,
+            account_generation: request.account_generation,
+            updater: request.updater,
             platform,
             completed_steps: FixedStep::all().to_vec(),
             cloud_worker: CloudWorkerStatus::DisabledByProductScope,
+            runtime_status: RuntimeStatus::RuntimeHealthy,
             completed_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| InstallError::Clock)?
@@ -713,11 +943,18 @@ impl InstallReceipt {
         self.schema_version == 1
             && self.request_sha256 == *request_sha256
             && self.bundle_sha256 == request.bundle_sha256
+            && self.manifest_sha256 == request.manifest_sha256
             && self.deployment_uuid == request.deployment_uuid
             && self.service_id == request.service_id
             && self.release == request.release
+            && self.domain == request.domain
+            && self.public_ipv4 == request.public_ipv4
+            && self.region == request.region
+            && self.account_generation == request.account_generation
+            && self.updater == request.updater
             && self.completed_steps == FixedStep::all()
             && self.cloud_worker == CloudWorkerStatus::DisabledByProductScope
+            && self.runtime_status == RuntimeStatus::RuntimeHealthy
             && self.platform.validate().is_ok()
     }
 }
@@ -730,8 +967,17 @@ struct VerifiedBundle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleAssets {
     pub compose_file: Vec<u8>,
+    pub caddyfile: Vec<u8>,
+    pub message_server_initializer: Vec<u8>,
+    pub agent_secret_materializer: Vec<u8>,
+    pub message_server_entrypoint: Vec<u8>,
+    pub capability_ca_initializer: Vec<u8>,
+    pub postgres_entrypoint: Vec<u8>,
+    pub postgres_initializer: Vec<u8>,
     pub updater_binary: Vec<u8>,
     pub updater_unit: Vec<u8>,
+    pub updater_version: String,
+    pub updater_source_url: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -740,6 +986,28 @@ pub struct BuiltBundle {
     pub bundle_sha256: DigestHex,
     pub manifest_sha256: DigestHex,
     pub release_signing_public_key: PublicKeyHex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleBuildRequest {
+    pub schema_version: u32,
+    pub release: String,
+    pub images: Vec<ImageReference>,
+    pub compose_path: PathBuf,
+    pub caddyfile_path: PathBuf,
+    pub message_server_initializer_path: PathBuf,
+    pub agent_secret_materializer_path: PathBuf,
+    pub message_server_entrypoint_path: PathBuf,
+    pub capability_ca_initializer_path: PathBuf,
+    pub postgres_entrypoint_path: PathBuf,
+    pub postgres_initializer_path: PathBuf,
+    pub updater_binary_path: PathBuf,
+    pub updater_unit_path: PathBuf,
+    pub updater_version: String,
+    pub updater_source_url: String,
+    pub updater_sha256: DigestHex,
+    pub output_bundle_path: PathBuf,
 }
 
 pub fn build_bundle(
@@ -760,6 +1028,25 @@ pub fn build_bundle(
     }
     let artifacts = [
         (BundleRole::ComposeFile, assets.compose_file),
+        (BundleRole::Caddyfile, assets.caddyfile),
+        (
+            BundleRole::MessageServerInitializer,
+            assets.message_server_initializer,
+        ),
+        (
+            BundleRole::AgentSecretMaterializer,
+            assets.agent_secret_materializer,
+        ),
+        (
+            BundleRole::MessageServerEntrypoint,
+            assets.message_server_entrypoint,
+        ),
+        (
+            BundleRole::CapabilityCaInitializer,
+            assets.capability_ca_initializer,
+        ),
+        (BundleRole::PostgresEntrypoint, assets.postgres_entrypoint),
+        (BundleRole::PostgresInitializer, assets.postgres_initializer),
         (BundleRole::UpdaterBinary, assets.updater_binary),
         (BundleRole::UpdaterUnit, assets.updater_unit),
     ];
@@ -778,11 +1065,24 @@ pub fn build_bundle(
             mode: role.mode(),
         })
         .collect();
+    let updater_sha256 = files
+        .iter()
+        .find(|file| file.role == BundleRole::UpdaterBinary)
+        .ok_or(InstallError::NonCanonicalTopology)?
+        .sha256
+        .clone();
+    let updater = UpdaterIdentity {
+        version: assets.updater_version,
+        source_url: assets.updater_source_url,
+        sha256: updater_sha256,
+    };
+    updater.validate()?;
     let manifest = BundleManifest {
         schema_version: 1,
         release: release.to_owned(),
         target: HostTarget::LinuxAmd64,
         images,
+        updater,
         files,
     };
     let signing_key = SigningKey::from_bytes(signing_key);
@@ -1006,6 +1306,7 @@ impl InstallBackend for LinuxBackend {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_step(&mut self, step: FixedStep, input: StepInput<'_>) -> Result<(), BackendError> {
         match step {
             FixedStep::InstallDocker => {
@@ -1036,12 +1337,7 @@ impl InstallBackend for LinuxBackend {
                     ));
                 }
                 let digest_reference = image.digest_reference();
-                let tagged_reference = image.tagged_reference();
                 run_program("/usr/bin/docker", &["pull", &digest_reference])?;
-                run_program(
-                    "/usr/bin/docker",
-                    &["image", "tag", &digest_reference, &tagged_reference],
-                )?;
             }
             FixedStep::InstallComposeFile => {
                 install_file(
@@ -1049,6 +1345,42 @@ impl InstallBackend for LinuxBackend {
                     "/var/dirextalk-message-server/docker-compose.yml",
                     0o600,
                 )?;
+            }
+            FixedStep::InstallCaddyfile => {
+                install_file(
+                    input.artifact()?,
+                    "/var/dirextalk-message-server/runtime/Caddyfile",
+                    0o444,
+                )?;
+            }
+            step @ (FixedStep::InstallMessageServerInitializer
+            | FixedStep::InstallAgentSecretMaterializer
+            | FixedStep::InstallMessageServerEntrypoint
+            | FixedStep::InstallCapabilityCaInitializer
+            | FixedStep::InstallPostgresEntrypoint
+            | FixedStep::InstallPostgresInitializer) => {
+                let destination = match step {
+                    FixedStep::InstallMessageServerInitializer => {
+                        "/var/dirextalk-message-server/runtime/initialize-message-server.sh"
+                    }
+                    FixedStep::InstallAgentSecretMaterializer => {
+                        "/var/dirextalk-message-server/runtime/materialize-agent-secrets.sh"
+                    }
+                    FixedStep::InstallMessageServerEntrypoint => {
+                        "/var/dirextalk-message-server/runtime/message-server-entrypoint.sh"
+                    }
+                    FixedStep::InstallCapabilityCaInitializer => {
+                        "/var/dirextalk-message-server/runtime/initialize-capability-ca.sh"
+                    }
+                    FixedStep::InstallPostgresEntrypoint => {
+                        "/var/dirextalk-message-server/runtime/postgres-entrypoint.sh"
+                    }
+                    FixedStep::InstallPostgresInitializer => {
+                        "/var/dirextalk-message-server/runtime/initialize-postgres.sh"
+                    }
+                    _ => unreachable!("guard restricts fixed helper step"),
+                };
+                install_file(input.artifact()?, destination, 0o555)?;
             }
             FixedStep::InstallUpdaterBinary => {
                 install_file(input.artifact()?, "/usr/local/bin/dirextalk-updater", 0o755)?;
@@ -1079,6 +1411,63 @@ impl InstallBackend for LinuxBackend {
                     &["enable", "--now", "dirextalk-updater.service"],
                 )?;
             }
+            FixedStep::MaterializeRuntime => materialize_runtime(input.runtime()?)?,
+            FixedStep::ValidateCompose => {
+                let runtime = input.runtime()?;
+                run_compose(&["config", "--quiet"])?;
+                verify_updater_binary(&runtime.request.updater)?;
+            }
+            FixedStep::StartMessageServer => {
+                run_compose(&[
+                    "up",
+                    "--detach",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    "--wait",
+                    "message-server",
+                ])?;
+            }
+            FixedStep::RefreshAgentToken => refresh_agent_token()?,
+            FixedStep::StartAgent => {
+                run_compose(&[
+                    "up",
+                    "--detach",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    "--wait",
+                    "agent",
+                ])?;
+            }
+            FixedStep::VerifyDns => verify_dns(input.runtime()?.request)?,
+            FixedStep::StartCaddy => {
+                run_compose(&[
+                    "up",
+                    "--detach",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    "--wait",
+                    "caddy",
+                ])?;
+            }
+            FixedStep::VerifyRuntime => verify_runtime_services()?,
+            FixedStep::VerifyHttps => verify_https(input.runtime()?)?,
+            FixedStep::VerifyTurn => verify_turn_acceptance(input.runtime()?.request)?,
+            FixedStep::VerifyUpdater => {
+                let runtime = input.runtime()?;
+                verify_updater_binary(&runtime.request.updater)?;
+                let output = run_program(
+                    "/usr/bin/systemctl",
+                    &["is-active", "dirextalk-updater.service"],
+                )?;
+                if output.stdout != b"active\n" {
+                    return Err(BackendError::Infrastructure(
+                        "pinned updater is not active".into(),
+                    ));
+                }
+            }
             _ => return Err(BackendError::Infrastructure("invalid fixed step".into())),
         }
         Ok(())
@@ -1087,6 +1476,539 @@ impl InstallBackend for LinuxBackend {
     fn write_receipt(&mut self, canonical_receipt: &[u8]) -> Result<(), BackendError> {
         atomic_write(Path::new(RECEIPT_PATH), canonical_receipt, 0o600)
     }
+}
+
+fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
+    ensure_secure_directory(Path::new(RUNTIME_ROOT), 0o700)?;
+    ensure_secure_directory(Path::new("/var/dirextalk-message-server/runtime"), 0o700)?;
+    ensure_secure_directory(Path::new("/var/dirextalk-message-server/secrets"), 0o700)?;
+
+    let postgres_admin = read_or_create_hex_secret("postgres_admin_password", 24)?;
+    let message_password = read_or_create_hex_secret("message_postgres_password", 24)?;
+    let agent_password = read_or_create_hex_secret("agent_postgres_password", 24)?;
+    let registration = read_or_create_hex_secret("message_registration_shared_secret", 32)?;
+    let turn = read_or_create_hex_secret("turn_shared_secret", 32)?;
+    let portal = read_or_create_hex_secret("message_portal_password", 16)?;
+    let master = read_or_create_raw_secret("core_secret_master_key", 32)?;
+    let mcp_path = runtime_secret_path("message_mcp_token");
+    if mcp_path.exists() {
+        read_runtime_secret(&mcp_path, 4096)?;
+    } else {
+        create_secret_noclobber(&mcp_path, b"")?;
+    }
+
+    let message_database = Zeroizing::new(format!(
+        "postgresql://dirextalk_message_server:{}@message-postgres:5432/dirextalk_message_server?sslmode=disable",
+        String::from_utf8_lossy(&message_password)
+    ));
+    let agent_database = Zeroizing::new(format!(
+        "postgresql://dirextalk_agent:{}@agent-postgres:5432/dirextalk_agent?sslmode=disable",
+        String::from_utf8_lossy(&agent_password)
+    ));
+    atomic_write(
+        &runtime_secret_path("message_database_url"),
+        message_database.as_bytes(),
+        0o600,
+    )?;
+    atomic_write(
+        &runtime_secret_path("agent_database_url"),
+        agent_database.as_bytes(),
+        0o600,
+    )?;
+
+    let turn_config = Zeroizing::new(render_turn_config(runtime.request, &turn));
+    atomic_write(
+        &runtime_secret_path("turnserver.conf"),
+        turn_config.as_bytes(),
+        0o600,
+    )?;
+
+    let message_instance = derived_instance_id(runtime.request.deployment_uuid, b"message-server");
+    let agent_instance = derived_instance_id(runtime.request.deployment_uuid, b"agent");
+    let env = render_runtime_env(runtime, message_instance, agent_instance)?;
+    atomic_write(
+        Path::new("/var/dirextalk-message-server/.env"),
+        env.as_bytes(),
+        0o600,
+    )?;
+    let agent_config = render_agent_config(runtime.request, agent_instance);
+    atomic_write(
+        Path::new("/var/dirextalk-message-server/agent-config.yaml"),
+        agent_config.as_bytes(),
+        0o600,
+    )?;
+
+    drop((postgres_admin, registration, portal, master));
+    Ok(())
+}
+
+fn render_turn_config(request: &InstallRequest, shared_secret: &[u8]) -> String {
+    format!(
+        "listening-port=3478\nmin-port=49160\nmax-port=49200\nrealm={}\nexternal-ip={}\nfingerprint\nuse-auth-secret\nstatic-auth-secret={}\nstale-nonce=600\nno-cli\nno-multicast-peers\nno-tls\nno-dtls\npidfile=/tmp/turnserver.pid\n",
+        request.domain,
+        request.public_ipv4,
+        String::from_utf8_lossy(shared_secret)
+    )
+}
+
+fn render_runtime_env(
+    runtime: RuntimeSpec<'_>,
+    message_instance: Uuid,
+    agent_instance: Uuid,
+) -> Result<String, BackendError> {
+    let image = |role| {
+        runtime
+            .images
+            .get(&role)
+            .map(ImageReference::digest_reference)
+            .ok_or_else(|| BackendError::Infrastructure("signed runtime image is missing".into()))
+    };
+    Ok(format!(
+        "POSTGRES_IMAGE={}\nUTILITY_IMAGE={}\nMESSAGE_SERVER_IMAGE={}\nAGENT_IMAGE={}\nCADDY_IMAGE={}\nCOTURN_IMAGE={}\nDOMAIN={}\nMESSAGE_SERVER_INSTANCE_ID={}\nAGENT_INSTANCE_ID={}\nACCOUNT_GENERATION={}\nRELEASE_CATALOG_ORIGIN={}\n",
+        image(ImageRole::Postgres)?,
+        image(ImageRole::Utility)?,
+        image(ImageRole::MessageServer)?,
+        image(ImageRole::Agent)?,
+        image(ImageRole::Caddy)?,
+        image(ImageRole::Coturn)?,
+        runtime.request.domain,
+        message_instance,
+        agent_instance,
+        runtime.request.account_generation,
+        runtime.request.release_catalog_origin,
+    ))
+}
+
+fn render_agent_config(request: &InstallRequest, agent_instance: Uuid) -> String {
+    format!(
+        "instance_id: {agent_instance}\ndatabase_url_file: /run/secrets/database_url\ngrpc_listen: \":9443\"\nagent_http_enabled: true\nagent_http_listen: 0.0.0.0:8082\ntls_cert_file: /run/secrets/tls_cert\ntls_key_file: /run/secrets/tls_key\nservice_token_file: /run/secrets/service_token\ncore_voice_callback_relay_token_file: /run/secrets/voice_relay_token\nenable_health_service: true\nenable_reflection: false\ncapability_grant_public_key_file: /run/secrets/grant_public_key\ncapability_account_generation: {}\nproduct_capability_enabled: true\nproduct_capability_address: message-server:50053\nproduct_capability_ca_cert_file: /run/secrets/product_ca\nproduct_capability_tls_cert_file: /run/secrets/product_tls_cert\nproduct_capability_tls_key_file: /run/secrets/product_tls_key\nproduct_capability_token_file: /run/secrets/agent_to_ms_token\nproduct_capability_server_name: dirextalk-message-server\nproduct_capability_instance_id: {agent_instance}\nproduct_capability_account_generation: {}\ncore_task_max_concurrency: 4\ncore_task_lease_ttl: 30s\ncore_schedule_sweep_interval: 1s\ncore_shutdown_grace: 30s\ncore_extension_enabled: false\ncore_message_mcp_enabled: true\ncore_message_mcp_endpoint: http://message-server:8008/mcp\ncore_message_mcp_token_file: /run/secrets/message_mcp_token\ncore_static_sites_enabled: false\ncore_workload_enabled: false\ncore_secret_master_key_file: /run/secrets/core_secret_master_key\ncore_secret_master_key_version: 1\ncore_knowledge_enabled: false\n",
+        request.account_generation, request.account_generation
+    )
+}
+
+fn runtime_secret_path(name: &str) -> PathBuf {
+    Path::new("/var/dirextalk-message-server/secrets").join(name)
+}
+
+fn read_or_create_hex_secret(
+    name: &str,
+    random_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    let path = runtime_secret_path(name);
+    if path.exists() {
+        let bytes = Zeroizing::new(read_runtime_secret(&path, random_bytes * 2)?);
+        if bytes.len() != random_bytes * 2
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err(BackendError::Infrastructure(format!(
+                "{name} has invalid protected state"
+            )));
+        }
+        return Ok(bytes);
+    }
+    let mut random = Zeroizing::new(vec![0_u8; random_bytes]);
+    fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(|error| BackendError::Infrastructure(format!("read OS RNG: {error}")))?;
+    let encoded = Zeroizing::new(hex::encode(&*random).into_bytes());
+    create_secret_noclobber(&path, &encoded)?;
+    Ok(encoded)
+}
+
+fn read_or_create_raw_secret(name: &str, size: usize) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    let path = runtime_secret_path(name);
+    if path.exists() {
+        let bytes = Zeroizing::new(read_runtime_secret(&path, size)?);
+        if bytes.len() != size {
+            return Err(BackendError::Infrastructure(format!(
+                "{name} has invalid protected state"
+            )));
+        }
+        return Ok(bytes);
+    }
+    let mut bytes = Zeroizing::new(vec![0_u8; size]);
+    fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|error| BackendError::Infrastructure(format!("read OS RNG: {error}")))?;
+    create_secret_noclobber(&path, &bytes)?;
+    Ok(bytes)
+}
+
+fn read_runtime_secret(path: &Path, maximum: usize) -> Result<Vec<u8>, BackendError> {
+    read_stable_regular(path, Some(0), Some(0o600), maximum).map_err(|error| {
+        BackendError::Infrastructure(format!("read protected runtime state: {error}"))
+    })
+}
+
+fn create_secret_noclobber(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BackendError::Infrastructure("secret has no parent".into()))?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    temporary
+        .as_file()
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        BackendError::Infrastructure(format!("publish protected runtime state: {}", error.error))
+    })?;
+    Ok(())
+}
+
+fn ensure_secure_directory(path: &Path, mode: u32) -> Result<(), BackendError> {
+    fs::create_dir_all(path).map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    if !metadata.file_type().is_dir() || metadata.uid() != 0 {
+        return Err(BackendError::Infrastructure(format!(
+            "runtime directory is not root-owned: {}",
+            path.display()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))
+}
+
+fn derived_instance_id(deployment: Uuid, label: &[u8]) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(deployment.as_bytes());
+    digest.update(label);
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn run_compose(arguments: &[&str]) -> Result<std::process::Output, BackendError> {
+    let mut fixed = vec![
+        "compose",
+        "--project-name",
+        COMPOSE_PROJECT,
+        "--file",
+        COMPOSE_PATH,
+    ];
+    fixed.extend_from_slice(arguments);
+    run_program("/usr/bin/docker", &fixed)
+}
+
+#[derive(Deserialize)]
+struct BootstrapCredentials {
+    access_token: String,
+    agent_token: String,
+}
+
+struct BootstrapSecrets {
+    access_token: Zeroizing<String>,
+    agent_token: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+struct TurnResponse {
+    uris: Vec<String>,
+    username: String,
+    password: String,
+    ttl: u64,
+}
+
+fn read_bootstrap_credentials() -> Result<BootstrapSecrets, BackendError> {
+    let output = run_compose(&["ps", "--quiet", "message-server"])?;
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BackendError::Infrastructure(
+            "message-server container identity is invalid".into(),
+        ));
+    }
+    verify_exact_container(&id, "message-server", true)?;
+    let output = run_program(
+        "/usr/bin/docker",
+        &[
+            "exec",
+            &id,
+            "/bin/cat",
+            "/var/dirextalk-message-server/p2p/bootstrap.json",
+        ],
+    )?;
+    verify_exact_container(&id, "message-server", true)?;
+    if output.stdout.len() > 64 * 1024 {
+        return Err(BackendError::Infrastructure(
+            "message-server bootstrap is too large".into(),
+        ));
+    }
+    let credentials: BootstrapCredentials = serde_json::from_slice(&output.stdout)
+        .map_err(|_| BackendError::Infrastructure("message-server bootstrap is invalid".into()))?;
+    for token in [&credentials.access_token, &credentials.agent_token] {
+        if token.is_empty()
+            || token.len() > 4096
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(BackendError::Infrastructure(
+                "message-server bootstrap token is invalid".into(),
+            ));
+        }
+    }
+    Ok(BootstrapSecrets {
+        access_token: Zeroizing::new(credentials.access_token),
+        agent_token: Zeroizing::new(credentials.agent_token),
+    })
+}
+
+fn verify_exact_container(
+    id: &str,
+    service: &str,
+    require_healthy: bool,
+) -> Result<(), BackendError> {
+    let output = run_program("/usr/bin/docker", &["inspect", id])?;
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|_| BackendError::Infrastructure("container inspection is invalid".into()))?;
+    let value = values
+        .first()
+        .filter(|_| values.len() == 1)
+        .ok_or_else(|| {
+            BackendError::Infrastructure("container inspection identity is ambiguous".into())
+        })?;
+    let label = |name: &str| {
+        value
+            .pointer(&format!("/Config/Labels/{name}"))
+            .and_then(serde_json::Value::as_str)
+    };
+    let healthy = value
+        .pointer("/State/Health/Status")
+        .and_then(serde_json::Value::as_str);
+    if value.get("Id").and_then(serde_json::Value::as_str) != Some(id)
+        || label("com.docker.compose.project") != Some(COMPOSE_PROJECT)
+        || label("com.docker.compose.service") != Some(service)
+        || value
+            .pointer("/State/Status")
+            .and_then(serde_json::Value::as_str)
+            != Some("running")
+        || (require_healthy && healthy != Some("healthy"))
+    {
+        return Err(BackendError::Infrastructure(format!(
+            "exact {service} container is not healthy"
+        )));
+    }
+    Ok(())
+}
+
+fn refresh_agent_token() -> Result<(), BackendError> {
+    let credentials = read_bootstrap_credentials()?;
+    atomic_write(
+        &runtime_secret_path("message_mcp_token"),
+        credentials.agent_token.as_bytes(),
+        0o600,
+    )
+}
+
+fn verify_dns(request: &InstallRequest) -> Result<(), BackendError> {
+    for (server, label) in [
+        (request.authoritative_dns_ipv4, "authoritative"),
+        (request.public_recursive_dns_ipv4, "public-recursive"),
+    ] {
+        let server = format!("@{server}");
+        let output = run_program(
+            "/usr/bin/dig",
+            &[
+                "+time=5",
+                "+tries=1",
+                "+short",
+                "A",
+                &server,
+                &request.domain,
+            ],
+        )?;
+        let answers = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<Ipv4Addr>().ok())
+            .collect::<BTreeSet<_>>();
+        if !answers.contains(&request.public_ipv4) {
+            return Err(BackendError::WaitingUser(format!(
+                "{label} DNS has not published the expected A record"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_https(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
+    let request = runtime.request;
+    let resolve = format!("{}:443:{}", request.domain, request.public_ipv4);
+    let matrix_url = format!("https://{}/_matrix/client/versions", request.domain);
+    run_program(
+        "/usr/bin/curl",
+        &[
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+            "--resolve",
+            &resolve,
+            &matrix_url,
+        ],
+    )?;
+    let agent_url = format!("https://{}/agent/v1/health", request.domain);
+    let output = run_program(
+        "/usr/bin/curl",
+        &[
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+            "--resolve",
+            &resolve,
+            &agent_url,
+        ],
+    )?;
+    let health: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| BackendError::Infrastructure("public Agent health is invalid".into()))?;
+    let expected_release = runtime
+        .images
+        .get(&ImageRole::Agent)
+        .and_then(|image| image.tag.as_deref())
+        .ok_or_else(|| BackendError::Infrastructure("signed Agent identity is missing".into()))?;
+    if json_string(&health, "status") != Some("ok")
+        || json_string(&health, "release_version") != Some(expected_release)
+    {
+        return Err(BackendError::Infrastructure(
+            "public Agent health does not match the signed release".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_turn_acceptance(request: &InstallRequest) -> Result<(), BackendError> {
+    let credentials = read_bootstrap_credentials()?;
+    let url = format!(
+        "https://{}/_matrix/client/v3/voip/turnServer",
+        request.domain
+    );
+    let resolve = format!("{}:443:{}", request.domain, request.public_ipv4);
+    let config = Zeroizing::new(format!(
+        "silent\nshow-error\nfail\nmax-time = 15\nresolve = \"{resolve}\"\nheader = \"Authorization: Bearer {}\"\nurl = \"{url}\"\n",
+        *credentials.access_token
+    ));
+    let output = run_program_with_input("/usr/bin/curl", &["--config", "-"], config.as_bytes())?;
+    let response: TurnResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|_| BackendError::Infrastructure("Matrix TURN response is invalid".into()))?;
+    let expected = BTreeSet::from([
+        format!("turn:{}:3478?transport=tcp", request.domain),
+        format!("turn:{}:3478?transport=udp", request.domain),
+    ]);
+    if response.uris.into_iter().collect::<BTreeSet<_>>() != expected
+        || response.username.is_empty()
+        || response.password.is_empty()
+        || response.ttl == 0
+    {
+        return Err(BackendError::Infrastructure(
+            "Matrix did not accept the credential-backed TURN 3478 contract".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_runtime_services() -> Result<(), BackendError> {
+    let output = run_compose(&["ps", "--all", "--format", "json"])?;
+    let records = parse_compose_ps(&output.stdout)?;
+    let expected = BTreeSet::from([
+        "postgres",
+        "coturn",
+        "message-init",
+        "message-server",
+        "agent-secret-init",
+        "agent-migrate",
+        "agent",
+        "caddy",
+    ]);
+    if records.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err(BackendError::Infrastructure(
+            "Compose service set is not canonical".into(),
+        ));
+    }
+    for service in ["postgres", "coturn", "message-server", "agent"] {
+        let value = &records[service];
+        if json_string(value, "State") != Some("running")
+            || json_string(value, "Health") != Some("healthy")
+        {
+            return Err(BackendError::Infrastructure(format!(
+                "{service} is not healthy"
+            )));
+        }
+    }
+    if json_string(&records["caddy"], "State") != Some("running") {
+        return Err(BackendError::Infrastructure("caddy is not running".into()));
+    }
+    for service in ["message-init", "agent-secret-init", "agent-migrate"] {
+        let value = &records[service];
+        let exit_code = value
+            .get("ExitCode")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        if json_string(value, "State") != Some("exited") || exit_code != 0 {
+            return Err(BackendError::Infrastructure(format!(
+                "{service} did not complete successfully"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_compose_ps(bytes: &[u8]) -> Result<BTreeMap<String, serde_json::Value>, BackendError> {
+    let values = if let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
+        values
+    } else {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| BackendError::Infrastructure("Compose status JSON is invalid".into()))?
+    };
+    let mut records = BTreeMap::new();
+    for value in values {
+        let service = json_string(&value, "Service")
+            .ok_or_else(|| {
+                BackendError::Infrastructure("Compose status omitted service identity".into())
+            })?
+            .to_owned();
+        if records.insert(service, value).is_some() {
+            return Err(BackendError::Infrastructure(
+                "Compose status has duplicate services".into(),
+            ));
+        }
+    }
+    Ok(records)
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn verify_updater_binary(expected: &UpdaterIdentity) -> Result<(), BackendError> {
+    let bytes = read_stable_regular(
+        Path::new("/usr/local/bin/dirextalk-updater"),
+        Some(0),
+        Some(0o755),
+        MAX_FILE_BYTES,
+    )
+    .map_err(|error| BackendError::Infrastructure(format!("verify updater binary: {error}")))?;
+    if DigestHex::calculate(&bytes) != expected.sha256 {
+        return Err(BackendError::Infrastructure(
+            "installed updater digest changed".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn read_stable_regular(
@@ -1179,6 +2101,34 @@ fn run_program(program: &str, arguments: &[&str]) -> Result<std::process::Output
     }
 }
 
+fn run_program_with_input(
+    program: &str,
+    arguments: &[&str],
+    input: &[u8],
+) -> Result<std::process::Output, BackendError> {
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| BackendError::Infrastructure("child stdin is unavailable".into()))?
+        .write_all(input)
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(command_failure(program, &output))
+    }
+}
+
 fn command_failure(program: &str, output: &std::process::Output) -> BackendError {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if program == "/usr/bin/apt-get"
@@ -1224,6 +2174,70 @@ fn validate_slug(value: &str, name: &'static str) -> Result<(), InstallError> {
     }
 }
 
+fn validate_dns_name(value: &str) -> Result<(), InstallError> {
+    if value.is_empty()
+        || value.len() > 253
+        || value.ends_with('.')
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+        || value.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        Err(InstallError::InvalidRequest("domain"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_region(value: &str) -> Result<(), InstallError> {
+    if value.is_empty()
+        || value.len() > 63
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        Err(InstallError::InvalidRequest("region"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_https_origin(value: &str) -> Result<(), InstallError> {
+    let Some(host) = value.strip_prefix("https://") else {
+        return Err(InstallError::InvalidRequest("release_catalog_origin"));
+    };
+    if host.contains(['/', '?', '#', '@', ':']) || validate_dns_name(host).is_err() {
+        Err(InstallError::InvalidRequest("release_catalog_origin"))
+    } else {
+        Ok(())
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_broadcast()
+        && !address.is_documentation()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && octets[0] != 0
+        && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+        && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        && !(octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        && octets[0] < 224
+}
+
 fn validate_release(value: &str) -> Result<(), InstallError> {
     if value.is_empty()
         || value.len() > 128
@@ -1237,11 +2251,24 @@ fn validate_release(value: &str) -> Result<(), InstallError> {
     }
 }
 
-fn valid_tag(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_')
-        && value.len() <= 128
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+fn valid_product_version(value: &str) -> bool {
+    let Some(version) = value.strip_prefix('v') else {
+        return false;
+    };
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (*part == "0" || !part.starts_with('0'))
+        })
+}
+
+fn valid_source_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn decode_hex_array<const SIZE: usize>(value: &str) -> Result<[u8; SIZE], InstallError> {
@@ -1278,14 +2305,18 @@ pub enum InstallError {
     ReceiptKeyMismatch,
     #[error("bundle manifest does not match the install request")]
     ManifestMismatch,
+    #[error("updater release identity is invalid")]
+    InvalidUpdaterIdentity,
+    #[error("updater binary digest does not match its signed identity")]
+    UpdaterIdentityMismatch,
     #[error("bundle does not contain the exact canonical production topology")]
     NonCanonicalTopology,
     #[error("bundle does not contain the exact canonical image set")]
     NonCanonicalImages,
     #[error("image reference is invalid for role {0:?}")]
     InvalidImageReference(ImageRole),
-    #[error("application image tag does not match the exact release for role {0:?}")]
-    ApplicationImageReleaseMismatch(ImageRole),
+    #[error("third-party image does not match the frozen release pin for role {0:?}")]
+    ThirdPartyImagePinMismatch(ImageRole),
     #[error("bundle is too large")]
     BundleTooLarge,
     #[error("bundle contains a non-regular or unsafe entry")]
@@ -1333,6 +2364,7 @@ mod tests {
         steps: Vec<FixedStep>,
         writes: usize,
         fail: Option<BackendError>,
+        fail_at: Option<(FixedStep, BackendError)>,
     }
 
     impl InstallBackend for FakeBackend {
@@ -1353,6 +2385,11 @@ mod tests {
             _input: StepInput<'_>,
         ) -> Result<(), BackendError> {
             self.steps.push(step);
+            if let Some((failed_step, error)) = &self.fail_at
+                && *failed_step == step
+            {
+                return Err(error.clone());
+            }
             Ok(())
         }
 
@@ -1378,12 +2415,26 @@ mod tests {
             .map(|role| ImageReference {
                 role: *role,
                 repository: role.allowed_repository().into(),
-                tag: if role.is_application() {
-                    release.into()
-                } else {
-                    "fixed-1".into()
+                tag: match role {
+                    ImageRole::Postgres | ImageRole::Utility => Some("pg18".into()),
+                    ImageRole::MessageServer | ImageRole::Agent => Some(release.into()),
+                    ImageRole::Caddy => None,
+                    ImageRole::Coturn => Some("4.6.3-alpine".into()),
                 },
-                digest: DigestHex::calculate(format!("image:{role:?}").as_bytes()),
+                digest: DigestHex::parse(match role {
+                    ImageRole::Postgres | ImageRole::Utility => POSTGRES_UTILITY_DIGEST,
+                    ImageRole::Caddy => CADDY_DIGEST,
+                    ImageRole::Coturn => COTURN_DIGEST,
+                    ImageRole::MessageServer | ImageRole::Agent => {
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                })
+                .unwrap(),
+                source_revision: if matches!(role, ImageRole::MessageServer | ImageRole::Agent) {
+                    Some("0123456789abcdef0123456789abcdef01234567".into())
+                } else {
+                    None
+                },
             })
             .collect()
     }
@@ -1391,12 +2442,21 @@ mod tests {
     fn fixture() -> (Vec<u8>, DigestHex, Vec<u8>, Vec<u8>) {
         let key = vec![42; 32];
         let built = build_bundle(
-            "1.2.3",
-            images("1.2.3"),
+            "v1.2.3",
+            images("v1.2.3"),
             BundleAssets {
                 compose_file: b"services: {}".to_vec(),
+                caddyfile: b"{$DOMAIN}".to_vec(),
+                message_server_initializer: b"#!/bin/sh".to_vec(),
+                agent_secret_materializer: b"#!/bin/sh".to_vec(),
+                message_server_entrypoint: b"#!/bin/sh".to_vec(),
+                capability_ca_initializer: b"#!/bin/sh".to_vec(),
+                postgres_entrypoint: b"#!/bin/sh".to_vec(),
+                postgres_initializer: b"#!/bin/sh".to_vec(),
                 updater_binary: b"updater".to_vec(),
                 updater_unit: b"[Service]".to_vec(),
+                updater_version: "v1.0.0".into(),
+                updater_source_url: "https://releases.example/updater".into(),
             },
             &[7; 32],
         )
@@ -1405,12 +2465,24 @@ mod tests {
             schema_version: 1,
             deployment_uuid: Uuid::nil(),
             service_id: "service-1".into(),
-            release: "1.2.3".into(),
+            release: "v1.2.3".into(),
             target: HostTarget::LinuxAmd64,
             bundle_sha256: built.bundle_sha256,
             manifest_sha256: built.manifest_sha256,
             release_signing_public_key: built.release_signing_public_key,
             receipt_key_sha256: DigestHex::calculate(&key),
+            domain: "node.example.com".into(),
+            public_ipv4: "8.8.4.4".parse().unwrap(),
+            region: "us-central1".into(),
+            release_catalog_origin: "https://imadmin.dirextalk.ai".into(),
+            account_generation: 1,
+            authoritative_dns_ipv4: "9.9.9.9".parse().unwrap(),
+            public_recursive_dns_ipv4: "8.8.8.8".parse().unwrap(),
+            updater: UpdaterIdentity {
+                version: "v1.0.0".into(),
+                source_url: "https://releases.example/updater".into(),
+                sha256: DigestHex::calculate(b"updater"),
+            },
         };
         let request = canonical_json(&request).unwrap();
         let digest = DigestHex::calculate(&request);
@@ -1534,16 +2606,25 @@ mod tests {
 
     #[test]
     fn rejects_non_allowlisted_image_and_wrong_manifest_signer() {
-        let mut invalid_images = images("1.2.3");
+        let mut invalid_images = images("v1.2.3");
         invalid_images[0].repository = "evil.example/postgres".into();
         assert!(matches!(
             build_bundle(
-                "1.2.3",
+                "v1.2.3",
                 invalid_images,
                 BundleAssets {
                     compose_file: b"services: {}".to_vec(),
+                    caddyfile: b"{$DOMAIN}".to_vec(),
+                    message_server_initializer: b"#!/bin/sh".to_vec(),
+                    agent_secret_materializer: b"#!/bin/sh".to_vec(),
+                    message_server_entrypoint: b"#!/bin/sh".to_vec(),
+                    capability_ca_initializer: b"#!/bin/sh".to_vec(),
+                    postgres_entrypoint: b"#!/bin/sh".to_vec(),
+                    postgres_initializer: b"#!/bin/sh".to_vec(),
                     updater_binary: b"updater".to_vec(),
                     updater_unit: b"[Service]".to_vec(),
+                    updater_version: "v1.0.0".into(),
+                    updater_source_url: "https://releases.example/updater".into(),
                 },
                 &[7; 32],
             ),
@@ -1567,5 +2648,206 @@ mod tests {
             }
         ));
         assert!(installer.into_backend().steps.is_empty());
+    }
+
+    #[test]
+    fn canonical_image_contract_uses_split_release_roles_and_pins() {
+        assert_eq!(
+            ImageRole::required(),
+            &[
+                ImageRole::Postgres,
+                ImageRole::Utility,
+                ImageRole::MessageServer,
+                ImageRole::Agent,
+                ImageRole::Caddy,
+                ImageRole::Coturn,
+            ]
+        );
+        let mut resolved = images("v1.2.3");
+        resolved
+            .iter_mut()
+            .find(|image| image.role == ImageRole::Agent)
+            .unwrap()
+            .tag = Some("v2.0.0".into());
+        build_bundle(
+            "stable-2026-08-20",
+            resolved.clone(),
+            BundleAssets {
+                compose_file: b"services: {}".to_vec(),
+                caddyfile: b"{$DOMAIN}".to_vec(),
+                message_server_initializer: b"#!/bin/sh".to_vec(),
+                agent_secret_materializer: b"#!/bin/sh".to_vec(),
+                message_server_entrypoint: b"#!/bin/sh".to_vec(),
+                capability_ca_initializer: b"#!/bin/sh".to_vec(),
+                postgres_entrypoint: b"#!/bin/sh".to_vec(),
+                postgres_initializer: b"#!/bin/sh".to_vec(),
+                updater_binary: b"updater".to_vec(),
+                updater_unit: b"[Service]".to_vec(),
+                updater_version: "v1.0.0".into(),
+                updater_source_url: "https://releases.example/updater".into(),
+            },
+            &[7; 32],
+        )
+        .unwrap();
+
+        resolved
+            .iter_mut()
+            .find(|image| image.role == ImageRole::MessageServer)
+            .unwrap()
+            .tag = Some("latest".into());
+        assert!(matches!(
+            build_bundle(
+                "stable-2026-08-20",
+                resolved,
+                BundleAssets {
+                    compose_file: b"services: {}".to_vec(),
+                    caddyfile: b"{$DOMAIN}".to_vec(),
+                    message_server_initializer: b"#!/bin/sh".to_vec(),
+                    agent_secret_materializer: b"#!/bin/sh".to_vec(),
+                    message_server_entrypoint: b"#!/bin/sh".to_vec(),
+                    capability_ca_initializer: b"#!/bin/sh".to_vec(),
+                    postgres_entrypoint: b"#!/bin/sh".to_vec(),
+                    postgres_initializer: b"#!/bin/sh".to_vec(),
+                    updater_binary: b"updater".to_vec(),
+                    updater_unit: b"[Service]".to_vec(),
+                    updater_version: "v1.0.0".into(),
+                    updater_source_url: "https://releases.example/updater".into(),
+                },
+                &[7; 32],
+            ),
+            Err(InstallError::NonCanonicalImages)
+        ));
+    }
+
+    #[test]
+    fn final_receipt_is_written_only_after_every_runtime_gate() {
+        let (request, request_digest, bundle, key) = fixture();
+        for (step, error, expected_code) in [
+            (
+                FixedStep::VerifyDns,
+                BackendError::WaitingUser("DNS is pending".into()),
+                2,
+            ),
+            (
+                FixedStep::VerifyTurn,
+                BackendError::Infrastructure("TURN failed".into()),
+                1,
+            ),
+            (
+                FixedStep::VerifyUpdater,
+                BackendError::Infrastructure("updater failed".into()),
+                1,
+            ),
+        ] {
+            let mut installer = Installer::new(FakeBackend {
+                fail_at: Some((step, error)),
+                ..FakeBackend::default()
+            });
+            assert_eq!(
+                installer
+                    .install(&request_digest, &request, &bundle, &key)
+                    .exit_code(),
+                expected_code
+            );
+            assert_eq!(installer.into_backend().writes, 0);
+        }
+
+        let mut installer = Installer::new(FakeBackend::default());
+        let outcome = installer.install(&request_digest, &request, &bundle, &key);
+        let InstallOutcome::Success(receipt) = outcome else {
+            panic!("all-green runtime did not produce a receipt");
+        };
+        assert_eq!(
+            receipt.receipt.runtime_status,
+            RuntimeStatus::RuntimeHealthy
+        );
+        assert_eq!(
+            receipt.receipt.completed_steps.last(),
+            Some(&FixedStep::VerifyUpdater)
+        );
+        assert_eq!(installer.into_backend().writes, 1);
+    }
+
+    #[test]
+    fn turn_contract_is_credential_backed_3478_without_tls_listener() {
+        let (request, _, _, _) = fixture();
+        let request: InstallRequest = parse_canonical_json(&request).unwrap();
+        let config = render_turn_config(
+            &request,
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        assert!(config.contains("listening-port=3478\n"));
+        assert!(config.contains("use-auth-secret\nstatic-auth-secret="));
+        assert!(config.contains("no-tls\nno-dtls\n"));
+        assert!(config.contains(&format!("external-ip={}\n", request.public_ipv4)));
+        assert!(!config.contains("5349"));
+    }
+
+    #[test]
+    fn runtime_bundle_roles_have_exact_paths_and_modes() {
+        let expected = [
+            (BundleRole::ComposeFile, "runtime/docker-compose.yml", 0o644),
+            (BundleRole::Caddyfile, "runtime/Caddyfile", 0o444),
+            (
+                BundleRole::MessageServerInitializer,
+                "runtime/initialize-message-server.sh",
+                0o555,
+            ),
+            (
+                BundleRole::AgentSecretMaterializer,
+                "runtime/materialize-agent-secrets.sh",
+                0o555,
+            ),
+            (
+                BundleRole::MessageServerEntrypoint,
+                "runtime/message-server-entrypoint.sh",
+                0o555,
+            ),
+            (
+                BundleRole::CapabilityCaInitializer,
+                "runtime/initialize-capability-ca.sh",
+                0o555,
+            ),
+            (
+                BundleRole::PostgresEntrypoint,
+                "runtime/postgres-entrypoint.sh",
+                0o555,
+            ),
+            (
+                BundleRole::PostgresInitializer,
+                "runtime/initialize-postgres.sh",
+                0o555,
+            ),
+            (
+                BundleRole::UpdaterBinary,
+                "updater/dirextalk-updater",
+                0o755,
+            ),
+            (
+                BundleRole::UpdaterUnit,
+                "updater/dirextalk-updater.service",
+                0o644,
+            ),
+        ];
+        assert_eq!(BundleRole::required().len(), expected.len());
+        for (actual, (role, path, mode)) in BundleRole::required().iter().zip(expected) {
+            assert_eq!(*actual, role);
+            assert_eq!(actual.archive_path(), path);
+            assert_eq!(actual.mode(), mode);
+        }
+    }
+
+    #[test]
+    fn strict_runtime_request_rejects_untrusted_network_fields() {
+        let (request, _, _, _) = fixture();
+        let mut request: InstallRequest = parse_canonical_json(&request).unwrap();
+        request.domain = "node.example.com;reboot".into();
+        assert!(request.validate().is_err());
+        request.domain = "node.example.com".into();
+        request.release_catalog_origin = "http://imadmin.dirextalk.ai".into();
+        assert!(request.validate().is_err());
+        request.release_catalog_origin = "https://imadmin.dirextalk.ai".into();
+        request.public_recursive_dns_ipv4 = request.authoritative_dns_ipv4;
+        assert!(request.validate().is_err());
     }
 }
