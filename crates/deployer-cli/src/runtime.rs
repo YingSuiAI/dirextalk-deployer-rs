@@ -1,7 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,13 +20,12 @@ use deployer_core::{
     SourceImageIdentity, SshHostKeyAlgorithm, SshSha256Fingerprint, UnpricedExclusion,
 };
 use deployer_gcp::{
-    AddressSpec, CredentialStore, DiskSpec, DnsChange, DnsPreflightMode, DnsPreflightStatus,
-    DnsRecordSet, DnsZoneIdentity, EncryptedFileStore, FirewallAllowance, FirewallSpec,
-    GcpDiscovery, GcpImageDiscovery, GcpLifecycle, GoogleCloudClient, GoogleInstalledApp,
-    ImageIdentity, InstalledAppConfig, InstanceSpec, KeyringStore, NetworkSpec, Operation,
-    OperationScope, OperationState, PassphraseProvider, Preflight, RequiredQuota, RequiredService,
-    ResourceIdentity, ResourceKind as GcpResourceKind, ResourceSpecRef, SecretStore,
-    SubnetworkSpec, SystemBrowser, longest_matching_zone,
+    AddressSpec, DiskSpec, DnsChange, DnsPreflightMode, DnsPreflightStatus, DnsRecordSet,
+    DnsZoneIdentity, FirewallAllowance, FirewallSpec, GcloudAuthBroker, GcpDiscovery,
+    GcpImageDiscovery, GcpLifecycle, GoogleCloudClient, ImageIdentity, InstanceSpec, NetworkSpec,
+    Operation, OperationScope, OperationState, Preflight, RequiredQuota, RequiredService,
+    ResourceIdentity, ResourceKind as GcpResourceKind, ResourceSpecRef, SubnetworkSpec,
+    longest_matching_zone, require_oauth_principal,
     require_resource_absent as require_gcp_resource_absent, validate_resource_identity,
     validate_resource_properties,
 };
@@ -68,36 +66,26 @@ struct TurnCredentials {
 }
 
 pub struct LiveControlPlane {
-    oauth: GoogleInstalledApp,
+    auth: GcloudAuthBroker,
     releases: Arc<dyn ReleaseCatalog>,
 }
 
 impl LiveControlPlane {
     pub fn new() -> Result<Self> {
         crate::ensure_tls_provider();
-        let config = InstalledAppConfig::from_build().map_err(gcp_error)?;
         let base = BaseDirs::new()
             .ok_or_else(|| EngineError::State("current user home is unavailable".into()))?;
-        let service = "dirextalk-deployer-gcp-v1";
-        let secrets: Arc<dyn SecretStore> = Arc::new(CredentialStore::new(
-            KeyringStore::new(service),
-            EncryptedFileStore::with_passphrase_provider(
-                base.home_dir().join(".dirextalk/credentials"),
-                service,
-                Arc::new(InteractivePassphraseProvider),
-            ),
-        ));
         Ok(Self {
-            oauth: GoogleInstalledApp::new(config, secrets, Arc::new(SystemBrowser)),
+            auth: GcloudAuthBroker::for_home(base.home_dir()).map_err(auth_error)?,
             releases: Arc::new(GithubReleaseCatalog::new()?),
         })
     }
 
     async fn token(&self) -> Result<deployer_gcp::OAuthToken> {
-        self.oauth
-            .refresh()
+        self.auth
+            .token()
             .await
-            .map_err(gcp_error)?
+            .map_err(auth_error)?
             .ok_or_else(|| EngineError::WaitingUser("run `dirextalk-deployer auth login`".into()))
     }
 
@@ -111,9 +99,8 @@ impl LiveControlPlane {
 
     async fn client_for(&self, identity: &ProjectIdentity) -> Result<GoogleCloudClient> {
         let token = self.token().await?;
-        if token.principal != identity.oauth_principal.as_str() {
-            return Err(EngineError::Backend("OAuth principal changed".into()));
-        }
+        require_oauth_principal(identity.oauth_principal.as_str(), &token.principal)
+            .map_err(gcp_error)?;
         GoogleCloudClient::new(
             &identity.project_id,
             identity.project_number.to_string(),
@@ -283,10 +270,10 @@ impl LiveControlPlane {
 #[async_trait]
 impl ControlPlane for LiveControlPlane {
     async fn auth_login(&self) -> Result<SafeResult> {
-        let token = self.oauth.login().await.map_err(gcp_error)?;
+        let token = self.auth.login().await.map_err(auth_error)?;
         Ok(SafeResult::new(
             "AUTH_LOGIN_COMPLETE",
-            "Browser OAuth login completed and the refresh credential was stored securely.",
+            "Google Cloud CLI login completed in the isolated Dirextalk configuration.",
             json!({ "authenticated": !token.principal.is_empty() }),
         ))
     }
@@ -301,10 +288,10 @@ impl ControlPlane for LiveControlPlane {
     }
 
     async fn auth_logout(&self) -> Result<SafeResult> {
-        self.oauth.logout().await.map_err(gcp_error)?;
+        self.auth.logout().await.map_err(auth_error)?;
         Ok(SafeResult::new(
             "AUTH_LOGOUT_COMPLETE",
-            "The stored Google OAuth refresh credential was revoked and removed.",
+            "The isolated Dirextalk Google Cloud CLI credentials were revoked.",
             json!({}),
         ))
     }
@@ -544,9 +531,8 @@ impl DeploymentBackend for LiveControlPlane {
 
     async fn revalidate_project(&self, identity: &ProjectIdentity) -> Result<()> {
         let (token, client) = self.discovery().await?;
-        if token.principal != identity.oauth_principal.as_str() {
-            return Err(EngineError::Backend("OAuth principal changed".into()));
-        }
+        require_oauth_principal(identity.oauth_principal.as_str(), &token.principal)
+            .map_err(gcp_error)?;
         let project = client
             .project(&identity.project_id)
             .await
@@ -2662,38 +2648,22 @@ const fn daemon_name(state: DaemonState) -> &'static str {
     }
 }
 
-struct InteractivePassphraseProvider;
-
-impl PassphraseProvider for InteractivePassphraseProvider {
-    fn passphrase(&self) -> deployer_gcp::Result<SecretString> {
-        if let Ok(passphrase) = std::env::var("DIREXTALK_GCP_CREDENTIAL_PASSPHRASE") {
-            return Ok(SecretString::from(passphrase));
-        }
-        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-            return Err(deployer_gcp::GcpError::CredentialStorage(
-                "encrypted OAuth fallback needs a hidden terminal passphrase prompt".into(),
-            ));
-        }
-        let passphrase = rpassword::prompt_password(
-            "Encrypted OAuth fallback passphrase (minimum 16 characters): ",
-        )
-        .map_err(|_| {
-            deployer_gcp::GcpError::CredentialStorage(
-                "hidden OAuth fallback passphrase prompt failed".into(),
-            )
-        })?;
-        Ok(SecretString::from(passphrase))
-    }
+#[allow(clippy::needless_pass_by_value)]
+fn gcp_error(error: deployer_gcp::GcpError) -> EngineError {
+    EngineError::Backend(error.to_string())
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn gcp_error(error: deployer_gcp::GcpError) -> EngineError {
-    if matches!(error, deployer_gcp::GcpError::CredentialStorage(_))
-        && error.to_string().contains("passphrase")
-    {
-        EngineError::WaitingUser(error.to_string())
-    } else {
-        EngineError::Backend(error.to_string())
+fn auth_error(error: deployer_gcp::GcpError) -> EngineError {
+    match error {
+        deployer_gcp::GcpError::GcloudUnavailable => EngineError::WaitingUser(
+            "Google Cloud CLI is required; install it from https://cloud.google.com/sdk/docs/install"
+                .into(),
+        ),
+        deployer_gcp::GcpError::GcloudUnauthenticated => {
+            EngineError::WaitingUser("run `dirextalk-deployer auth login`".into())
+        }
+        error => EngineError::Backend(error.to_string()),
     }
 }
 

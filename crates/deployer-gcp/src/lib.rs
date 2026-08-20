@@ -21,10 +21,7 @@ pub use lifecycle::{
     ResourceSpecRef, SubnetworkSpec, require_dns_change_applied, require_resource_absent,
     validate_dns_zone_identity, validate_resource_identity, validate_resource_properties,
 };
-pub use oauth::{
-    BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, LoginRequest, OAuthToken,
-    SystemBrowser, product_google_oauth_client_id_sha256,
-};
+pub use oauth::{GcloudAuthBroker, OAuthToken, require_oauth_principal};
 pub use official::{GcpImageDiscovery, GoogleCloudClient, ImageIdentity, validate_image_identity};
 pub use preflight::{
     BillingStatus, DnsPreflightMode, DnsPreflightStatus, DnsZone, GcpDiscovery, Preflight,

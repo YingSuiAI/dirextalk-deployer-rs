@@ -1,148 +1,34 @@
-use std::io::{Read, Write as _};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::Rng;
+use async_trait::async_trait;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use url::Url;
+use zeroize::Zeroizing;
 
-use crate::{GcpError, Result, SecretStore};
+use crate::{GcpError, Result};
 
-const REFRESH_TOKEN_ACCOUNT: &str = "google-oauth-refresh-token";
-const MAX_CALLBACK_HEADER_BYTES: usize = 8192;
-const ACCESS_TOKEN_EXPIRY_MARGIN: Duration = Duration::from_mins(1);
-const PRODUCT_GOOGLE_OAUTH_CLIENT_ID_SOURCE: &str = include_str!("../google-oauth-client-id.txt");
-
-#[derive(Debug, Clone)]
-pub struct InstalledAppConfig {
-    client_id: String,
-    client_secret: Option<SecretString>,
-    scopes: Vec<String>,
-    authorization_endpoint: Url,
-    token_endpoint: Url,
-    revocation_endpoint: Url,
-    userinfo_endpoint: Url,
-    callback_timeout: Duration,
-}
-
-impl InstalledAppConfig {
-    /// Resolves the product-owned native public client id embedded by the
-    /// build. Runtime user input and environment overrides are never accepted.
-    pub fn from_build() -> Result<Self> {
-        let client_id = resolve_client_id(PRODUCT_GOOGLE_OAUTH_CLIENT_ID_SOURCE)?;
-        Self::google(client_id)
-    }
-
-    fn google(client_id: impl Into<String>) -> Result<Self> {
-        Ok(Self {
-            client_id: client_id.into(),
-            client_secret: None,
-            scopes: vec![
-                "openid".into(),
-                "https://www.googleapis.com/auth/cloud-platform".into(),
-            ],
-            authorization_endpoint: Url::parse("https://accounts.google.com/o/oauth2/v2/auth")?,
-            token_endpoint: Url::parse("https://oauth2.googleapis.com/token")?,
-            revocation_endpoint: Url::parse("https://oauth2.googleapis.com/revoke")?,
-            userinfo_endpoint: Url::parse("https://openidconnect.googleapis.com/v1/userinfo")?,
-            callback_timeout: Duration::from_mins(5),
-        })
-    }
-}
-
-fn resolve_client_id(source: &str) -> Result<String> {
-    let Some(value) = source.strip_suffix('\n') else {
-        return Err(GcpError::Contract(
-            "embedded Google OAuth client id source is not canonical".into(),
-        ));
-    };
-    let suffix = ".apps.googleusercontent.com";
-    let Some(prefix) = value.strip_suffix(suffix) else {
-        return Err(GcpError::Contract(
-            "embedded Google OAuth client id has an invalid product identity".into(),
-        ));
-    };
-    if prefix.is_empty()
-        || value.trim() != value
-        || value.contains(['\r', '\n'])
-        || !prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Err(GcpError::Contract(
-            "embedded Google OAuth client id has an invalid product identity".into(),
-        ));
-    }
-    Ok(value.to_owned())
-}
-
-/// Returns the audited identity committed into release provenance without
-/// exposing any runtime or end-user override boundary.
-pub fn product_google_oauth_client_id_sha256() -> Result<String> {
-    let client_id = resolve_client_id(PRODUCT_GOOGLE_OAUTH_CLIENT_ID_SOURCE)?;
-    Ok(hex::encode(Sha256::digest(client_id.as_bytes())))
-}
-
-pub trait BrowserLauncher: Send + Sync {
-    fn open(&self, url: &Url) -> Result<()>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemBrowser;
-
-impl BrowserLauncher for SystemBrowser {
-    fn open(&self, url: &Url) -> Result<()> {
-        open::that(url.as_str()).map_err(|error| {
-            GcpError::Infrastructure(format!("could not open the system browser: {error}"))
-        })
-    }
-}
-
-pub struct GoogleInstalledApp {
-    config: InstalledAppConfig,
-    secrets: Arc<dyn SecretStore>,
-    browser: Arc<dyn BrowserLauncher>,
-    client: reqwest::Client,
-    refresh_lock: tokio::sync::Mutex<()>,
-    token_cache: std::sync::Mutex<Option<CachedToken>>,
-}
-
-impl std::fmt::Debug for GoogleInstalledApp {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GoogleInstalledApp")
-            .field("client_id", &self.config.client_id)
-            .field("client_secret", &"[REDACTED]")
-            .field("scopes", &self.config.scopes)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LoginRequest {
-    pub authorization_url: Url,
-    redirect_uri: Url,
-    state: SecretString,
-    verifier: SecretString,
-}
+const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const SANITIZED_ENVIRONMENT: [&str; 7] = [
+    "CLOUDSDK_ACTIVE_CONFIG_NAME",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "CLOUDSDK_CORE_ACCOUNT",
+    "CLOUDSDK_CORE_DISABLE_PROMPTS",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+];
 
 #[derive(Clone)]
 pub struct OAuthToken {
     pub access_token: SecretString,
-    /// Stable Google OIDC subject (`sub`) used for authorization
-    /// and persisted identity comparisons.
+    /// Stable Google OIDC subject (`sub`) used for authorization and persisted
+    /// identity comparisons. It must never be included in public output.
     pub principal: String,
     pub expires_at: Option<Instant>,
-}
-
-struct CachedToken {
-    credential_fingerprint: [u8; 32],
-    token: OAuthToken,
 }
 
 impl std::fmt::Debug for OAuthToken {
@@ -156,771 +42,687 @@ impl std::fmt::Debug for OAuthToken {
     }
 }
 
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: SecretString,
-    refresh_token: Option<SecretString>,
-    expires_in: Option<u64>,
+/// Fails closed when a deployment is resumed by a different Google account.
+/// The returned error deliberately omits both opaque subjects.
+pub fn require_oauth_principal(expected: &str, observed: &str) -> Result<()> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(GcpError::Authentication(
+            "authenticated Google account changed".into(),
+        ))
+    }
 }
 
-#[derive(Deserialize)]
-struct UserInfo {
-    #[serde(default)]
-    sub: String,
+/// Official `gcloud` authentication broker using a private configuration tree.
+pub struct GcloudAuthBroker {
+    home: PathBuf,
+    config_dir: PathBuf,
+    process: Arc<dyn GcloudProcess>,
+    subject_resolver: Arc<dyn SubjectResolver>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TokenFlow {
-    Login,
-    Refresh,
+impl std::fmt::Debug for GcloudAuthBroker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GcloudAuthBroker")
+            .field("config_dir", &self.config_dir)
+            .finish_non_exhaustive()
+    }
 }
 
-impl GoogleInstalledApp {
-    #[must_use]
-    pub fn new(
-        config: InstalledAppConfig,
-        secrets: Arc<dyn SecretStore>,
-        browser: Arc<dyn BrowserLauncher>,
-    ) -> Self {
+impl GcloudAuthBroker {
+    pub fn for_home(home: &Path) -> Result<Self> {
         crate::ensure_tls_provider();
-        Self {
-            config,
-            secrets,
-            browser,
-            client: reqwest::Client::new(),
-            refresh_lock: tokio::sync::Mutex::new(()),
-            token_cache: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Runs the installed-app loopback flow. The listener binds only IPv4
-    /// loopback, and the callback must carry both the exact CSRF state and a
-    /// single authorization code.
-    pub async fn login(&self) -> Result<OAuthToken> {
-        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-        listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?;
-        let redirect_uri = Url::parse(&format!(
-            "http://127.0.0.1:{}/oauth/callback",
-            address.port()
-        ))?;
-        let request = self.login_request(redirect_uri);
-        eprintln!(
-            "Open this Google authorization URL if the browser did not open automatically:\n{}",
-            request.authorization_url
-        );
-        if let Err(error) = self.browser.open(&request.authorization_url) {
-            eprintln!("The system browser could not be opened ({error}); use the URL above.");
-        }
-
-        let timeout = self.config.callback_timeout;
-        let raw_callback =
-            tokio::task::spawn_blocking(move || receive_callback(&listener, timeout))
-                .await
-                .map_err(|error| {
-                    GcpError::Infrastructure(format!("OAuth listener failed: {error}"))
-                })??;
-        let code = Self::validate_callback(&raw_callback, &request)?;
-        let _refresh = self.refresh_lock.lock().await;
-        self.exchange_code(&code, &request).await
-    }
-
-    pub async fn refresh(&self) -> Result<Option<OAuthToken>> {
-        self.usable_token().await
-    }
-
-    pub async fn usable_token(&self) -> Result<Option<OAuthToken>> {
-        let _refresh = self.refresh_lock.lock().await;
-        let Some(refresh_token) = self.secrets.get(REFRESH_TOKEN_ACCOUNT)? else {
-            self.clear_token_cache()?;
-            return Ok(None);
-        };
-        let credential_fingerprint = self.credential_fingerprint(&refresh_token);
-        if let Some(token) = self.cached_token(&credential_fingerprint)? {
-            return Ok(Some(token));
-        }
-        let mut fields = vec![
-            ("client_id", self.config.client_id.as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.expose_secret()),
-        ];
-        if let Some(secret) = &self.config.client_secret {
-            fields.push(("client_secret", secret.expose_secret()));
-        }
-        let response = self
-            .client
-            .post(self.config.token_endpoint.clone())
-            .form(&fields)
-            .send()
-            .await
-            .map_err(|error| {
-                GcpError::Infrastructure(format!("OAuth token request failed: {error}"))
-            })?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| {
-            GcpError::Infrastructure(format!("OAuth token response failed: {error}"))
-        })?;
-        if !status.is_success() {
-            return Err(GcpError::safe_api(status.as_u16(), &bytes));
-        }
-        let token: TokenResponse = serde_json::from_slice(&bytes)
-            .map_err(|_| GcpError::Authentication("token response was invalid".into()))?;
-        let rotated_refresh = token.refresh_token.clone();
-        let token = self.finish_token(token, TokenFlow::Refresh).await?;
-        let cache_fingerprint = rotated_refresh.as_ref().map_or_else(
-            || credential_fingerprint,
-            |refresh_token| self.credential_fingerprint(refresh_token),
-        );
-        self.store_cached_token(cache_fingerprint, &token)?;
-        Ok(Some(token))
-    }
-
-    pub async fn logout(&self) -> Result<()> {
-        let _refresh = self.refresh_lock.lock().await;
-        self.clear_token_cache()?;
-        let token = self.secrets.get(REFRESH_TOKEN_ACCOUNT)?;
-        if let Some(token) = token {
-            let response = self
-                .client
-                .post(self.config.revocation_endpoint.clone())
-                .form(&[("token", token.expose_secret())])
-                .send()
-                .await
-                .map_err(|error| {
-                    GcpError::Infrastructure(format!("OAuth revocation failed: {error}"))
-                })?;
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let bytes = response.bytes().await.map_err(|error| {
-                    GcpError::Infrastructure(format!("OAuth revocation response failed: {error}"))
-                })?;
-                return Err(GcpError::safe_api(status, &bytes));
-            }
-        }
-        self.secrets.delete(REFRESH_TOKEN_ACCOUNT)
-    }
-
-    fn login_request(&self, redirect_uri: Url) -> LoginRequest {
-        let state = random_secret(32);
-        let verifier = random_secret(32);
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.expose_secret().as_bytes()));
-        let mut authorization_url = self.config.authorization_endpoint.clone();
-        authorization_url
-            .query_pairs_mut()
-            .append_pair("client_id", &self.config.client_id)
-            .append_pair("redirect_uri", redirect_uri.as_str())
-            .append_pair("response_type", "code")
-            .append_pair("scope", &self.config.scopes.join(" "))
-            .append_pair("state", state.expose_secret())
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("access_type", "offline")
-            .append_pair("prompt", "consent");
-        LoginRequest {
-            authorization_url,
-            redirect_uri,
-            state,
-            verifier,
-        }
-    }
-
-    fn validate_callback(raw_target: &str, request: &LoginRequest) -> Result<String> {
-        let callback = request.redirect_uri.join(raw_target)?;
-        if callback.scheme() != "http"
-            || callback.host_str() != Some("127.0.0.1")
-            || callback.port() != request.redirect_uri.port()
-            || callback.path() != request.redirect_uri.path()
-        {
-            return Err(GcpError::OAuthValidation(
-                "callback did not target the bound loopback redirect".into(),
-            ));
-        }
-        let values: Vec<_> = callback.query_pairs().into_owned().collect();
-        let state = unique_parameter(&values, "state")?;
-        if state.as_deref() != Some(request.state.expose_secret()) {
-            return Err(GcpError::OAuthValidation("CSRF state did not match".into()));
-        }
-        if let Some(error) = unique_parameter(&values, "error")? {
-            return Err(GcpError::Authentication(format!(
-                "authorization server returned {error}"
-            )));
-        }
-        unique_parameter(&values, "code")?
-            .filter(|code| !code.is_empty())
-            .ok_or_else(|| GcpError::OAuthValidation("authorization code was missing".into()))
-    }
-
-    async fn exchange_code(&self, code: &str, request: &LoginRequest) -> Result<OAuthToken> {
-        let mut fields = vec![
-            ("client_id", self.config.client_id.as_str()),
-            ("code", code),
-            ("code_verifier", request.verifier.expose_secret()),
-            ("grant_type", "authorization_code"),
-            ("redirect_uri", request.redirect_uri.as_str()),
-        ];
-        if let Some(secret) = &self.config.client_secret {
-            fields.push(("client_secret", secret.expose_secret()));
-        }
-        let response = self
-            .client
-            .post(self.config.token_endpoint.clone())
-            .form(&fields)
-            .send()
-            .await
-            .map_err(|error| {
-                GcpError::Infrastructure(format!("OAuth code exchange failed: {error}"))
-            })?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| {
-            GcpError::Infrastructure(format!("OAuth code response failed: {error}"))
-        })?;
-        if !status.is_success() {
-            return Err(GcpError::safe_api(status.as_u16(), &bytes));
-        }
-        let token: TokenResponse = serde_json::from_slice(&bytes)
-            .map_err(|_| GcpError::Authentication("token response was invalid".into()))?;
-        self.finish_token(token, TokenFlow::Login).await
-    }
-
-    async fn finish_token(&self, token: TokenResponse, flow: TokenFlow) -> Result<OAuthToken> {
-        let response = self
-            .client
-            .get(self.config.userinfo_endpoint.clone())
-            .bearer_auth(token.access_token.expose_secret())
-            .send()
-            .await
-            .map_err(|error| {
-                GcpError::Infrastructure(format!("OAuth userinfo request failed: {error}"))
-            })?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| {
-            GcpError::Infrastructure(format!("OAuth userinfo response failed: {error}"))
-        })?;
-        if !status.is_success() {
-            return Err(GcpError::safe_api(status.as_u16(), &bytes));
-        }
-        let user: UserInfo = serde_json::from_slice(&bytes)
-            .map_err(|_| GcpError::Authentication("userinfo response was invalid".into()))?;
-        self.complete_token(token, user, flow)
-    }
-
-    fn complete_token(
-        &self,
-        token: TokenResponse,
-        user: UserInfo,
-        flow: TokenFlow,
-    ) -> Result<OAuthToken> {
-        let principal = validate_user_info(user)?;
-        match (flow, token.refresh_token.as_ref()) {
-            (TokenFlow::Login, None) => {
-                return Err(GcpError::Authentication(
-                    "login did not return an offline refresh credential; existing credential was not changed"
-                        .into(),
-                ));
-            }
-            (TokenFlow::Login | TokenFlow::Refresh, Some(refresh_token)) => {
-                self.secrets.set(REFRESH_TOKEN_ACCOUNT, refresh_token)?;
-                self.clear_token_cache()?;
-            }
-            (TokenFlow::Refresh, None) => {}
-        }
-        Ok(OAuthToken {
-            access_token: token.access_token,
-            principal,
-            expires_at: token
-                .expires_in
-                .map(|seconds| Instant::now() + Duration::from_secs(seconds)),
+        let subject_resolver = GoogleSubjectResolver::new()?;
+        Ok(Self {
+            home: home.to_path_buf(),
+            config_dir: home.join(".dirextalk/gcloud"),
+            process: Arc::new(RealGcloudProcess),
+            subject_resolver: Arc::new(subject_resolver),
         })
     }
 
-    fn credential_fingerprint(&self, refresh_token: &SecretString) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(b"dirextalk-google-oauth-cache-v1\0");
-        digest.update(self.config.client_id.as_bytes());
-        digest.update(b"\0");
-        digest.update(refresh_token.expose_secret().as_bytes());
-        digest.finalize().into()
+    pub async fn login(&self) -> Result<OAuthToken> {
+        let output = self
+            .run(&["auth", "login", "--brief"], OutputMode::Interactive)
+            .await?;
+        if !output.success {
+            return Err(GcpError::GcloudUnauthenticated);
+        }
+        self.token().await?.ok_or(GcpError::GcloudUnauthenticated)
     }
 
-    fn cached_token(&self, credential_fingerprint: &[u8; 32]) -> Result<Option<OAuthToken>> {
-        let cache = self.token_cache.lock().map_err(|_| {
-            GcpError::Infrastructure("OAuth access-token cache lock was poisoned".into())
+    pub async fn token(&self) -> Result<Option<OAuthToken>> {
+        if !self.has_active_account().await? {
+            return Ok(None);
+        }
+        let output = self
+            .run(&["auth", "print-access-token"], OutputMode::Captured)
+            .await?;
+        if !output.success {
+            return Err(GcpError::GcloudUnauthenticated);
+        }
+        let access_token = parse_access_token(&output.stdout)?;
+        let principal = self.subject_resolver.resolve(&access_token).await?;
+        Ok(Some(OAuthToken {
+            access_token,
+            principal,
+            expires_at: None,
+        }))
+    }
+
+    pub async fn logout(&self) -> Result<()> {
+        if !self.has_active_account().await? {
+            return Ok(());
+        }
+        let output = self
+            .run(
+                &["auth", "revoke", "--all", "--quiet"],
+                OutputMode::Interactive,
+            )
+            .await?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(GcpError::Infrastructure(
+                "gcloud authentication revoke failed".into(),
+            ))
+        }
+    }
+
+    async fn has_active_account(&self) -> Result<bool> {
+        let output = self
+            .run(
+                &[
+                    "auth",
+                    "list",
+                    "--filter=status:ACTIVE",
+                    "--format=value(status)",
+                ],
+                OutputMode::Captured,
+            )
+            .await?;
+        if !output.success {
+            return Err(GcpError::Infrastructure(
+                "gcloud authentication status failed".into(),
+            ));
+        }
+        if output.stdout.len() > 1024 {
+            return Err(GcpError::Contract(
+                "gcloud authentication status output is invalid".into(),
+            ));
+        }
+        let status = std::str::from_utf8(&output.stdout).map_err(|_| {
+            GcpError::Contract("gcloud authentication status output is invalid".into())
         })?;
-        Ok(cache
-            .as_ref()
-            .filter(|cached| {
-                &cached.credential_fingerprint == credential_fingerprint
-                    && token_is_usable(&cached.token, Instant::now())
+        let status = status.trim();
+        if status.is_empty() {
+            Ok(false)
+        } else if status.lines().all(|line| line.trim() == "ACTIVE") {
+            Ok(true)
+        } else {
+            Err(GcpError::Contract(
+                "gcloud authentication status output is invalid".into(),
+            ))
+        }
+    }
+
+    async fn run(&self, args: &[&'static str], output: OutputMode) -> Result<GcloudProcessOutput> {
+        prepare_isolated_config(&self.home, &self.config_dir)?;
+        self.process
+            .run(GcloudInvocation {
+                args: args.to_vec(),
+                config_dir: self.config_dir.clone(),
+                output,
             })
-            .map(|cached| cached.token.clone()))
+            .await
     }
 
-    fn store_cached_token(
-        &self,
-        credential_fingerprint: [u8; 32],
-        token: &OAuthToken,
-    ) -> Result<()> {
-        let mut cache = self.token_cache.lock().map_err(|_| {
-            GcpError::Infrastructure("OAuth access-token cache lock was poisoned".into())
-        })?;
-        *cache = token_is_usable(token, Instant::now()).then(|| CachedToken {
-            credential_fingerprint,
-            token: token.clone(),
-        });
-        Ok(())
-    }
-
-    fn clear_token_cache(&self) -> Result<()> {
-        let mut cache = self.token_cache.lock().map_err(|_| {
-            GcpError::Infrastructure("OAuth access-token cache lock was poisoned".into())
-        })?;
-        *cache = None;
-        Ok(())
-    }
-}
-
-fn token_is_usable(token: &OAuthToken, now: Instant) -> bool {
-    token
-        .expires_at
-        .is_some_and(|expires_at| expires_at > now + ACCESS_TOKEN_EXPIRY_MARGIN)
-}
-
-fn validate_user_info(user: UserInfo) -> Result<String> {
-    if user.sub.trim().is_empty() {
-        return Err(GcpError::Authentication(
-            "Google userinfo subject was missing".into(),
-        ));
-    }
-    Ok(user.sub)
-}
-
-fn unique_parameter(values: &[(String, String)], key: &str) -> Result<Option<String>> {
-    let mut matches = values.iter().filter(|(name, _)| name == key);
-    let value = matches.next().map(|(_, value)| value.clone());
-    if matches.next().is_some() {
-        return Err(GcpError::OAuthValidation(format!(
-            "OAuth callback contained duplicate {key} parameters"
-        )));
-    }
-    Ok(value)
-}
-
-fn random_secret(bytes: usize) -> SecretString {
-    let mut value = vec![0_u8; bytes];
-    rand::rng().fill_bytes(&mut value);
-    SecretString::from(URL_SAFE_NO_PAD.encode(value))
-}
-
-fn receive_callback(listener: &TcpListener, timeout: Duration) -> Result<String> {
-    let deadline = Instant::now() + timeout;
-    let (mut stream, peer) = loop {
-        match listener.accept() {
-            Ok(connection) => break connection,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(GcpError::OAuthValidation(
-                        "timed out waiting for browser callback".into(),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error.into()),
+    #[cfg(test)]
+    fn with_components(
+        home: &Path,
+        process: Arc<dyn GcloudProcess>,
+        subject_resolver: Arc<dyn SubjectResolver>,
+    ) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            config_dir: home.join(".dirextalk/gcloud"),
+            process,
+            subject_resolver,
         }
-    };
-    if !peer.ip().is_loopback() {
-        return Err(GcpError::OAuthValidation(
-            "callback peer was not loopback".into(),
-        ));
     }
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let bytes = read_callback_headers(&mut stream)?;
-    let request = std::str::from_utf8(&bytes)
-        .map_err(|_| GcpError::OAuthValidation("callback was not valid HTTP".into()))?;
-    let mut lines = request
-        .strip_suffix("\r\n\r\n")
-        .unwrap_or(request)
-        .split("\r\n");
-    let first_line = lines.next().unwrap_or_default();
-    let mut parts = first_line.split_whitespace();
-    if parts.next() != Some("GET")
-        || parts.next().is_none()
-        || !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1"))
-        || parts.next().is_some()
-    {
-        return Err(GcpError::OAuthValidation(
-            "callback request line was invalid".into(),
-        ));
-    }
-    let target = first_line
-        .split_whitespace()
-        .nth(1)
-        .expect("validated request line has a target");
-    if lines.any(|line| {
-        line.split_once(':')
-            .is_none_or(|(name, _)| name.is_empty() || name.contains([' ', '\t']))
-    }) {
-        return Err(GcpError::OAuthValidation(
-            "callback headers were malformed".into(),
-        ));
-    }
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: 55\r\n\r\nAuthorization received. You may close this browser window.")?;
-    Ok(target.to_owned())
 }
 
-fn read_callback_headers(reader: &mut impl Read) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(1024);
-    let mut chunk = [0_u8; 1024];
-    loop {
-        let remaining = MAX_CALLBACK_HEADER_BYTES.saturating_sub(bytes.len());
-        if remaining == 0 {
-            return Err(GcpError::OAuthValidation(
-                "callback headers exceeded the size limit".into(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Interactive,
+    Captured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GcloudInvocation {
+    args: Vec<&'static str>,
+    config_dir: PathBuf,
+    output: OutputMode,
+}
+
+struct GcloudProcessOutput {
+    success: bool,
+    stdout: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for GcloudProcessOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GcloudProcessOutput")
+            .field("success", &self.success)
+            .field("stdout", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[async_trait]
+trait GcloudProcess: Send + Sync {
+    async fn run(&self, invocation: GcloudInvocation) -> Result<GcloudProcessOutput>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealGcloudProcess;
+
+#[async_trait]
+impl GcloudProcess for RealGcloudProcess {
+    async fn run(&self, invocation: GcloudInvocation) -> Result<GcloudProcessOutput> {
+        tokio::task::spawn_blocking(move || run_gcloud(&invocation))
+            .await
+            .map_err(|_| GcpError::Infrastructure("gcloud process task failed".into()))?
+    }
+}
+
+fn run_gcloud(invocation: &GcloudInvocation) -> Result<GcloudProcessOutput> {
+    let mut command = Command::new("gcloud");
+    command.args(&invocation.args);
+    command.env("CLOUDSDK_CONFIG", &invocation.config_dir);
+    for name in SANITIZED_ENVIRONMENT {
+        command.env_remove(name);
+    }
+
+    match invocation.output {
+        OutputMode::Interactive => {
+            command
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            let mut child = command
+                .spawn()
+                .map_err(|error| classify_process_error(&error))?;
+            let mut stdout = child.stdout.take().ok_or_else(|| {
+                GcpError::Infrastructure("gcloud interactive output is unavailable".into())
+            })?;
+            let copy_result = std::io::copy(&mut stdout, &mut std::io::stderr().lock());
+            let status = child
+                .wait()
+                .map_err(|error| classify_process_error(&error))?;
+            copy_result.map_err(|_| {
+                GcpError::Infrastructure("could not relay gcloud interactive output".into())
+            })?;
+            Ok(GcloudProcessOutput {
+                success: status.success(),
+                stdout: Zeroizing::new(Vec::new()),
+            })
+        }
+        OutputMode::Captured => {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let output = command
+                .output()
+                .map_err(|error| classify_process_error(&error))?;
+            Ok(GcloudProcessOutput {
+                success: output.status.success(),
+                stdout: Zeroizing::new(output.stdout),
+            })
+        }
+    }
+}
+
+fn classify_process_error(error: &std::io::Error) -> GcpError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        GcpError::GcloudUnavailable
+    } else {
+        GcpError::Infrastructure("could not execute gcloud".into())
+    }
+}
+
+fn parse_access_token(stdout: &[u8]) -> Result<SecretString> {
+    if stdout.is_empty() || stdout.len() > 16 * 1024 {
+        return Err(GcpError::GcloudUnauthenticated);
+    }
+    let token = stdout
+        .strip_suffix(b"\n")
+        .unwrap_or(stdout)
+        .strip_suffix(b"\r")
+        .unwrap_or_else(|| stdout.strip_suffix(b"\n").unwrap_or(stdout));
+    if token.is_empty() || !token.iter().all(u8::is_ascii_graphic) {
+        return Err(GcpError::GcloudUnauthenticated);
+    }
+    let token = std::str::from_utf8(token).map_err(|_| GcpError::GcloudUnauthenticated)?;
+    Ok(SecretString::from(token.to_owned()))
+}
+
+#[async_trait]
+trait SubjectResolver: Send + Sync {
+    async fn resolve(&self, access_token: &SecretString) -> Result<String>;
+}
+
+#[derive(Debug, Clone)]
+struct GoogleSubjectResolver {
+    client: reqwest::Client,
+}
+
+impl GoogleSubjectResolver {
+    fn new() -> Result<Self> {
+        let client = reqwest::Client::builder().build().map_err(|_| {
+            GcpError::Infrastructure("could not initialize Google identity client".into())
+        })?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl SubjectResolver for GoogleSubjectResolver {
+    async fn resolve(&self, access_token: &SecretString) -> Result<String> {
+        #[derive(Deserialize)]
+        struct UserInfo {
+            sub: String,
+        }
+
+        let response = self
+            .client
+            .get(USERINFO_ENDPOINT)
+            .bearer_auth(access_token.expose_secret())
+            .send()
+            .await
+            .map_err(|_| GcpError::Infrastructure("Google identity request failed".into()))?;
+        if !response.status().is_success() {
+            return Err(GcpError::Authentication(
+                "Google identity rejected the gcloud access token".into(),
             ));
         }
-        let read_limit = remaining.min(chunk.len());
-        let count = reader.read(&mut chunk[..read_limit])?;
-        if count == 0 {
-            return Err(GcpError::OAuthValidation(
-                "callback headers were incomplete".into(),
+        let info: UserInfo = response
+            .json()
+            .await
+            .map_err(|_| GcpError::Infrastructure("Google identity response was invalid".into()))?;
+        if info.sub.is_empty()
+            || info.sub.len() > 255
+            || !info.sub.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(GcpError::Contract(
+                "Google identity subject is invalid".into(),
             ));
         }
-        bytes.extend_from_slice(&chunk[..count]);
-        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            let end = position + 4;
-            if bytes[end..].iter().any(|byte| !byte.is_ascii_whitespace()) {
-                return Err(GcpError::OAuthValidation(
-                    "callback contained unexpected trailing data".into(),
+        Ok(info.sub)
+    }
+}
+
+fn prepare_isolated_config(home: &Path, config_dir: &Path) -> Result<()> {
+    if !home.is_absolute() || config_dir != home.join(".dirextalk/gcloud") {
+        return Err(GcpError::Contract(
+            "isolated gcloud configuration path is invalid".into(),
+        ));
+    }
+    reject_symlink_components(home)?;
+    validate_owned_directory(home)?;
+    let private_root = home.join(".dirextalk");
+    require_directory(&private_root, true, false)?;
+    require_directory(config_dir, true, true)?;
+    Ok(())
+}
+
+fn reject_symlink_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(OsStr::new("/"))),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(GcpError::Contract(
+                    "isolated gcloud configuration path is invalid".into(),
                 ));
             }
-            bytes.truncate(end);
-            return Ok(bytes);
+            Component::Normal(part) => {
+                current.push(part);
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(GcpError::Contract(
+                        "isolated gcloud configuration path is not a real directory".into(),
+                    ));
+                }
+            }
         }
     }
+    Ok(())
+}
+
+fn require_directory(path: &Path, create: bool, restrict: bool) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(GcpError::Contract(
+                    "isolated gcloud configuration path is not a real directory".into(),
+                ));
+            }
+        }
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(GcpError::Contract(
+                    "isolated gcloud configuration path is not a real directory".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    validate_owned_directory(path)?;
+    if restrict {
+        restrict_directory(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_owned_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.uid() == rustix::process::geteuid().as_raw() {
+        Ok(())
+    } else {
+        Err(GcpError::Contract(
+            "isolated gcloud configuration directory has the wrong owner".into(),
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_owned_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(GcpError::Contract(
+            "isolated gcloud configuration directory has the wrong owner".into(),
+        ));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::Read;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex};
 
     use secrecy::{ExposeSecret as _, SecretString};
-    use url::Url;
 
     use super::{
-        BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, OAuthToken, TokenFlow,
-        TokenResponse, UserInfo, product_google_oauth_client_id_sha256, read_callback_headers,
-        resolve_client_id, token_is_usable, validate_user_info,
+        GcloudAuthBroker, GcloudInvocation, GcloudProcess, GcloudProcessOutput, OAuthToken,
+        OutputMode, SubjectResolver, require_oauth_principal,
     };
-    use crate::{GcpError, Result, SecretStore};
+    use crate::{GcpError, Result};
 
-    struct NoBrowser;
-    impl BrowserLauncher for NoBrowser {
-        fn open(&self, _url: &Url) -> Result<()> {
-            Ok(())
-        }
+    #[derive(Default)]
+    struct FakeProcess {
+        outputs: Mutex<VecDeque<Result<GcloudProcessOutput>>>,
+        invocations: Mutex<Vec<GcloudInvocation>>,
     }
 
-    struct FragmentedReader {
-        fragments: VecDeque<Vec<u8>>,
-    }
-
-    impl Read for FragmentedReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let Some(mut fragment) = self.fragments.pop_front() else {
-                return Ok(0);
-            };
-            let count = fragment.len().min(buffer.len());
-            buffer[..count].copy_from_slice(&fragment[..count]);
-            if count < fragment.len() {
-                fragment.drain(..count);
-                self.fragments.push_front(fragment);
-            }
-            Ok(count)
-        }
-    }
-    struct NoSecrets;
-    impl SecretStore for NoSecrets {
-        fn get(&self, _account: &str) -> Result<Option<SecretString>> {
-            Ok(None)
-        }
-        fn set(&self, _account: &str, _value: &SecretString) -> Result<()> {
-            Ok(())
-        }
-        fn delete(&self, _account: &str) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    struct RecordingSecrets {
-        value: Mutex<Option<String>>,
-        set_calls: AtomicUsize,
-    }
-
-    impl RecordingSecrets {
-        fn with_value(value: &str) -> Self {
+    impl FakeProcess {
+        fn new(outputs: impl IntoIterator<Item = Result<GcloudProcessOutput>>) -> Self {
             Self {
-                value: Mutex::new(Some(value.to_owned())),
-                set_calls: AtomicUsize::new(0),
+                outputs: Mutex::new(outputs.into_iter().collect()),
+                invocations: Mutex::new(Vec::new()),
             }
         }
 
-        fn value(&self) -> Option<String> {
-            self.value.lock().expect("credential lock").clone()
+        fn invocations(&self) -> Vec<GcloudInvocation> {
+            self.invocations.lock().expect("invocations").clone()
         }
     }
 
-    impl SecretStore for RecordingSecrets {
-        fn get(&self, _account: &str) -> Result<Option<SecretString>> {
-            Ok(self.value().map(SecretString::from))
-        }
-
-        fn set(&self, _account: &str, value: &SecretString) -> Result<()> {
-            self.set_calls.fetch_add(1, Ordering::SeqCst);
-            *self.value.lock().expect("credential lock") = Some(value.expose_secret().to_owned());
-            Ok(())
-        }
-
-        fn delete(&self, _account: &str) -> Result<()> {
-            *self.value.lock().expect("credential lock") = None;
-            Ok(())
+    #[async_trait::async_trait]
+    impl GcloudProcess for FakeProcess {
+        async fn run(&self, invocation: GcloudInvocation) -> Result<GcloudProcessOutput> {
+            self.invocations
+                .lock()
+                .expect("invocations")
+                .push(invocation);
+            self.outputs
+                .lock()
+                .expect("outputs")
+                .pop_front()
+                .expect("queued process output")
         }
     }
 
-    fn app_with_secrets(secrets: Arc<dyn SecretStore>) -> GoogleInstalledApp {
-        GoogleInstalledApp::new(
-            InstalledAppConfig::google("client-id").expect("config"),
-            secrets,
-            Arc::new(NoBrowser),
-        )
-    }
+    struct FakeSubject(&'static str);
 
-    fn app() -> GoogleInstalledApp {
-        app_with_secrets(Arc::new(NoSecrets))
-    }
-
-    fn token(refresh_token: Option<&str>) -> TokenResponse {
-        TokenResponse {
-            access_token: SecretString::from("access-token-secret"),
-            refresh_token: refresh_token.map(SecretString::from),
-            expires_in: Some(3600),
+    #[async_trait::async_trait]
+    impl SubjectResolver for FakeSubject {
+        async fn resolve(&self, _access_token: &SecretString) -> Result<String> {
+            Ok(self.0.into())
         }
     }
 
-    fn user(sub: &str) -> UserInfo {
-        UserInfo {
-            sub: sub.to_owned(),
+    fn success(stdout: &[u8]) -> GcloudProcessOutput {
+        GcloudProcessOutput {
+            success: true,
+            stdout: zeroize::Zeroizing::new(stdout.to_vec()),
         }
     }
 
-    #[test]
-    fn login_request_uses_pkce_s256_and_callback_rejects_wrong_state() {
-        let app = app();
-        let redirect = Url::parse("http://127.0.0.1:12345/oauth/callback").expect("url");
-        let request = app.login_request(redirect);
-        let params: std::collections::HashMap<_, _> = request
-            .authorization_url
-            .query_pairs()
-            .into_owned()
-            .collect();
+    fn failure() -> GcloudProcessOutput {
+        GcloudProcessOutput {
+            success: false,
+            stdout: zeroize::Zeroizing::new(Vec::new()),
+        }
+    }
+
+    fn broker(
+        home: &std::path::Path,
+        process: Arc<FakeProcess>,
+        subject: &'static str,
+    ) -> GcloudAuthBroker {
+        GcloudAuthBroker::with_components(home, process, Arc::new(FakeSubject(subject)))
+    }
+
+    #[tokio::test]
+    async fn token_uses_isolated_fixed_commands_and_preserves_subject() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([
+            Ok(success(b"ACTIVE\n")),
+            Ok(success(b"secret-access-token\n")),
+        ]));
+        let auth = broker(home.path(), Arc::clone(&process), "opaque-subject-1");
+
+        let token = auth.token().await.expect("token").expect("authenticated");
+        assert_eq!(token.access_token.expose_secret(), "secret-access-token");
+        assert_eq!(token.principal, "opaque-subject-1");
         assert_eq!(
-            params.get("code_challenge_method").map(String::as_str),
-            Some("S256")
-        );
-        assert!(
-            params
-                .get("code_challenge")
-                .is_some_and(|value| !value.is_empty())
-        );
-        let error = GoogleInstalledApp::validate_callback(
-            "/oauth/callback?state=attacker&code=secret-code",
-            &request,
-        )
-        .expect_err("wrong state must fail");
-        assert!(matches!(error, GcpError::OAuthValidation(_)));
-        assert!(!format!("{error:?}").contains("secret-code"));
-    }
-
-    #[test]
-    fn product_build_uses_the_single_source_owned_public_client() {
-        let config = InstalledAppConfig::from_build().expect("source-owned config");
-        assert_eq!(
-            config.client_id,
-            "211802699132-blfhais5rcnd470kapaagpd12hpq9gck.apps.googleusercontent.com"
-        );
-        assert!(config.client_secret.is_none());
-        assert_eq!(
-            product_google_oauth_client_id_sha256().expect("client identity"),
-            "eb775d252766588e3b87c8975e1f84226b524155ad6e28d5d5d6921a8dfd64a3"
-        );
-    }
-
-    #[test]
-    fn product_client_source_shape_fails_closed() {
-        for value in [
-            "",
-            "client-id",
-            " client.apps.googleusercontent.com",
-            "client.apps.googleusercontent.com ",
-            "client.apps.googleusercontent.com\nextra",
-            "client.apps.googleusercontent.com",
-        ] {
-            assert!(resolve_client_id(value).is_err(), "{value:?}");
-        }
-        assert_eq!(
-            resolve_client_id("client.apps.googleusercontent.com\n").expect("client id"),
-            "client.apps.googleusercontent.com"
-        );
-    }
-
-    #[test]
-    fn callback_requires_exact_loopback_path_and_code() {
-        let app = app();
-        let redirect = Url::parse("http://127.0.0.1:12345/oauth/callback").expect("url");
-        let request = app.login_request(redirect);
-        let state = request
-            .authorization_url
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .expect("state")
-            .1
-            .into_owned();
-        let wrong_path = format!("/other?state={state}&code=code");
-        assert!(GoogleInstalledApp::validate_callback(&wrong_path, &request).is_err());
-        let valid = format!("/oauth/callback?state={state}&code=one-time-code");
-        assert_eq!(
-            GoogleInstalledApp::validate_callback(&valid, &request).expect("valid"),
-            "one-time-code"
-        );
-        let duplicate = format!("/oauth/callback?state={state}&state={state}&code=one-time-code");
-        assert!(GoogleInstalledApp::validate_callback(&duplicate, &request).is_err());
-    }
-
-    #[test]
-    fn callback_headers_may_arrive_fragmented_but_not_pipelined() {
-        let mut fragmented = FragmentedReader {
-            fragments: [
-                b"GET /oauth/call".to_vec(),
-                b"back?state=s&code=c HTTP/1.1\r\nHo".to_vec(),
-                b"st: 127.0.0.1\r\n\r\n".to_vec(),
+            process.invocations(),
+            [
+                GcloudInvocation {
+                    args: vec![
+                        "auth",
+                        "list",
+                        "--filter=status:ACTIVE",
+                        "--format=value(status)",
+                    ],
+                    config_dir: home.path().join(".dirextalk/gcloud"),
+                    output: OutputMode::Captured,
+                },
+                GcloudInvocation {
+                    args: vec!["auth", "print-access-token"],
+                    config_dir: home.path().join(".dirextalk/gcloud"),
+                    output: OutputMode::Captured,
+                },
             ]
-            .into(),
-        };
-        let headers = read_callback_headers(&mut fragmented).expect("fragmented headers");
-        assert_eq!(
-            headers,
-            b"GET /oauth/callback?state=s&code=c HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
         );
+    }
 
-        let mut pipelined = FragmentedReader {
-            fragments: [
-                b"GET /oauth/callback HTTP/1.1\r\n\r\nGET /again HTTP/1.1\r\n\r\n".to_vec(),
+    #[tokio::test]
+    async fn empty_active_account_is_expected_unauthenticated_state() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([Ok(success(b"\n"))]));
+        let auth = broker(home.path(), Arc::clone(&process), "unused");
+
+        assert!(auth.token().await.expect("status").is_none());
+        assert_eq!(process.invocations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_failures_are_distinct_from_unauthenticated_state() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([Err(GcpError::Infrastructure(
+            "simulated process failure".into(),
+        ))]));
+        let auth = broker(home.path(), process, "unused");
+        assert!(matches!(
+            auth.token().await,
+            Err(GcpError::Infrastructure(_))
+        ));
+
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([Ok(success(b"ACTIVE\n")), Ok(failure())]));
+        let auth = broker(home.path(), process, "unused");
+        assert!(matches!(
+            auth.token().await,
+            Err(GcpError::GcloudUnauthenticated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_gcloud_error_is_preserved() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([Err(GcpError::GcloudUnavailable)]));
+        let auth = broker(home.path(), process, "unused");
+        assert!(matches!(
+            auth.token().await,
+            Err(GcpError::GcloudUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_is_interactive_then_returns_a_short_lived_token() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([
+            Ok(success(b"")),
+            Ok(success(b"ACTIVE\n")),
+            Ok(success(b"secret-access-token\n")),
+        ]));
+        let auth = broker(home.path(), Arc::clone(&process), "opaque-subject");
+
+        auth.login().await.expect("login");
+        let invocations = process.invocations();
+        assert_eq!(invocations[0].args, ["auth", "login", "--brief"]);
+        assert_eq!(invocations[0].output, OutputMode::Interactive);
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_only_the_isolated_configuration() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([
+            Ok(success(b"ACTIVE\n")),
+            Ok(success(b"")),
+        ]));
+        let auth = broker(home.path(), Arc::clone(&process), "unused");
+
+        auth.logout().await.expect("logout");
+        assert_eq!(
+            process.invocations(),
+            [
+                GcloudInvocation {
+                    args: vec![
+                        "auth",
+                        "list",
+                        "--filter=status:ACTIVE",
+                        "--format=value(status)",
+                    ],
+                    config_dir: home.path().join(".dirextalk/gcloud"),
+                    output: OutputMode::Captured,
+                },
+                GcloudInvocation {
+                    args: vec!["auth", "revoke", "--all", "--quiet"],
+                    config_dir: home.path().join(".dirextalk/gcloud"),
+                    output: OutputMode::Interactive,
+                },
             ]
-            .into(),
-        };
-        let error = read_callback_headers(&mut pipelined).expect_err("trailing request must fail");
-        assert!(matches!(error, GcpError::OAuthValidation(_)));
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_is_idempotent_without_an_isolated_session() {
+        let home = tempfile::tempdir().expect("home");
+        let process = Arc::new(FakeProcess::new([Ok(success(b"\n"))]));
+        let auth = broker(home.path(), Arc::clone(&process), "unused");
+
+        auth.logout().await.expect("logout");
+        assert_eq!(process.invocations().len(), 1);
     }
 
     #[test]
-    fn userinfo_rejects_missing_and_empty_subject() {
-        for raw in [r"{}", r#"{"sub":""}"#] {
-            let user: UserInfo = serde_json::from_str(raw).expect("userinfo shape");
-            let error = validate_user_info(user).expect_err("subject is required");
-            assert!(matches!(error, GcpError::Authentication(_)));
-        }
-    }
+    fn account_switch_and_debug_output_do_not_disclose_identity_or_token() {
+        let error = require_oauth_principal("old-subject", "new-subject").expect_err("switch");
+        let error_text = error.to_string();
+        assert!(!error_text.contains("old-subject"));
+        assert!(!error_text.contains("new-subject"));
 
-    #[test]
-    fn oauth_principal_is_the_opaque_stable_subject() {
-        let principal = validate_user_info(user("stable-subject-123")).expect("valid identity");
-
-        assert_eq!(principal, "stable-subject-123");
-    }
-
-    #[test]
-    fn login_validates_identity_before_committing_refresh_credential() {
-        let secrets = Arc::new(RecordingSecrets::with_value("old-account-refresh"));
-        let app = app_with_secrets(secrets.clone());
-
-        let error = app
-            .complete_token(
-                token(Some("new-account-refresh")),
-                user(""),
-                TokenFlow::Login,
-            )
-            .expect_err("invalid subject must fail");
-
-        assert_eq!(secrets.value().as_deref(), Some("old-account-refresh"));
-        assert_eq!(secrets.set_calls.load(Ordering::SeqCst), 0);
-        let debug = format!("{error:?}");
-        assert!(!debug.contains("access-token-secret"));
-        assert!(!debug.contains("new-account-refresh"));
-    }
-
-    #[test]
-    fn login_requires_a_new_offline_refresh_credential() {
-        let secrets = Arc::new(RecordingSecrets::with_value("old-account-refresh"));
-        let app = app_with_secrets(secrets.clone());
-
-        let error = app
-            .complete_token(token(None), user("new-subject"), TokenFlow::Login)
-            .expect_err("login without refresh token must fail");
-
-        assert_eq!(secrets.value().as_deref(), Some("old-account-refresh"));
-        assert_eq!(secrets.set_calls.load(Ordering::SeqCst), 0);
-        assert!(!format!("{error:?}").contains("access-token-secret"));
-    }
-
-    #[test]
-    fn refresh_may_retain_existing_credential_after_subject_validation() {
-        let secrets = Arc::new(RecordingSecrets::with_value("existing-refresh"));
-        let app = app_with_secrets(secrets.clone());
-
-        let refreshed = app
-            .complete_token(token(None), user("stable-subject"), TokenFlow::Refresh)
-            .expect("refresh without token rotation");
-
-        assert_eq!(refreshed.principal, "stable-subject");
-        assert_eq!(secrets.value().as_deref(), Some("existing-refresh"));
-        assert_eq!(secrets.set_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn oauth_token_debug_redacts_access_token() {
         let token = OAuthToken {
-            access_token: SecretString::from("access-token-secret"),
-            principal: "stable-subject".into(),
+            access_token: SecretString::from("secret-access-token"),
+            principal: "new-subject".into(),
             expires_at: None,
         };
-
         let debug = format!("{token:?}");
-        assert!(!debug.contains("access-token-secret"));
-        assert!(!debug.contains("stable-subject"));
-        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret-access-token"));
+        assert!(!debug.contains("new-subject"));
+
+        let output = GcloudProcessOutput {
+            success: true,
+            stdout: zeroize::Zeroizing::new(b"operator@example.test\n".to_vec()),
+        };
+        assert!(!format!("{output:?}").contains("operator@example.test"));
     }
 
-    #[test]
-    fn cached_access_token_requires_conservative_remaining_lifetime() {
-        let now = Instant::now();
-        let token = |expires_at| OAuthToken {
-            access_token: SecretString::from("access-token-secret"),
-            principal: "stable-subject".into(),
-            expires_at,
-        };
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_config_parent_is_rejected_before_process_execution() {
+        use std::os::unix::fs::symlink;
 
-        assert!(token_is_usable(
-            &token(Some(now + Duration::from_secs(61))),
-            now
-        ));
-        assert!(!token_is_usable(
-            &token(Some(now + Duration::from_mins(1))),
-            now
-        ));
-        assert!(!token_is_usable(&token(None), now));
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        symlink(target.path(), home.path().join(".dirextalk")).expect("symlink");
+        let process = Arc::new(FakeProcess::new([Ok(success(b"\n"))]));
+        let auth = broker(home.path(), Arc::clone(&process), "unused");
+
+        assert!(matches!(auth.token().await, Err(GcpError::Contract(_))));
+        assert!(process.invocations().is_empty());
+        assert!(!target.path().join("gcloud").exists());
     }
 }

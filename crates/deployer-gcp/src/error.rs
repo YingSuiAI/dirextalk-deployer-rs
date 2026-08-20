@@ -2,6 +2,10 @@
 /// to Google's non-sensitive status/message fields before entering this type.
 #[derive(Debug, thiserror::Error)]
 pub enum GcpError {
+    #[error("Google Cloud CLI is unavailable")]
+    GcloudUnavailable,
+    #[error("the isolated Google Cloud CLI session is not authenticated")]
+    GcloudUnauthenticated,
     #[error("authentication failed: {0}")]
     Authentication(String),
     #[error("OAuth callback validation failed: {0}")]

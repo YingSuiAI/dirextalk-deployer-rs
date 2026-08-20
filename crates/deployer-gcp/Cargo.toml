@@ -19,8 +19,6 @@ google-cloud-compute-v1 = { version = "3.4.0", default-features = false, feature
 google-cloud-dns-v1 = { version = "1.7.0", default-features = false }
 google-cloud-gax = { version = "1.13.0", default-features = false }
 google-cloud-resourcemanager-v3 = { version = "1.12.0", default-features = false }
-hex.workspace = true
-open.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["form"] }
 rustls.workspace = true
