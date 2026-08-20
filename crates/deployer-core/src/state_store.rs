@@ -23,6 +23,7 @@ pub struct StateStore {
     seal_key: Zeroizing<[u8; 32]>,
     directory_identity: FilesystemIdentity,
     lock_identity: FilesystemIdentity,
+    seal_key_identity: FilesystemIdentity,
 }
 
 impl StateStore {
@@ -49,12 +50,14 @@ impl StateStore {
         let directory_identity = path_identity(paths.root())?;
         let lock_identity = file_identity(&lock)?;
         let seal_key = load_or_create_seal_key(&paths)?;
+        let seal_key_identity = path_identity(&paths.state_seal_key_file())?;
         let store = Self {
             paths,
             lock,
             seal_key,
             directory_identity,
             lock_identity,
+            seal_key_identity,
         };
         store.revalidate_filesystem_identity()?;
         Ok(store)
@@ -141,18 +144,22 @@ impl StateStore {
             .persist(self.paths.state_file())
             .map_err(|error| CoreError::io("replace state", error.error))?;
         sync_directory(self.paths.root())?;
+        self.revalidate_filesystem_identity()?;
         Ok(())
     }
 
     fn revalidate_filesystem_identity(&self) -> Result<()> {
         reject_symlink(self.paths.root())?;
         reject_symlink(&self.paths.lock_file())?;
+        reject_symlink(&self.paths.state_seal_key_file())?;
         if path_identity(self.paths.root())? != self.directory_identity
             || path_identity(&self.paths.lock_file())? != self.lock_identity
+            || path_identity(&self.paths.state_seal_key_file())? != self.seal_key_identity
         {
             return Err(CoreError::UnsafeFilesystemObject);
         }
         validate_owner(self.paths.root())?;
+        validate_owner(&self.paths.state_seal_key_file())?;
         validate_owner_file(&self.lock)
     }
 }
@@ -566,6 +573,22 @@ mod tests {
         let displaced = temporary.path().join("displaced-service");
         fs::rename(&original, &displaced).unwrap();
         fs::create_dir(&original).unwrap();
+        assert!(matches!(
+            store.write(&state(service_id)),
+            Err(CoreError::UnsafeFilesystemObject)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_same_name_seal_key_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let service_id = "production-0123456789ab";
+        let store = StateStore::open(temporary.path(), service_id).unwrap();
+        let key_path = store.paths().state_seal_key_file();
+        let displaced = store.paths().root().join("displaced-state.key");
+        fs::rename(&key_path, displaced).unwrap();
+        fs::write(&key_path, [7_u8; 32]).unwrap();
         assert!(matches!(
             store.write(&state(service_id)),
             Err(CoreError::UnsafeFilesystemObject)

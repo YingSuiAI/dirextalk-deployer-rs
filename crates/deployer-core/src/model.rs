@@ -15,7 +15,7 @@ pub struct ProjectIdentity {
 }
 
 /// The lifecycle phase durably reached by a deployment.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentPhase {
     Planned,
@@ -28,7 +28,7 @@ pub enum DeploymentPhase {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectAction {
     Create,
@@ -36,7 +36,7 @@ pub enum EffectAction {
     Delete,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Network,
@@ -52,6 +52,8 @@ pub enum ResourceKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationRef {
+    /// The original idempotency request id, equal to `PendingEffect.effect_id`.
+    pub request_id: Uuid,
     pub project_number: u64,
     pub location: String,
     pub numeric_id: u64,
@@ -62,6 +64,7 @@ pub struct OperationRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingEffect {
+    /// Persisted before mutation and reused as the provider request id.
     pub effect_id: Uuid,
     pub deployment_uuid: Uuid,
     pub project_number: u64,
@@ -70,6 +73,9 @@ pub struct PendingEffect {
     pub resource_name: String,
     pub location: String,
     pub expected_attributes: BTreeMap<String, String>,
+    /// Exact pre-mutation target. Required for update/delete and forbidden for
+    /// create, so a retry can never cross into a same-name replacement.
+    pub target: Option<ResourceRef>,
     pub operation: Option<OperationRef>,
 }
 
@@ -77,6 +83,8 @@ pub struct PendingEffect {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceRef {
+    pub resource_kind: ResourceKind,
+    pub name: String,
     pub project_number: u64,
     pub location: String,
     pub numeric_id: u64,
@@ -101,20 +109,20 @@ pub struct GcpResources {
 }
 
 impl GcpResources {
-    fn iter(&self) -> impl Iterator<Item = &ResourceRef> {
+    fn iter(&self) -> impl Iterator<Item = (ResourceKind, &ResourceRef)> {
         [
-            self.network.as_ref(),
-            self.subnet.as_ref(),
-            self.web_firewall.as_ref(),
-            self.turn_firewall.as_ref(),
-            self.ssh_firewall.as_ref(),
-            self.address.as_ref(),
-            self.instance.as_ref(),
-            self.boot_disk.as_ref(),
-            self.dns_record.as_ref(),
+            (ResourceKind::Network, self.network.as_ref()),
+            (ResourceKind::Subnet, self.subnet.as_ref()),
+            (ResourceKind::Firewall, self.web_firewall.as_ref()),
+            (ResourceKind::Firewall, self.turn_firewall.as_ref()),
+            (ResourceKind::Firewall, self.ssh_firewall.as_ref()),
+            (ResourceKind::Address, self.address.as_ref()),
+            (ResourceKind::Instance, self.instance.as_ref()),
+            (ResourceKind::Disk, self.boot_disk.as_ref()),
+            (ResourceKind::DnsRecord, self.dns_record.as_ref()),
         ]
         .into_iter()
-        .flatten()
+        .filter_map(|(kind, resource)| resource.map(|resource| (kind, resource)))
     }
 }
 
@@ -208,12 +216,17 @@ impl DeploymentState {
                 "active deployment requires an approved plan digest",
             ));
         }
-        for resource in self.gcp_resources.iter() {
+        for (expected_kind, resource) in self.gcp_resources.iter() {
             validate_resource(
                 resource,
                 self.project_identity.project_number,
                 self.deployment_uuid,
             )?;
+            if resource.resource_kind != expected_kind {
+                return Err(CoreError::InvalidState(
+                    "resource kind does not match its state slot",
+                ));
+            }
         }
         if let Some(effect) = &self.pending_effect {
             validate_effect(
@@ -247,11 +260,14 @@ impl DeploymentState {
     }
 }
 
-fn validate_resource(
+pub(crate) fn validate_resource(
     resource: &ResourceRef,
     project_number: u64,
     deployment_uuid: Uuid,
 ) -> Result<()> {
+    if resource.name.is_empty() {
+        return Err(CoreError::InvalidState("resource name is incomplete"));
+    }
     if resource.project_number != project_number {
         return Err(CoreError::InvalidState(
             "resource project identity mismatch",
@@ -262,10 +278,14 @@ fn validate_resource(
             "resource deployment identity mismatch",
         ));
     }
-    if resource.numeric_id == 0 || resource.self_link.is_empty() || resource.location.is_empty() {
+    if resource.numeric_id == 0
+        || !safe_public_name(&resource.name)
+        || !safe_location(&resource.location)
+        || !trusted_google_self_link(&resource.self_link)
+    {
         return Err(CoreError::InvalidState("resource identity is incomplete"));
     }
-    validate_attribute_keys(&resource.observed_attributes)
+    validate_attributes(&resource.observed_attributes)
 }
 
 fn validate_effect(
@@ -290,17 +310,37 @@ fn validate_effect(
     if effect.project_number != project_number || effect.deployment_uuid != deployment_uuid {
         return Err(CoreError::InvalidState("pending effect identity mismatch"));
     }
+    match (effect.action, &effect.target) {
+        (EffectAction::Create, None) => {}
+        (EffectAction::Update | EffectAction::Delete, Some(target)) => {
+            validate_resource(target, project_number, deployment_uuid)?;
+            if target.resource_kind != effect.resource_kind
+                || target.name != effect.resource_name
+                || target.location != effect.location
+            {
+                return Err(CoreError::InvalidState(
+                    "pending effect target identity mismatch",
+                ));
+            }
+        }
+        _ => {
+            return Err(CoreError::InvalidState(
+                "pending effect target identity is missing or unexpected",
+            ));
+        }
+    }
     if effect.resource_name.is_empty() || effect.location.is_empty() {
         return Err(CoreError::InvalidState(
             "pending effect identity is incomplete",
         ));
     }
-    validate_attribute_keys(&effect.expected_attributes)?;
+    validate_attributes(&effect.expected_attributes)?;
     if let Some(operation) = &effect.operation
-        && (operation.project_number != effect.project_number
+        && (operation.request_id != effect.effect_id
+            || operation.project_number != effect.project_number
             || operation.numeric_id == 0
-            || operation.self_link.is_empty()
-            || operation.location.is_empty())
+            || !trusted_google_self_link(&operation.self_link)
+            || !safe_location(&operation.location))
     {
         return Err(CoreError::InvalidState("operation identity mismatch"));
     }
@@ -330,8 +370,8 @@ fn validate_host(state: &DeploymentState) -> Result<()> {
     Ok(())
 }
 
-fn validate_attribute_keys(attributes: &BTreeMap<String, String>) -> Result<()> {
-    for key in attributes.keys() {
+pub(crate) fn validate_attributes(attributes: &BTreeMap<String, String>) -> Result<()> {
+    for (key, value) in attributes {
         let normalized = key.to_ascii_lowercase();
         if key.is_empty()
             || key.len() > 64
@@ -342,6 +382,10 @@ fn validate_attribute_keys(attributes: &BTreeMap<String, String>) -> Result<()> 
                 "token",
                 "secret",
                 "password",
+                "credential",
+                "authorization",
+                "cookie",
+                "bearer",
                 "private_key",
                 "initialization_code",
                 "conversation",
@@ -353,8 +397,90 @@ fn validate_attribute_keys(attributes: &BTreeMap<String, String>) -> Result<()> 
                 "resource attributes contain an unsafe key",
             ));
         }
+        if !safe_attribute_value(key, value) {
+            return Err(CoreError::InvalidState(
+                "resource attributes contain an unsafe value",
+            ));
+        }
     }
     Ok(())
+}
+
+fn safe_attribute_value(key: &str, value: &str) -> bool {
+    if value.is_empty() || value.len() > 2_048 {
+        return false;
+    }
+    match key {
+        "name" | "type" | "machine_type" | "status" | "zone_name" => safe_public_name(value),
+        "service_account" => value == "none",
+        "cidr" => valid_ipv4_cidr(value, false),
+        "source" => valid_ipv4_cidr(value, true),
+        "ports" => value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b":,-".contains(&byte)
+        }),
+        "size_gib" | "zone_numeric_id" | "ttl" => {
+            value.parse::<u64>().is_ok_and(|number| number > 0)
+        }
+        "overwrite_approved" => matches!(value, "true" | "false"),
+        "address" | "value" => value.parse::<std::net::Ipv4Addr>().is_ok(),
+        "current_values" => serde_json::from_str::<Vec<std::net::Ipv4Addr>>(value).is_ok(),
+        "tags" => serde_json::from_str::<Vec<String>>(value)
+            .is_ok_and(|tags| !tags.is_empty() && tags.iter().all(|tag| safe_public_name(tag))),
+        "network_self_link" | "subnet_self_link" => trusted_google_self_link(value),
+        _ => false,
+    }
+}
+
+fn safe_public_name(value: &str) -> bool {
+    (1..=253).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn safe_location(value: &str) -> bool {
+    value == "global" || safe_public_name(value)
+}
+
+fn trusted_google_self_link(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host == "googleapis.com" || host.ends_with(".googleapis.com"))
+}
+
+fn valid_ipv4_cidr(value: &str, require_host: bool) -> bool {
+    let Some((address, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let (Ok(address), Ok(prefix)) = (address.parse::<std::net::Ipv4Addr>(), prefix.parse::<u32>())
+    else {
+        return false;
+    };
+    if prefix > 32 || (require_host && prefix != 32) {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    u32::from(address) & mask == u32::from(address)
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -380,14 +506,28 @@ pub enum ProgressStatus {
     Failed,
 }
 
+/// Fixed operation labels prevent credentials or conversation content from
+/// entering JSON/JSONL through free-form progress fields.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressOperation {
+    Plan,
+    Apply,
+    Resume,
+    Destroy,
+    Verify,
+    CloudEffect,
+    HostInstall,
+    ConnectInstall,
+}
+
 /// Secret-free structured progress suitable for human, JSON, or JSONL output.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgressEvent {
     pub timestamp_unix_ms: u64,
-    pub operation: String,
+    pub operation: ProgressOperation,
     pub status: ProgressStatus,
-    pub message: String,
     pub resource_kind: Option<ResourceKind>,
 }
 
@@ -431,6 +571,8 @@ mod tests {
             self_link: "https://compute.googleapis.com/network/1".to_owned(),
             deployment_uuid: state.deployment_uuid,
             observed_attributes: BTreeMap::new(),
+            resource_kind: ResourceKind::Network,
+            name: "network".to_owned(),
         });
         assert!(matches!(
             state.validate(),
@@ -443,8 +585,9 @@ mod tests {
     #[test]
     fn pending_operation_must_match_effect_project() {
         let mut state = state();
+        let effect_id = Uuid::new_v4();
         state.pending_effect = Some(PendingEffect {
-            effect_id: Uuid::new_v4(),
+            effect_id,
             deployment_uuid: state.deployment_uuid,
             project_number: 42,
             action: EffectAction::Create,
@@ -452,7 +595,9 @@ mod tests {
             resource_name: "network".to_owned(),
             location: "global".to_owned(),
             expected_attributes: BTreeMap::new(),
+            target: None,
             operation: Some(OperationRef {
+                request_id: effect_id,
                 project_number: 43,
                 location: "global".to_owned(),
                 numeric_id: 7,
@@ -460,6 +605,51 @@ mod tests {
             }),
         });
         assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn delete_requires_full_target_and_operation_request_binding() {
+        let mut state = state();
+        state.phase = DeploymentPhase::Destroying;
+        let target = ResourceRef {
+            resource_kind: ResourceKind::Network,
+            name: "network".to_owned(),
+            project_number: 42,
+            location: "global".to_owned(),
+            numeric_id: 8,
+            self_link: "https://compute.googleapis.com/network/8".to_owned(),
+            deployment_uuid: state.deployment_uuid,
+            observed_attributes: BTreeMap::from([("name".to_owned(), "network".to_owned())]),
+        };
+        let effect_id = Uuid::new_v4();
+        let mut effect = PendingEffect {
+            effect_id,
+            deployment_uuid: state.deployment_uuid,
+            project_number: 42,
+            action: EffectAction::Delete,
+            resource_kind: ResourceKind::Network,
+            resource_name: "network".to_owned(),
+            location: "global".to_owned(),
+            expected_attributes: BTreeMap::new(),
+            target: None,
+            operation: None,
+        };
+        state.pending_effect = Some(effect.clone());
+        assert!(state.validate().is_err());
+
+        effect.target = Some(target);
+        effect.operation = Some(OperationRef {
+            request_id: Uuid::new_v4(),
+            project_number: 42,
+            location: "global".to_owned(),
+            numeric_id: 9,
+            self_link: "https://compute.googleapis.com/operation/9".to_owned(),
+        });
+        state.pending_effect = Some(effect.clone());
+        assert!(state.validate().is_err());
+        effect.operation.as_mut().unwrap().request_id = effect_id;
+        state.pending_effect = Some(effect);
+        assert!(state.validate().is_ok());
     }
 
     #[test]
@@ -489,11 +679,37 @@ mod tests {
                 "oauth_refresh_token".to_owned(),
                 "never-persist-this".to_owned(),
             )]),
+            resource_kind: ResourceKind::Network,
+            name: "network".to_owned(),
         });
         assert!(matches!(
             state.validate(),
             Err(CoreError::InvalidState(
                 "resource attributes contain an unsafe key"
+            ))
+        ));
+    }
+
+    #[test]
+    fn state_rejects_untyped_or_secret_capable_attribute_values() {
+        let mut state = state();
+        state.gcp_resources.address = Some(ResourceRef {
+            project_number: 42,
+            location: "us-central1".to_owned(),
+            numeric_id: 1,
+            self_link: "https://compute.googleapis.com/address/1".to_owned(),
+            deployment_uuid: state.deployment_uuid,
+            observed_attributes: BTreeMap::from([(
+                "address".to_owned(),
+                "not-an-ip-or-token".to_owned(),
+            )]),
+            resource_kind: ResourceKind::Address,
+            name: "static-ip".to_owned(),
+        });
+        assert!(matches!(
+            state.validate(),
+            Err(CoreError::InvalidState(
+                "resource attributes contain an unsafe value"
             ))
         ));
     }

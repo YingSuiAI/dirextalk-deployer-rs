@@ -16,6 +16,8 @@ pub enum CoreError {
     CanonicalSerialization,
     #[error("plan digest must have the form `sha256:<64 lowercase hexadecimal characters>`")]
     InvalidPlanDigest,
+    #[error("deployment plan is not valid: {0}")]
+    InvalidPlan(&'static str),
     #[error("service id is invalid")]
     InvalidServiceId,
     #[error("deployment state is not valid: {0}")]

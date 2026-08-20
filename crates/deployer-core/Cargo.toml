@@ -23,6 +23,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 uuid.workspace = true
+url.workspace = true
 zeroize.workspace = true
 
 [lints]

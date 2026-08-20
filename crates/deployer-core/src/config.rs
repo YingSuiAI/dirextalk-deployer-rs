@@ -168,9 +168,7 @@ impl DeploymentConfig {
         if !valid_ipv4_host_cidr(&self.operator_ssh_cidr) {
             return invalid("operator_ssh_cidr", "must be a canonical IPv4 /32 CIDR");
         }
-        if !self.maximum_monthly_usd.is_finite() || self.maximum_monthly_usd <= 0.0 {
-            return invalid("maximum_monthly_usd", "must be a finite positive amount");
-        }
+        self.maximum_monthly_microusd()?;
         if let ReleaseSelection::Exact(release) = &self.release
             && !valid_exact_release(release)
         {
@@ -183,6 +181,33 @@ impl DeploymentConfig {
             );
         }
         Ok(())
+    }
+
+    /// Returns the budget as exact millionths of one USD for canonical plans.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ConfigValidation`] if the amount is non-positive,
+    /// non-finite, out of range, or has more than six fractional digits.
+    pub fn maximum_monthly_microusd(&self) -> Result<u64> {
+        let amount = self.maximum_monthly_usd;
+        if !amount.is_finite() || amount <= 0.0 {
+            return invalid("maximum_monthly_usd", "must be a finite positive amount");
+        }
+        let scaled = amount * 1_000_000.0;
+        let rounded = scaled.round();
+        if rounded > 9_007_199_254_740_991.0 || (scaled - rounded).abs() > 1e-6 {
+            return invalid(
+                "maximum_monthly_usd",
+                "must fit unsigned micro-USD with at most six fractional digits",
+            );
+        }
+        format!("{rounded:.0}")
+            .parse()
+            .map_err(|_| CoreError::ConfigValidation {
+                field: "maximum_monthly_usd",
+                reason: "must fit exact micro-USD",
+            })
     }
 }
 
@@ -363,6 +388,20 @@ release = "stable"
         assert!(matches!(
             DeploymentConfig::parse(&legacy),
             Err(CoreError::ConfigParse)
+        ));
+    }
+
+    #[test]
+    fn budget_has_an_exact_canonical_integer_form() {
+        let config = DeploymentConfig::parse(MINIMAL).unwrap();
+        assert_eq!(config.maximum_monthly_microusd().unwrap(), 150_000_000);
+        let excessive_precision = MINIMAL.replace("150.0", "0.1234567");
+        assert!(matches!(
+            DeploymentConfig::parse(&excessive_precision),
+            Err(CoreError::ConfigValidation {
+                field: "maximum_monthly_usd",
+                ..
+            })
         ));
     }
 }
