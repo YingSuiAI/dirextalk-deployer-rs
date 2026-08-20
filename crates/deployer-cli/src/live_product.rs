@@ -31,6 +31,7 @@ pub(crate) struct HttpProductApi {
 
 impl HttpProductApi {
     pub(crate) fn new() -> Result<Self> {
+        crate::ensure_tls_provider();
         let client = reqwest::Client::builder()
             .https_only(true)
             .build()

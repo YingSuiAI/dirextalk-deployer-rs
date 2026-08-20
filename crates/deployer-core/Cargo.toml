@@ -11,10 +11,10 @@ description = "Core contracts and durable state for the Dirextalk GCP deployer"
 directories.workspace = true
 fs4 = "1.1.0"
 hex.workspace = true
-hmac = "0.12.1"
-libc = "0.2.180"
+hmac = "0.13.0"
+libc = "0.2.189"
 rand.workspace = true
-rustix = { version = "1.1.2", features = ["process"] }
+rustix = { version = "1.1.4", features = ["process"] }
 serde.workspace = true
 serde-value = "0.7.0"
 serde_json.workspace = true

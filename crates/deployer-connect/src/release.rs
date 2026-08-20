@@ -113,6 +113,7 @@ impl ReleaseResolver {
     ///
     /// Returns an error when the client cannot be built.
     pub fn new() -> Result<Self, ReleaseError> {
+        crate::ensure_tls_provider();
         let client = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::limited(5))

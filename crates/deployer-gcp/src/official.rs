@@ -81,6 +81,7 @@ impl GoogleCloudClient {
         project_number: impl Into<String>,
         access_token: SecretString,
     ) -> Result<Self> {
+        crate::ensure_tls_provider();
         let project_id = project_id.into();
         let project_number = project_number.into();
         let token = access_token.expose_secret();

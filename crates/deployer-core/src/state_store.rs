@@ -5,7 +5,7 @@ use std::{
 };
 
 use fs4::{FileExt, TryLockError};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::Sha256;
 use zeroize::Zeroizing;

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/deployer-cli",
+    "crates/deployer-connect",
+    "crates/deployer-core",
+    "crates/deployer-gcp",
+    "crates/deployer-host",
+    "crates/deployer-transport",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.0"
+license = "MIT"
+repository = "https://github.com/YingSuiAI/dirextalk-deployer-rs"
+
+[workspace.dependencies]
+aes-gcm = "0.11.0"
+argon2 = "0.5.3"
+async-trait = "0.1.92"
+base64 = "0.23.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+directories = "6.0.0"
+hex = "0.4.3"
+http = "1.5.0"
+keyring = "4.1.6"
+open = "5.4.1"
+rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+toml = "1.1.4"
+tonic = { version = "0.14.6", default-features = false, features = ["tls-ring"] }
+url = { version = "2.5.8", features = ["serde"] }
+uuid = { version = "1.24.1", features = ["serde", "v4", "v7"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

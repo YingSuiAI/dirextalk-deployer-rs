@@ -58,7 +58,7 @@ impl Sha256Digest {
 
     #[must_use]
     pub fn calculate(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)))
+        Self(hex::encode(Sha256::digest(bytes)))
     }
 
     #[must_use]
@@ -341,7 +341,7 @@ impl HostTransport for SshClient {
             hasher.update(&buffer[..count]);
         }
         if total != bytes.len()
-            || format!("{:x}", hasher.finalize()) != Sha256Digest::calculate(bytes).as_str()
+            || hex::encode(hasher.finalize()) != Sha256Digest::calculate(bytes).as_str()
         {
             return Err(TransportError::UploadVerification);
         }

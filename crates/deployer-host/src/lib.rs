@@ -2,7 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -123,7 +123,7 @@ impl DigestHex {
 
     #[must_use]
     pub fn calculate(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)))
+        Self(hex::encode(Sha256::digest(bytes)))
     }
 
     #[must_use]

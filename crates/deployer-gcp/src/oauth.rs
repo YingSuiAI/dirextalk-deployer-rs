@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::RngCore;
+use rand::Rng;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -184,6 +184,7 @@ impl GoogleInstalledApp {
         secrets: Arc<dyn SecretStore>,
         browser: Arc<dyn BrowserLauncher>,
     ) -> Self {
+        crate::ensure_tls_provider();
         Self {
             config,
             secrets,

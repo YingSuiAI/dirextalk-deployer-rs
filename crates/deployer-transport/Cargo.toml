@@ -7,9 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hex = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
-ssh2 = "0.9.5"
+ssh2 = "0.9.6"
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 

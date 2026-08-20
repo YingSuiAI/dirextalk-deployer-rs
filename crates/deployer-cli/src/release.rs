@@ -55,6 +55,7 @@ pub struct GithubReleaseCatalog {
 
 impl GithubReleaseCatalog {
     pub fn new() -> Result<Self> {
+        crate::ensure_tls_provider();
         let audited_public_key = option_env!("DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
@@ -692,7 +693,7 @@ fn validate_url(asset: &GithubAsset, tag: &str) -> Result<()> {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn decode_hex<const N: usize>(value: &str) -> std::result::Result<[u8; N], ()> {

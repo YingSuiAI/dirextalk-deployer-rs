@@ -19,10 +19,12 @@ deployer-gcp = { path = "../deployer-gcp" }
 deployer-host = { path = "../deployer-host" }
 deployer-transport = { path = "../deployer-transport" }
 directories.workspace = true
-ed25519-dalek = "2.2.0"
+ed25519-dalek = "3.0.0"
+hex.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 rand.workspace = true
-rpassword = "7.4.0"
+rpassword = "7.5.4"
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

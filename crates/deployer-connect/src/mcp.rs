@@ -56,6 +56,7 @@ impl HttpMcpTransport {
     /// Returns an error unless the endpoint is canonical HTTPS `/mcp`, the
     /// token is non-empty, and an HTTPS client can be built.
     pub fn new(endpoint: &str, agent_token: impl Into<String>) -> Result<Self, McpError> {
+        crate::ensure_tls_provider();
         let endpoint =
             Url::parse(endpoint).map_err(|error| McpError::InvalidEndpoint(error.to_string()))?;
         if endpoint.scheme() != "https"

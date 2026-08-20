@@ -33,6 +33,12 @@ pub use release::{
 };
 pub use status::{ConnectStatus, Redactor};
 
+pub(crate) fn ensure_tls_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     #[error("invalid service id: {0}")]

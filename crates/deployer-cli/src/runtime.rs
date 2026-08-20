@@ -22,10 +22,10 @@ use deployer_core::{
 };
 use deployer_gcp::{
     AddressSpec, CredentialStore, DiskSpec, DnsChange, DnsPreflightMode, DnsPreflightStatus,
-    DnsRecordSet, EncryptedFileStore, FirewallAllowance, FirewallSpec, GcpDiscovery,
-    GcpImageDiscovery, GcpLifecycle, GoogleCloudClient, GoogleInstalledApp, ImageIdentity,
-    InstalledAppConfig, InstanceSpec, KeyringStore, NetworkSpec, Operation, OperationScope,
-    OperationState, PassphraseProvider, Preflight, RequiredQuota, RequiredService,
+    DnsRecordSet, DnsZoneIdentity, EncryptedFileStore, FirewallAllowance, FirewallSpec,
+    GcpDiscovery, GcpImageDiscovery, GcpLifecycle, GoogleCloudClient, GoogleInstalledApp,
+    ImageIdentity, InstalledAppConfig, InstanceSpec, KeyringStore, NetworkSpec, Operation,
+    OperationScope, OperationState, PassphraseProvider, Preflight, RequiredQuota, RequiredService,
     ResourceIdentity, ResourceKind as GcpResourceKind, ResourceSpecRef, SecretStore,
     SubnetworkSpec, SystemBrowser, longest_matching_zone,
     require_resource_absent as require_gcp_resource_absent, validate_resource_identity,
@@ -40,7 +40,7 @@ use deployer_transport::{
     RemoteArtifact, Sha256Digest, SshClient,
 };
 use directories::BaseDirs;
-use rand::RngCore as _;
+use rand::Rng as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -74,6 +74,7 @@ pub struct LiveControlPlane {
 
 impl LiveControlPlane {
     pub fn new() -> Result<Self> {
+        crate::ensure_tls_provider();
         let config = InstalledAppConfig::from_environment().map_err(gcp_error)?;
         let base = BaseDirs::new()
             .ok_or_else(|| EngineError::State("current user home is unavailable".into()))?;
@@ -487,10 +488,15 @@ impl DeploymentBackend for LiveControlPlane {
                 DnsPreflightStatus::Available,
             ) => match longest_matching_zone(&config.domain, &report.zones) {
                 Some(zone) => {
+                    let zone_identity = DnsZoneIdentity {
+                        project_id: config.project_id.clone(),
+                        name: zone.name.clone(),
+                        numeric_id: zone.id.clone(),
+                    };
                     let record = client
-                        .dns_record_set(
-                            &config.project_id,
-                            &zone.name,
+                        .get_dns_record_set(
+                            &project.project_number,
+                            &zone_identity,
                             &format!("{}.", config.domain),
                             "A",
                         )
@@ -645,7 +651,7 @@ impl DeploymentBackend for LiveControlPlane {
                 "recorded operation request id differs from the pending effect".into(),
             ));
         }
-        let operation = gcp_operation(effect, recorded)?;
+        let operation = gcp_operation(state, effect, recorded)?;
         let client = self.client_for(&state.project_identity).await?;
         for _ in 0..900 {
             self.revalidate_project(&state.project_identity).await?;
@@ -1180,7 +1186,7 @@ async fn start_dns_update(
     state: &DeploymentState,
     effect: &PendingEffect,
 ) -> Result<Option<Operation>> {
-    let zone = required_attribute(effect, "zone_name")?.to_owned();
+    let zone = dns_zone_for_effect(state, effect)?;
     let current: Vec<String> = effect
         .expected_attributes
         .get("current_values")
@@ -1223,10 +1229,15 @@ async fn start_dns_delete(
     state: &DeploymentState,
     effect: &PendingEffect,
 ) -> Result<Option<Operation>> {
-    let zone = required_attribute(effect, "zone_name")?;
+    let zone = dns_zone_for_effect(state, effect)?;
     let name = format!("{}.", effect.resource_name.trim_end_matches('.'));
     let Some(observed) = client
-        .dns_record_set(&state.project_identity.project_id, zone, &name, "A")
+        .get_dns_record_set(
+            &state.project_identity.project_number.to_string(),
+            &zone,
+            &name,
+            "A",
+        )
         .await
         .map_err(gcp_error)?
     else {
@@ -1244,7 +1255,7 @@ async fn start_dns_delete(
             &state.project_identity.project_number.to_string(),
             effect.effect_id,
             &DnsChange {
-                managed_zone: zone.to_owned(),
+                managed_zone: zone,
                 expected_current: Some(observed.clone()),
                 additions: Vec::new(),
                 deletions: vec![observed],
@@ -1281,11 +1292,11 @@ async fn require_dns_absent(
     state: &DeploymentState,
     effect: &PendingEffect,
 ) -> Result<()> {
-    let zone = required_attribute(effect, "zone_name")?;
+    let zone = dns_zone_for_effect(state, effect)?;
     let observed = client
-        .dns_record_set(
-            &state.project_identity.project_id,
-            zone,
+        .get_dns_record_set(
+            &state.project_identity.project_number.to_string(),
+            &zone,
             &format!("{}.", effect.resource_name.trim_end_matches('.')),
             "A",
         )
@@ -1318,9 +1329,13 @@ fn operation_ref(effect: &PendingEffect, operation: &Operation) -> Result<Operat
     })
 }
 
-fn gcp_operation(effect: &PendingEffect, recorded: &OperationRef) -> Result<Operation> {
+fn gcp_operation(
+    state: &DeploymentState,
+    effect: &PendingEffect,
+    recorded: &OperationRef,
+) -> Result<Operation> {
     let scope = if effect.resource_kind == CoreResourceKind::DnsRecord {
-        OperationScope::DnsZone(required_attribute(effect, "zone_name")?.to_owned())
+        OperationScope::DnsZone(dns_zone_for_effect(state, effect)?)
     } else {
         match effect.resource_kind {
             CoreResourceKind::Network | CoreResourceKind::Firewall => OperationScope::Global,
@@ -1346,16 +1361,16 @@ async fn dns_effect_receipt(
     state: &DeploymentState,
     effect: &PendingEffect,
 ) -> Result<EffectReceipt> {
-    let zone = required_attribute(effect, "zone_name")?;
+    let zone = dns_zone_for_effect(state, effect)?;
     let expected = effect
         .expected_attributes
         .get("value")
         .cloned()
         .unwrap_or(public_ipv4(state)?.to_string());
     let record = client
-        .dns_record_set(
-            &state.project_identity.project_id,
-            zone,
+        .get_dns_record_set(
+            &state.project_identity.project_number.to_string(),
+            &zone,
             &format!("{}.", effect.resource_name.trim_end_matches('.')),
             "A",
         )
@@ -1379,8 +1394,8 @@ async fn dns_effect_receipt(
         location: effect.location.clone(),
         numeric_id,
         self_link: format!(
-            "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{zone}/rrsets/{}/A",
-            state.project_identity.project_id, effect.resource_name
+            "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/rrsets/{}/A",
+            state.project_identity.project_id, zone.name, effect.resource_name
         ),
         deployment_uuid: effect.deployment_uuid,
         observed_attributes: attributes,
@@ -1447,7 +1462,7 @@ async fn revalidate_dns_resource(
     identity: &ProjectIdentity,
     resource: &ResourceRef,
 ) -> Result<()> {
-    let zone = resource
+    let zone_name = resource
         .observed_attributes
         .get("zone_name")
         .ok_or_else(|| EngineError::Backend("Cloud DNS receipt omitted zone name".into()))?;
@@ -1466,10 +1481,15 @@ async fn revalidate_dns_resource(
             "Cloud DNS immutable identity differs from the receipt".into(),
         ));
     }
+    let zone = DnsZoneIdentity {
+        project_id: identity.project_id.clone(),
+        name: zone_name.clone(),
+        numeric_id: zone_id.to_string(),
+    };
     let record = client
-        .dns_record_set(
-            &identity.project_id,
-            zone,
+        .get_dns_record_set(
+            &identity.project_number.to_string(),
+            &zone,
             &format!("{}.", resource.name.trim_end_matches('.')),
             "A",
         )
@@ -1665,6 +1685,19 @@ fn required_attribute<'a>(effect: &'a PendingEffect, name: &str) -> Result<&'a s
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| EngineError::Backend(format!("planned effect omitted {name}")))
+}
+
+fn dns_zone_for_effect(state: &DeploymentState, effect: &PendingEffect) -> Result<DnsZoneIdentity> {
+    if effect.project_number != state.project_identity.project_number {
+        return Err(EngineError::Backend(
+            "Cloud DNS effect project differs from deployment state".into(),
+        ));
+    }
+    Ok(DnsZoneIdentity {
+        project_id: state.project_identity.project_id.clone(),
+        name: required_attribute(effect, "zone_name")?.to_owned(),
+        numeric_id: required_attribute(effect, "zone_numeric_id")?.to_owned(),
+    })
 }
 
 fn required_resource<'a>(resource: Option<&'a ResourceRef>, name: &str) -> Result<&'a ResourceRef> {

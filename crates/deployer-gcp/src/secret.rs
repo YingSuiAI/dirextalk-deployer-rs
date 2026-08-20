@@ -12,7 +12,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::RngCore;
+use rand::Rng;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -187,12 +187,16 @@ impl SecretStore for EncryptedFileStore {
                 "credential nonce has invalid length".into(),
             ));
         }
+        let nonce_bytes: [u8; 12] = nonce.as_slice().try_into().map_err(|_| {
+            GcpError::CredentialStorage("credential nonce has invalid length".into())
+        })?;
+        let nonce = Nonce::from(nonce_bytes);
         let key = self.derive_key(&salt)?;
         let cipher = Aes256Gcm::new_from_slice(key.as_ref())
             .map_err(|_| GcpError::CredentialStorage("invalid encryption key".into()))?;
         let plaintext = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: &ciphertext,
                     aad: &self.aad(account),
@@ -210,12 +214,13 @@ impl SecretStore for EncryptedFileStore {
         let mut nonce = [0_u8; 12];
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce);
+        let nonce_value = Nonce::from(nonce);
         let key = self.derive_key(&salt)?;
         let cipher = Aes256Gcm::new_from_slice(key.as_ref())
             .map_err(|_| GcpError::CredentialStorage("invalid encryption key".into()))?;
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &nonce_value,
                 Payload {
                     msg: value.expose_secret().as_bytes(),
                     aad: &self.aad(account),

@@ -26,7 +26,7 @@ pub trait HttpTransport: Send + Sync {
     ) -> Result<RestResponse>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
@@ -34,9 +34,16 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     #[must_use]
     pub fn new() -> Self {
+        crate::ensure_tls_provider();
         Self {
             client: reqwest::Client::new(),
         }
+    }
+}
+
+impl Default for ReqwestTransport {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
