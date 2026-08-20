@@ -121,7 +121,7 @@ impl GcloudAuthBroker {
         let output = self
             .run(
                 &["auth", "revoke", "--all", "--quiet"],
-                OutputMode::Interactive,
+                OutputMode::Captured,
             )
             .await?;
         if output.success {
@@ -721,7 +721,7 @@ mod tests {
         let logout = gcloud_command(&GcloudInvocation {
             args: vec!["auth", "revoke", "--all", "--quiet"],
             config_dir,
-            output: OutputMode::Interactive,
+            output: OutputMode::Captured,
         });
         let (_, logout_browser) = logout
             .get_envs()
@@ -756,7 +756,7 @@ mod tests {
                 GcloudInvocation {
                     args: vec!["auth", "revoke", "--all", "--quiet"],
                     config_dir: home.path().join(".dirextalk/gcloud"),
-                    output: OutputMode::Interactive,
+                    output: OutputMode::Captured,
                 },
             ]
         );
