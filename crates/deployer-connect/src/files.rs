@@ -151,4 +151,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn credential_write_error_never_contains_secret_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocker = temp.path().join("not-a-directory");
+        fs::write(&blocker, b"block").unwrap();
+        let error = write_credentials(&blocker.join("credentials.json"), &credentials("12345678"))
+            .unwrap_err()
+            .to_string();
+        for secret in ["12345678", "owner-secret", "agent-secret"] {
+            assert!(!error.contains(secret));
+        }
+    }
 }

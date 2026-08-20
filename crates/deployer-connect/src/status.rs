@@ -62,7 +62,7 @@ impl Redactor {
 fn redact_bearer_values(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut rest = value;
-    while let Some(index) = rest.find("Bearer ") {
+    while let Some(index) = find_bearer(rest) {
         let (before, token_and_after) = rest.split_at(index);
         result.push_str(before);
         result.push_str("Bearer [REDACTED]");
@@ -74,6 +74,13 @@ fn redact_bearer_values(value: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+fn find_bearer(value: &str) -> Option<usize> {
+    value
+        .as_bytes()
+        .windows("Bearer ".len())
+        .position(|window| window.eq_ignore_ascii_case(b"Bearer "))
 }
 
 #[cfg(test)]
@@ -94,7 +101,12 @@ mod tests {
         assert!(!json.contains("password"));
 
         let redactor = Redactor::new(["known-secret".to_owned()]);
-        let evidence = redactor.redact("known-secret Authorization: Bearer other-secret\nok");
-        assert_eq!(evidence, "[REDACTED] Authorization: Bearer [REDACTED]\nok");
+        let evidence = redactor.redact(
+            "known-secret Authorization: Bearer other-secret\nauthorization: bearer lower-secret\nok",
+        );
+        assert_eq!(
+            evidence,
+            "[REDACTED] Authorization: Bearer [REDACTED]\nauthorization: Bearer [REDACTED]\nok"
+        );
     }
 }

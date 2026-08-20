@@ -1,10 +1,27 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_SERVER_NAME: &str = "dirextalk-message-server";
 const MAX_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
+const CANONICAL_READ_ONLY_TOOLS: &[&str] = &[
+    "dirextalk_contacts_list",
+    "dirextalk_contacts_search",
+    "dirextalk_rooms_search",
+    "dirextalk_messages_list",
+    "dirextalk_room_members_list",
+    "dirextalk_channel_posts_list",
+    "dirextalk_channel_comments_list",
+];
+const CANONICAL_WRITE_TOOLS: &[&str] = &[
+    "dirextalk_messages_send",
+    "dirextalk_channel_comments_create",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -14,10 +31,10 @@ pub enum McpError {
     Transport(String),
     #[error("MCP protocol failed: {0}")]
     Protocol(String),
-    #[error("MCP server returned JSON-RPC error {code}: {message}")]
-    Rpc { code: i64, message: String },
-    #[error("MCP smoke tool is not safely read-only: {0}")]
-    NotReadOnly(String),
+    #[error("MCP server returned JSON-RPC error {code}")]
+    Rpc { code: i64 },
+    #[error("MCP smoke tool is not a canonical read-only tool")]
+    NotReadOnly,
 }
 
 #[async_trait]
@@ -61,6 +78,8 @@ impl HttpMcpTransport {
         }
         let client = reqwest::Client::builder()
             .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| McpError::Transport(error.to_string()))?;
         Ok(Self {
@@ -178,13 +197,35 @@ impl<T: McpTransport> McpClient<T> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| McpError::Protocol("initialize omitted protocolVersion".to_owned()))?
             .to_owned();
+        if protocol_version != MCP_PROTOCOL_VERSION {
+            return Err(McpError::Protocol(
+                "initialize negotiated an unsupported protocol version".to_owned(),
+            ));
+        }
         let server_name = initialized
             .pointer("/serverInfo/name")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| McpError::Protocol("initialize omitted serverInfo.name".to_owned()))?
             .to_owned();
-        if initialized.pointer("/capabilities/tools").is_none() {
+        if server_name != MCP_SERVER_NAME {
+            return Err(McpError::Protocol(
+                "initialize returned an unexpected server".to_owned(),
+            ));
+        }
+        if initialized
+            .pointer("/serverInfo/version")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(McpError::Protocol(
+                "initialize omitted serverInfo.version".to_owned(),
+            ));
+        }
+        if !initialized
+            .pointer("/capabilities/tools")
+            .is_some_and(Value::is_object)
+        {
             return Err(McpError::Protocol(
                 "initialize omitted tools capability".to_owned(),
             ));
@@ -203,6 +244,26 @@ impl<T: McpTransport> McpClient<T> {
                 "tools/list returned no tools".to_owned(),
             ));
         }
+        let mut names = HashSet::with_capacity(tools.len());
+        for tool in &tools {
+            if tool.name.is_empty() || !names.insert(tool.name.as_str()) {
+                return Err(McpError::Protocol(
+                    "tools/list contains an empty or duplicate tool name".to_owned(),
+                ));
+            }
+            if !CANONICAL_READ_ONLY_TOOLS.contains(&tool.name.as_str())
+                && !CANONICAL_WRITE_TOOLS.contains(&tool.name.as_str())
+            {
+                return Err(McpError::Protocol(
+                    "tools/list contains an unknown tool".to_owned(),
+                ));
+            }
+            if !tool.input_schema.is_object() {
+                return Err(McpError::Protocol(
+                    "tools/list contains a non-object input schema".to_owned(),
+                ));
+            }
+        }
         Ok((protocol_version, server_name, tools))
     }
 
@@ -217,11 +278,9 @@ impl<T: McpTransport> McpClient<T> {
         let tool = tools
             .iter()
             .find(|tool| tool.name == smoke.tool_name)
-            .ok_or_else(|| {
-                McpError::NotReadOnly(format!("{} is not advertised", smoke.tool_name))
-            })?;
-        if !tool.is_read_only() {
-            return Err(McpError::NotReadOnly(smoke.tool_name.clone()));
+            .ok_or(McpError::NotReadOnly)?;
+        if !tool.is_read_only() || !CANONICAL_READ_ONLY_TOOLS.contains(&tool.name.as_str()) {
+            return Err(McpError::NotReadOnly);
         }
         let result = self
             .rpc(
@@ -230,9 +289,9 @@ impl<T: McpTransport> McpClient<T> {
                 json!({"name": smoke.tool_name, "arguments": smoke.arguments}),
             )
             .await?;
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        if result.get("isError").and_then(Value::as_bool) != Some(false) {
             return Err(McpError::Protocol(format!(
-                "read-only smoke tool {} reported an error",
+                "read-only smoke tool {} did not report success",
                 smoke.tool_name
             )));
         }
@@ -262,11 +321,6 @@ impl<T: McpTransport> McpClient<T> {
         if let Some(error) = response.get("error") {
             return Err(McpError::Rpc {
                 code: error.get("code").and_then(Value::as_i64).unwrap_or(-1),
-                message: error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown JSON-RPC error")
-                    .to_owned(),
             });
         }
         response
@@ -306,7 +360,7 @@ mod tests {
                         {"name":"dirextalk_messages_list","inputSchema":{"type":"object"},
                          "annotations":{"readOnlyHint":true,"destructiveHint":false}},
                         {"name":"dirextalk_messages_send","inputSchema":{"type":"object"},
-                         "annotations":{"readOnlyHint":false,"destructiveHint":false}}
+                         "annotations":{"readOnlyHint":true,"destructiveHint":false}}
                     ]}
                 }),
                 "tools/call" => json!({"jsonrpc":"2.0", "id":3, "result":{"isError":false}}),
@@ -358,7 +412,98 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(error, McpError::NotReadOnly(_)));
+        assert!(matches!(error, McpError::NotReadOnly));
         assert_eq!(client.transport.requests.lock().unwrap().len(), 2);
+    }
+
+    struct QueueTransport {
+        responses: Mutex<std::collections::VecDeque<Value>>,
+    }
+
+    #[async_trait]
+    impl McpTransport for QueueTransport {
+        async fn post(&self, _request: Value) -> Result<Value, McpError> {
+            Ok(self.responses.lock().unwrap().pop_front().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_protocol_before_tool_discovery() {
+        let client = McpClient::new(QueueTransport {
+            responses: Mutex::new(std::collections::VecDeque::from([json!({
+                "jsonrpc":"2.0", "id":1,
+                "result": {
+                    "protocolVersion":"2024-11-05",
+                    "serverInfo":{"name":MCP_SERVER_NAME,"version":"test"},
+                    "capabilities":{"tools":{}}
+                }
+            })])),
+        });
+        let error = client.initialize_and_discover().await.unwrap_err();
+        assert!(matches!(error, McpError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_tool_names_before_smoke_call() {
+        let client = McpClient::new(QueueTransport {
+            responses: Mutex::new(std::collections::VecDeque::from([
+                json!({
+                    "jsonrpc":"2.0", "id":1,
+                    "result": {
+                        "protocolVersion":MCP_PROTOCOL_VERSION,
+                        "serverInfo":{"name":MCP_SERVER_NAME,"version":"test"},
+                        "capabilities":{"tools":{}}
+                    }
+                }),
+                json!({
+                    "jsonrpc":"2.0", "id":2,
+                    "result":{"tools":[
+                        {"name":"dirextalk_messages_list","inputSchema":{"type":"object"},
+                         "annotations":{"readOnlyHint":true,"destructiveHint":false}},
+                        {"name":"dirextalk_messages_list","inputSchema":{"type":"object"},
+                         "annotations":{"readOnlyHint":false,"destructiveHint":true}}
+                    ]}
+                }),
+            ])),
+        });
+        let error = client.initialize_and_discover().await.unwrap_err();
+        assert!(matches!(error, McpError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn rpc_error_omits_untrusted_remote_message() {
+        let client = McpClient::new(QueueTransport {
+            responses: Mutex::new(std::collections::VecDeque::from([
+                json!({
+                    "jsonrpc":"2.0", "id":1,
+                    "result": {
+                        "protocolVersion":MCP_PROTOCOL_VERSION,
+                        "serverInfo":{"name":MCP_SERVER_NAME,"version":"test"},
+                        "capabilities":{"tools":{}}
+                    }
+                }),
+                json!({
+                    "jsonrpc":"2.0", "id":2,
+                    "result":{"tools":[
+                        {"name":"dirextalk_messages_list","inputSchema":{"type":"object"},
+                         "annotations":{"readOnlyHint":true,"destructiveHint":false}}
+                    ]}
+                }),
+                json!({
+                    "jsonrpc":"2.0", "id":3,
+                    "error":{"code":-32602,"message":"echoed agent-secret"}
+                }),
+            ])),
+        });
+        let error = client
+            .verify_read_only(&ReadOnlySmoke {
+                tool_name: "dirextalk_messages_list".into(),
+                arguments: serde_json::Map::new(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("-32602"));
+        assert!(!error.contains("agent-secret"));
     }
 }

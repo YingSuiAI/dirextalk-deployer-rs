@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -114,6 +115,8 @@ impl ReleaseResolver {
     pub fn new() -> Result<Self, ReleaseError> {
         let client = reqwest::Client::builder()
             .https_only(true)
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .timeout(Duration::from_mins(1))
             .user_agent(concat!("dirextalk-deployer/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| ReleaseError::Request(error.to_string()))?;
@@ -136,6 +139,18 @@ impl ReleaseResolver {
             return Err(ReleaseError::Contract(
                 "release must be published and stable".to_owned(),
             ));
+        }
+        let canonical_tag = normalized_tag(&release.tag_name).map_err(|_| {
+            ReleaseError::Contract(format!(
+                "release tag {} is not canonical stable semver",
+                release.tag_name
+            ))
+        })?;
+        if canonical_tag != release.tag_name {
+            return Err(ReleaseError::Contract(format!(
+                "release tag {} is not canonical stable semver",
+                release.tag_name
+            )));
         }
         if let ReleaseChannel::Exact(requested) = channel {
             let requested = normalized_tag(requested)?;
@@ -264,7 +279,9 @@ fn normalized_tag(value: &str) -> Result<String, ReleaseError> {
     let components: Vec<_> = version.split('.').collect();
     let valid = components.len() == 3
         && components.iter().all(|component| {
-            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+            !component.is_empty()
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (*component == "0" || !component.starts_with('0'))
         });
     if valid {
         Ok(format!("v{version}"))
@@ -362,8 +379,24 @@ mod tests {
     fn exact_release_selection_accepts_only_stable_semver() {
         assert_eq!(normalized_tag("1.2.3").unwrap(), "v1.2.3");
         assert_eq!(normalized_tag("v1.2.3").unwrap(), "v1.2.3");
-        for invalid in ["latest", "v1.2", "v1.2.3-rc.1", "../v1.2.3"] {
+        for invalid in ["latest", "v1.2", "v1.2.3-rc.1", "../v1.2.3", "v01.2.3"] {
             assert!(normalized_tag(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn release_download_url_is_bound_to_repo_tag_and_asset() {
+        let name = "dirextalk-connect-v1.2.3-linux-amd64";
+        let exact = Url::parse(&format!(
+            "https://github.com/{CONNECT_GITHUB_REPOSITORY}/releases/download/v1.2.3/{name}"
+        ))
+        .unwrap();
+        assert!(validate_download_url(&exact, "v1.2.3", name).is_ok());
+
+        let wrong_repo = Url::parse(&format!(
+            "https://github.com/attacker/dirextalk-connect/releases/download/v1.2.3/{name}"
+        ))
+        .unwrap();
+        assert!(validate_download_url(&wrong_repo, "v1.2.3", name).is_err());
     }
 }

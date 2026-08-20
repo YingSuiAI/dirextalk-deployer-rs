@@ -102,7 +102,7 @@ impl<E: CommandExecutor> DaemonController<E> {
         })
     }
 
-    /// Runs fixed install argv and then requires running status.
+    /// Runs fixed install argv and then requires running status and clean logs.
     ///
     /// # Errors
     ///
@@ -122,7 +122,7 @@ impl<E: CommandExecutor> DaemonController<E> {
         if install.exit_code != Some(0) {
             return Err(self.failure("daemon install", &install));
         }
-        self.status().await
+        self.doctor().await
     }
 
     /// Runs fixed status argv and classifies its output.
@@ -314,11 +314,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_requires_running_status() {
+    async fn install_requires_running_status_and_startup_log() {
         let executor = FakeExecutor {
             outputs: Mutex::new(VecDeque::from([
                 output(0, "installed", ""),
                 output(0, "Status:    Running", ""),
+                output(0, "dirextalk-connect is running", ""),
             ])),
             commands: Mutex::new(Vec::new()),
         };
@@ -334,8 +335,9 @@ mod tests {
             controller.install().await.unwrap().state,
             DaemonState::Running
         );
+        let commands = controller.executor.commands.lock().unwrap();
         assert_eq!(
-            controller.executor.commands.lock().unwrap()[0],
+            commands[0],
             vec![
                 "daemon",
                 "install",
@@ -346,5 +348,42 @@ mod tests {
                 "--force",
             ]
         );
+        assert_eq!(
+            commands[1..],
+            [
+                vec!["daemon", "status", "--service-name", "node.example.com"],
+                vec![
+                    "daemon",
+                    "logs",
+                    "--service-name",
+                    "node.example.com",
+                    "-n",
+                    "120"
+                ]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_fails_when_handoff_logs_show_agent_failure() {
+        let executor = FakeExecutor {
+            outputs: Mutex::new(VecDeque::from([
+                output(0, "installed", ""),
+                output(0, "Status:    Running", ""),
+                output(0, "agent CLI missing: daemon-secret", ""),
+            ])),
+            commands: Mutex::new(Vec::new()),
+        };
+        let controller = DaemonController::new(
+            executor,
+            "/service/dirextalk-connect",
+            "/service/config.toml",
+            "node.example.com",
+            Redactor::new(["daemon-secret".into()]),
+        )
+        .unwrap();
+        let error = controller.install().await.unwrap_err().to_string();
+        assert!(error.contains("agent cli missing"));
+        assert!(!error.contains("daemon-secret"));
     }
 }

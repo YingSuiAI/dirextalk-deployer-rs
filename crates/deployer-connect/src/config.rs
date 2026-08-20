@@ -178,6 +178,20 @@ fn validate(config: &ConnectConfig) -> Result<(), ConnectError> {
             return Err(ConnectError::InvalidConfig(format!("{name} is required")));
         }
     }
+    if !is_absolute_portable(&config.data_dir) || !is_absolute_portable(&project.work_dir) {
+        return Err(ConnectError::InvalidConfig(
+            "data_dir and work_dir must be absolute local paths".to_owned(),
+        ));
+    }
+    if project
+        .command
+        .as_deref()
+        .is_some_and(|command| command.trim().is_empty())
+    {
+        return Err(ConnectError::InvalidConfig(
+            "agent command must not be empty when provided".to_owned(),
+        ));
+    }
 
     let homeserver = canonical_https(&project.matrix.homeserver, "Matrix homeserver", false)?;
     let host = homeserver
@@ -188,7 +202,15 @@ fn validate(config: &ConnectConfig) -> Result<(), ConnectError> {
     require_real_room_id(&project.matrix.room_id, host)?;
 
     if let Some(mcp) = &project.mcp {
-        canonical_https(&mcp.url, "MCP URL", true)?;
+        let mcp_url = canonical_https(&mcp.url, "MCP URL", true)?;
+        if mcp_url.scheme() != homeserver.scheme()
+            || mcp_url.host_str() != homeserver.host_str()
+            || mcp_url.port_or_known_default() != homeserver.port_or_known_default()
+        {
+            return Err(ConnectError::InvalidConfig(
+                "MCP URL must use the deployed Matrix homeserver origin".to_owned(),
+            ));
+        }
         for (name, value) in [
             ("MCP server name", mcp.server_name.as_str()),
             ("MCP agent token", mcp.agent_token.as_str()),
@@ -198,6 +220,24 @@ fn validate(config: &ConnectConfig) -> Result<(), ConnectError> {
                 return Err(ConnectError::InvalidConfig(format!("{name} is required")));
             }
         }
+        if !canonical_mcp_server_name(&mcp.server_name) {
+            return Err(ConnectError::InvalidConfig(
+                "MCP server name must already be canonical lowercase ASCII".to_owned(),
+            ));
+        }
+        if mcp.agent_token.trim() != mcp.agent_token
+            || mcp.agent_token.chars().any(char::is_whitespace)
+            || mcp.agent_token.to_ascii_lowercase().starts_with("bearer ")
+        {
+            return Err(ConnectError::InvalidConfig(
+                "MCP agent token must be one raw non-whitespace token".to_owned(),
+            ));
+        }
+        if mcp.node_id != project.name {
+            return Err(ConnectError::InvalidConfig(
+                "MCP node id must equal the generated project name".to_owned(),
+            ));
+        }
     }
     validate_host_bridge(project, &config.data_dir)?;
     Ok(())
@@ -205,7 +245,16 @@ fn validate(config: &ConnectConfig) -> Result<(), ConnectError> {
 
 fn validate_host_bridge(project: &ProjectConfig, data_dir: &str) -> Result<(), ConnectError> {
     match project.selection.host_runtime {
-        HostRuntime::Direct => Ok(()),
+        HostRuntime::Direct => {
+            if project.selection.connect_agent == crate::ConnectAgent::Acp
+                && project.command.is_none()
+            {
+                return Err(ConnectError::InvalidConfig(
+                    "generic ACP requires an explicit agent command".to_owned(),
+                ));
+            }
+            Ok(())
+        }
         HostRuntime::OpenClaw => {
             let command = project.command.as_deref().ok_or_else(|| {
                 ConnectError::InvalidConfig(
@@ -340,6 +389,21 @@ fn is_absolute_portable(path: &str) -> bool {
         })
 }
 
+fn canonical_mcp_server_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
 fn canonical_https(value: &str, name: &str, mcp: bool) -> Result<Url, ConnectError> {
     let url = Url::parse(value)
         .map_err(|error| ConnectError::InvalidConfig(format!("{name}: {error}")))?;
@@ -387,6 +451,11 @@ fn require_real_room_id(value: &str, host: &str) -> Result<(), ConnectError> {
     if local.is_empty() || local == "agent" {
         return Err(ConnectError::InvalidConfig(
             "room_id must be the real persisted agent_room_id".to_owned(),
+        ));
+    }
+    if local.chars().any(char::is_whitespace) {
+        return Err(ConnectError::InvalidConfig(
+            "room_id must not contain whitespace".to_owned(),
         ));
     }
     Ok(())
@@ -468,6 +537,28 @@ mod tests {
         value.project.matrix.user_id = "@agent:node.example.com".into();
         value.project.matrix.room_id = "!agent:node.example.com".into();
         assert!(render_matrix_config(&value).is_err());
+        value.project.matrix.room_id = "!not real:node.example.com".into();
+        assert!(render_matrix_config(&value).is_err());
+    }
+
+    #[test]
+    fn rejects_cross_service_or_ambiguous_mcp_binding() {
+        let mut value = config(ConnectAgent::Codex);
+        value.project.mcp.as_mut().unwrap().url = "https://other.example.com/mcp".into();
+        assert!(render_matrix_config(&value).is_err());
+
+        value.project.mcp.as_mut().unwrap().url = "https://node.example.com/mcp".into();
+        value.project.mcp.as_mut().unwrap().node_id = "other-node".into();
+        assert!(render_matrix_config(&value).is_err());
+
+        value.project.mcp.as_mut().unwrap().node_id = "agent-node".into();
+        value.project.mcp.as_mut().unwrap().server_name = "Dirextalk node".into();
+        assert!(render_matrix_config(&value).is_err());
+
+        value.project.mcp.as_mut().unwrap().server_name = "dirextalk-node".into();
+        value.project.mcp.as_mut().unwrap().agent_token = "Bearer embedded-secret".into();
+        let error = render_matrix_config(&value).unwrap_err().to_string();
+        assert!(!error.contains("embedded-secret"));
     }
 
     #[test]
@@ -507,6 +598,52 @@ mod tests {
         assert!(render_matrix_config(&value).is_ok());
 
         value.project.command = Some("/usr/local/bin/dirextalk-connect".into());
+        assert!(render_matrix_config(&value).is_err());
+    }
+
+    #[test]
+    fn every_registry_class_renders_or_fails_as_declared() {
+        for agent in [
+            ConnectAgent::Acp,
+            ConnectAgent::ClaudeCode,
+            ConnectAgent::Codex,
+            ConnectAgent::Copilot,
+            ConnectAgent::Gemini,
+            ConnectAgent::Kimi,
+            ConnectAgent::OpenCode,
+            ConnectAgent::Qoder,
+        ] {
+            let mut value = config(agent);
+            if agent == ConnectAgent::Acp {
+                value.project.command = Some("/usr/local/bin/acp-agent".into());
+            }
+            let rendered = render_matrix_config(&value).unwrap();
+            assert!(rendered.contains("mcp_capability = \"session\""));
+        }
+
+        for agent in [
+            ConnectAgent::Antigravity,
+            ConnectAgent::Cursor,
+            ConnectAgent::IFlow,
+        ] {
+            let rendered = render_matrix_config(&config(agent)).unwrap();
+            assert!(!rendered.contains("mcp_agent_token"));
+            assert!(!rendered.contains("mcp_capability"));
+        }
+
+        for agent in [
+            ConnectAgent::Devin,
+            ConnectAgent::Pi,
+            ConnectAgent::Reasonix,
+            ConnectAgent::Tmux,
+        ] {
+            assert!(render_matrix_config(&config(agent)).is_err());
+        }
+    }
+
+    #[test]
+    fn generic_acp_requires_explicit_command() {
+        let value = config(ConnectAgent::Acp);
         assert!(render_matrix_config(&value).is_err());
     }
 }
