@@ -11,7 +11,6 @@ mod oauth;
 mod official;
 mod preflight;
 mod rest;
-mod secret;
 
 pub use error::{GcpError, Result};
 pub use lifecycle::{
@@ -29,10 +28,6 @@ pub use preflight::{
     RequiredService, ServiceStatus, SkuPrice, longest_matching_zone,
 };
 pub use rest::{GoogleRestClient, HttpTransport, ReqwestTransport, RestResponse};
-pub use secret::{
-    CredentialStore, EncryptedFileStore, KeyringStore, PassphraseProvider, SecretStore,
-};
-
 pub(crate) fn ensure_tls_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();

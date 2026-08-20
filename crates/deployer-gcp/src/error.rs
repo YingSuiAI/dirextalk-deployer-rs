@@ -8,12 +8,6 @@ pub enum GcpError {
     GcloudUnauthenticated,
     #[error("authentication failed: {0}")]
     Authentication(String),
-    #[error("OAuth callback validation failed: {0}")]
-    OAuthValidation(String),
-    #[error("credential storage is unavailable: {0}")]
-    CredentialStorage(String),
-    #[error("OS credential storage backend is unavailable: {0}")]
-    CredentialStorageUnavailable(String),
     #[error("GCP contract violation: {0}")]
     Contract(String),
     #[error("GCP resource was not found: {0}")]
