@@ -28,7 +28,7 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum TopLevelCommand {
-    /// Manage the built-in browser OAuth session.
+    /// Manage the isolated gcloud authentication session.
     Auth(AuthArgs),
     /// Inspect accessible GCP projects without mutating them.
     Project(ProjectArgs),
