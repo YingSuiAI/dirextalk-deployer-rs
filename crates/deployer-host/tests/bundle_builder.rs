@@ -1,3 +1,5 @@
+#![cfg(target_family = "unix")]
+
 use deployer_host::{
     BundleBuildRequest, CADDY_DIGEST, COTURN_DIGEST, DigestHex, ImageReference, ImageRole,
     POSTGRES_UTILITY_DIGEST, canonical_json,

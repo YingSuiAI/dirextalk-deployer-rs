@@ -7,11 +7,18 @@ use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_family = "unix")]
 use std::fs;
-use std::io::{Cursor, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::Write;
+use std::io::{Cursor, Read};
 use std::net::Ipv4Addr;
+#[cfg(target_family = "unix")]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+#[cfg(target_family = "unix")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -31,9 +38,13 @@ pub const MAX_RELEASE_BUNDLE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_INSTALL_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RECEIPT_KEY_BYTES: usize = 4 * 1024;
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const RUNTIME_ROOT: &str = "/var/dirextalk-message-server";
+#[cfg(target_os = "linux")]
 const COMPOSE_PATH: &str = "/var/dirextalk-message-server/docker-compose.yml";
+#[cfg(target_os = "linux")]
 const COMPOSE_PROJECT: &str = "dirextalk-p2p";
+#[cfg(target_os = "linux")]
 const UPDATER_CONFIG: &[u8] = br#"{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","caddy_mode":"compose","compose_project":"dirextalk-p2p","watchdog_enabled":false}"#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1276,9 +1287,11 @@ pub fn derive_updater_control_token(receipt_key: &[u8]) -> Result<Zeroizing<Stri
     Ok(Zeroizing::new(hex::encode(mac.finalize().into_bytes())))
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub struct LinuxBackend;
 
+#[cfg(target_os = "linux")]
 impl InstallBackend for LinuxBackend {
     fn platform(&mut self) -> Result<PlatformInfo, BackendError> {
         let os_release = fs::read_to_string("/etc/os-release")
@@ -1483,6 +1496,7 @@ impl InstallBackend for LinuxBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
     ensure_secure_directory(Path::new(RUNTIME_ROOT), 0o700)?;
     ensure_secure_directory(Path::new("/var/dirextalk-message-server/runtime"), 0o700)?;
@@ -1547,6 +1561,7 @@ fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn render_turn_config(request: &InstallRequest, shared_secret: &[u8]) -> String {
     format!(
         "listening-port=3478\nmin-port=49160\nmax-port=49200\nrealm={}\nexternal-ip={}\nfingerprint\nuse-auth-secret\nstatic-auth-secret={}\nstale-nonce=600\nno-cli\nno-multicast-peers\nno-tls\nno-dtls\npidfile=/tmp/turnserver.pid\n",
@@ -1556,6 +1571,7 @@ fn render_turn_config(request: &InstallRequest, shared_secret: &[u8]) -> String 
     )
 }
 
+#[cfg(target_os = "linux")]
 fn render_runtime_env(
     runtime: RuntimeSpec<'_>,
     message_instance: Uuid,
@@ -1584,6 +1600,7 @@ fn render_runtime_env(
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn render_agent_config(request: &InstallRequest, agent_instance: Uuid) -> String {
     format!(
         "instance_id: {agent_instance}\ndatabase_url_file: /run/secrets/database_url\ngrpc_listen: \":9443\"\nagent_http_enabled: true\nagent_http_listen: 0.0.0.0:8082\ntls_cert_file: /run/secrets/tls_cert\ntls_key_file: /run/secrets/tls_key\nservice_token_file: /run/secrets/service_token\ncore_voice_callback_relay_token_file: /run/secrets/voice_relay_token\nenable_health_service: true\nenable_reflection: false\ncapability_grant_public_key_file: /run/secrets/grant_public_key\ncapability_account_generation: {}\nproduct_capability_enabled: true\nproduct_capability_address: message-server:50053\nproduct_capability_ca_cert_file: /run/secrets/product_ca\nproduct_capability_tls_cert_file: /run/secrets/product_tls_cert\nproduct_capability_tls_key_file: /run/secrets/product_tls_key\nproduct_capability_token_file: /run/secrets/agent_to_ms_token\nproduct_capability_server_name: dirextalk-message-server\nproduct_capability_instance_id: {agent_instance}\nproduct_capability_account_generation: {}\ncore_task_max_concurrency: 4\ncore_task_lease_ttl: 30s\ncore_schedule_sweep_interval: 1s\ncore_shutdown_grace: 30s\ncore_extension_enabled: false\ncore_message_mcp_enabled: true\ncore_message_mcp_endpoint: http://message-server:8008/mcp\ncore_message_mcp_token_file: /run/secrets/message_mcp_token\ncore_static_sites_enabled: false\ncore_workload_enabled: false\ncore_secret_master_key_file: /run/secrets/core_secret_master_key\ncore_secret_master_key_version: 1\ncore_knowledge_enabled: false\n",
@@ -1591,10 +1608,12 @@ fn render_agent_config(request: &InstallRequest, agent_instance: Uuid) -> String
     )
 }
 
+#[cfg(target_os = "linux")]
 fn runtime_secret_path(name: &str) -> PathBuf {
     Path::new("/var/dirextalk-message-server/secrets").join(name)
 }
 
+#[cfg(target_os = "linux")]
 fn read_or_create_hex_secret(
     name: &str,
     random_bytes: usize,
@@ -1622,6 +1641,7 @@ fn read_or_create_hex_secret(
     Ok(encoded)
 }
 
+#[cfg(target_os = "linux")]
 fn read_or_create_numeric_secret(
     name: &str,
     digits: usize,
@@ -1629,6 +1649,7 @@ fn read_or_create_numeric_secret(
     read_or_create_numeric_secret_at(&runtime_secret_path(name), digits, 0)
 }
 
+#[cfg(target_os = "linux")]
 fn read_or_create_numeric_secret_at(
     path: &Path,
     digits: usize,
@@ -1676,6 +1697,7 @@ fn read_or_create_numeric_secret_at(
     Ok(secret)
 }
 
+#[cfg(target_os = "linux")]
 fn read_or_create_raw_secret(name: &str, size: usize) -> Result<Zeroizing<Vec<u8>>, BackendError> {
     let path = runtime_secret_path(name);
     if path.exists() {
@@ -1695,12 +1717,14 @@ fn read_or_create_raw_secret(name: &str, size: usize) -> Result<Zeroizing<Vec<u8
     Ok(bytes)
 }
 
+#[cfg(target_os = "linux")]
 fn read_runtime_secret(path: &Path, maximum: usize) -> Result<Vec<u8>, BackendError> {
     read_stable_regular(path, Some(0), Some(0o600), maximum).map_err(|error| {
         BackendError::Infrastructure(format!("read protected runtime state: {error}"))
     })
 }
 
+#[cfg(target_os = "linux")]
 fn create_secret_noclobber(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
     let parent = path
         .parent()
@@ -1722,6 +1746,7 @@ fn create_secret_noclobber(path: &Path, bytes: &[u8]) -> Result<(), BackendError
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_secure_directory(path: &Path, mode: u32) -> Result<(), BackendError> {
     fs::create_dir_all(path).map_err(|error| BackendError::Infrastructure(error.to_string()))?;
     let metadata = fs::symlink_metadata(path)
@@ -1736,6 +1761,7 @@ fn ensure_secure_directory(path: &Path, mode: u32) -> Result<(), BackendError> {
         .map_err(|error| BackendError::Infrastructure(error.to_string()))
 }
 
+#[cfg(target_os = "linux")]
 fn derived_instance_id(deployment: Uuid, label: &[u8]) -> Uuid {
     let mut digest = Sha256::new();
     digest.update(deployment.as_bytes());
@@ -1748,6 +1774,7 @@ fn derived_instance_id(deployment: Uuid, label: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+#[cfg(target_os = "linux")]
 fn run_compose(arguments: &[&str]) -> Result<std::process::Output, BackendError> {
     let mut fixed = vec![
         "compose",
@@ -1760,17 +1787,20 @@ fn run_compose(arguments: &[&str]) -> Result<std::process::Output, BackendError>
     run_program("/usr/bin/docker", &fixed)
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 struct BootstrapCredentials {
     access_token: String,
     agent_token: String,
 }
 
+#[cfg(target_os = "linux")]
 struct BootstrapSecrets {
     access_token: Zeroizing<String>,
     agent_token: Zeroizing<String>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 struct TurnResponse {
     uris: Vec<String>,
@@ -1779,6 +1809,7 @@ struct TurnResponse {
     ttl: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn read_bootstrap_credentials() -> Result<BootstrapSecrets, BackendError> {
     let output = run_compose(&["ps", "--quiet", "message-server"])?;
     let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -1823,6 +1854,7 @@ fn read_bootstrap_credentials() -> Result<BootstrapSecrets, BackendError> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn verify_exact_container(
     id: &str,
     service: &str,
@@ -1861,6 +1893,7 @@ fn verify_exact_container(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn refresh_agent_token() -> Result<(), BackendError> {
     let credentials = read_bootstrap_credentials()?;
     atomic_write(
@@ -1870,6 +1903,7 @@ fn refresh_agent_token() -> Result<(), BackendError> {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn verify_dns(request: &InstallRequest) -> Result<(), BackendError> {
     for (server, label) in [
         (request.authoritative_dns_ipv4, "authoritative"),
@@ -1900,6 +1934,7 @@ fn verify_dns(request: &InstallRequest) -> Result<(), BackendError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn verify_https(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
     let request = runtime.request;
     let resolve = format!("{}:443:{}", request.domain, request.public_ipv4);
@@ -1948,6 +1983,7 @@ fn verify_https(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn verify_turn_acceptance(request: &InstallRequest) -> Result<(), BackendError> {
     let credentials = read_bootstrap_credentials()?;
     let url = format!(
@@ -1978,6 +2014,7 @@ fn verify_turn_acceptance(request: &InstallRequest) -> Result<(), BackendError> 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn verify_runtime_services() -> Result<(), BackendError> {
     let output = run_compose(&["ps", "--all", "--format", "json"])?;
     let records = parse_compose_ps(&output.stdout)?;
@@ -2024,6 +2061,7 @@ fn verify_runtime_services() -> Result<(), BackendError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn parse_compose_ps(bytes: &[u8]) -> Result<BTreeMap<String, serde_json::Value>, BackendError> {
     let values = if let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
         values
@@ -2050,10 +2088,12 @@ fn parse_compose_ps(bytes: &[u8]) -> Result<BTreeMap<String, serde_json::Value>,
     Ok(records)
 }
 
+#[cfg(target_os = "linux")]
 fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
 }
 
+#[cfg(target_os = "linux")]
 fn verify_updater_binary(expected: &UpdaterIdentity) -> Result<(), BackendError> {
     let bytes = read_stable_regular(
         Path::new("/usr/local/bin/dirextalk-updater"),
@@ -2070,6 +2110,7 @@ fn verify_updater_binary(expected: &UpdaterIdentity) -> Result<(), BackendError>
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
 pub fn read_stable_regular(
     path: &Path,
     expected_uid: Option<u32>,
@@ -2120,10 +2161,12 @@ pub fn read_stable_regular(
     Ok(bytes)
 }
 
+#[cfg(target_os = "linux")]
 fn install_file(bytes: &[u8], destination: &str, mode: u32) -> Result<(), BackendError> {
     atomic_write(Path::new(destination), bytes, mode)
 }
 
+#[cfg(target_os = "linux")]
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), BackendError> {
     let parent = path
         .parent()
@@ -2147,6 +2190,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), BackendError
         .map_err(|error| BackendError::Infrastructure(error.to_string()))
 }
 
+#[cfg(target_os = "linux")]
 fn run_program(program: &str, arguments: &[&str]) -> Result<std::process::Output, BackendError> {
     let output = Command::new(program)
         .args(arguments)
@@ -2160,6 +2204,7 @@ fn run_program(program: &str, arguments: &[&str]) -> Result<std::process::Output
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_program_with_input(
     program: &str,
     arguments: &[&str],
@@ -2188,6 +2233,7 @@ fn run_program_with_input(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn command_failure(program: &str, output: &std::process::Output) -> BackendError {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if program == "/usr/bin/apt-get"
@@ -2203,6 +2249,7 @@ fn command_failure(program: &str, output: &std::process::Output) -> BackendError
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn parse_os_release(source: &str) -> BTreeMap<String, String> {
     source
         .lines()
@@ -2835,6 +2882,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn turn_contract_is_credential_backed_3478_without_tls_listener() {
         let (request, _, _, _) = fixture();
         let request: InstallRequest = parse_canonical_json(&request).unwrap();
@@ -2918,6 +2966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn portal_initialization_code_is_retry_safe_exactly_eight_digits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("message_portal_password");
@@ -2931,6 +2980,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn malformed_existing_portal_initialization_code_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("message_portal_password");
@@ -2979,5 +3029,24 @@ mod tests {
             UPDATER_SOURCE_REVISION
         );
         assert_eq!(request_digest, DigestHex::calculate(&canonical));
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod portable_compile_tests {
+    use super::*;
+
+    #[test]
+    fn shared_contract_api_does_not_require_linux_backend() {
+        let target = HostTarget::LinuxAmd64;
+        assert_eq!(canonical_json(&target).unwrap(), br#""linux_amd64""#);
+        assert_eq!(
+            InstallOutcome::WaitingUser {
+                reason: String::new()
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(BundleRole::required().len(), 10);
     }
 }
