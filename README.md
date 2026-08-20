@@ -81,9 +81,11 @@ dirextalk-deployer project inspect --project <project-id>
 The `auth login`, `auth status`, and `auth logout` commands broker
 authentication through the official installed `gcloud` CLI. They always set a
 private, isolated Dirextalk `CLOUDSDK_CONFIG`; they neither read nor change the
-operator's default gcloud configuration. Complete any interactive Google sign-in
-only in the browser opened or named by gcloud, and never paste authorization
-codes or tokens into chat, configuration, shell arguments, or issue reports.
+operator's default gcloud configuration. On Linux and Unix, `auth login` prints
+gcloud's Google authorization URL so it can be opened explicitly; on Windows,
+gcloud retains its normal browser behavior. Complete sign-in only at that URL
+or in the browser opened by gcloud, and never paste authorization codes or
+tokens into chat, configuration, shell arguments, or issue reports.
 Credentials remain in that restricted isolated gcloud configuration and are
 never copied into deployment state. `auth logout` removes the session from the
 isolated configuration only.

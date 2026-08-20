@@ -13,7 +13,8 @@ use zeroize::Zeroizing;
 use crate::{GcpError, Result};
 
 const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
-const SANITIZED_ENVIRONMENT: [&str; 7] = [
+const SANITIZED_ENVIRONMENT: [&str; 8] = [
+    "BROWSER",
     "CLOUDSDK_ACTIVE_CONFIG_NAME",
     "CLOUDSDK_AUTH_ACCESS_TOKEN",
     "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
@@ -241,12 +242,7 @@ impl GcloudProcess for RealGcloudProcess {
 }
 
 fn run_gcloud(invocation: &GcloudInvocation) -> Result<GcloudProcessOutput> {
-    let mut command = Command::new("gcloud");
-    command.args(&invocation.args);
-    command.env("CLOUDSDK_CONFIG", &invocation.config_dir);
-    for name in SANITIZED_ENVIRONMENT {
-        command.env_remove(name);
-    }
+    let mut command = gcloud_command(invocation);
 
     match invocation.output {
         OutputMode::Interactive => {
@@ -286,6 +282,24 @@ fn run_gcloud(invocation: &GcloudInvocation) -> Result<GcloudProcessOutput> {
             })
         }
     }
+}
+
+fn gcloud_command(invocation: &GcloudInvocation) -> Command {
+    let mut command = Command::new("gcloud");
+    command.args(&invocation.args);
+    command.env("CLOUDSDK_CONFIG", &invocation.config_dir);
+    for name in SANITIZED_ENVIRONMENT {
+        command.env_remove(name);
+    }
+
+    #[cfg(unix)]
+    if invocation.output == OutputMode::Interactive
+        && invocation.args == ["auth", "login", "--brief"]
+    {
+        command.env("BROWSER", "/bin/echo");
+    }
+
+    command
 }
 
 fn relay_interactive_output(reader: &mut impl Read) -> std::io::Result<()> {
@@ -504,7 +518,7 @@ mod tests {
 
     use super::{
         GcloudAuthBroker, GcloudInvocation, GcloudProcess, GcloudProcessOutput, OAuthToken,
-        OutputMode, SubjectResolver, relay_buffered, require_oauth_principal,
+        OutputMode, SubjectResolver, gcloud_command, relay_buffered, require_oauth_principal,
     };
     use crate::{GcpError, Result};
 
@@ -663,6 +677,44 @@ mod tests {
         let invocations = process.invocations();
         assert_eq!(invocations[0].args, ["auth", "login", "--brief"]);
         assert_eq!(invocations[0].output, OutputMode::Interactive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_login_prints_the_authorization_url_without_inheriting_browser() {
+        let home = tempfile::tempdir().expect("home");
+        let config_dir = home.path().join(".dirextalk/gcloud");
+        let login = gcloud_command(&GcloudInvocation {
+            args: vec!["auth", "login", "--brief"],
+            config_dir: config_dir.clone(),
+            output: OutputMode::Interactive,
+        });
+        assert_eq!(login.get_program(), "gcloud");
+        assert_eq!(
+            login.get_args().collect::<Vec<_>>(),
+            ["auth", "login", "--brief"]
+        );
+        let (_, login_config) = login
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLOUDSDK_CONFIG"))
+            .expect("isolated config environment");
+        assert_eq!(login_config, Some(config_dir.as_os_str()));
+        let (_, login_browser) = login
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("BROWSER"))
+            .expect("browser environment");
+        assert_eq!(login_browser, Some(std::ffi::OsStr::new("/bin/echo")));
+
+        let logout = gcloud_command(&GcloudInvocation {
+            args: vec!["auth", "revoke", "--all", "--quiet"],
+            config_dir,
+            output: OutputMode::Interactive,
+        });
+        let (_, logout_browser) = logout
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("BROWSER"))
+            .expect("sanitized browser environment");
+        assert_eq!(logout_browser, None);
     }
 
     #[tokio::test]
