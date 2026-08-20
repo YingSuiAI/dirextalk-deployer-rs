@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::sync::Arc;
@@ -270,19 +269,18 @@ impl GoogleInstalledApp {
                 "callback did not target the bound loopback redirect".into(),
             ));
         }
-        let values: HashMap<_, _> = callback.query_pairs().into_owned().collect();
-        if values.get("state").map(String::as_str) != Some(request.state.expose_secret()) {
+        let values: Vec<_> = callback.query_pairs().into_owned().collect();
+        let state = unique_parameter(&values, "state")?;
+        if state.as_deref() != Some(request.state.expose_secret()) {
             return Err(GcpError::OAuthValidation("CSRF state did not match".into()));
         }
-        if let Some(error) = values.get("error") {
+        if let Some(error) = unique_parameter(&values, "error")? {
             return Err(GcpError::Authentication(format!(
                 "authorization server returned {error}"
             )));
         }
-        values
-            .get("code")
+        unique_parameter(&values, "code")?
             .filter(|code| !code.is_empty())
-            .cloned()
             .ok_or_else(|| GcpError::OAuthValidation("authorization code was missing".into()))
     }
 
@@ -353,6 +351,17 @@ impl GoogleInstalledApp {
                 .map(|seconds| Instant::now() + Duration::from_secs(seconds)),
         })
     }
+}
+
+fn unique_parameter(values: &[(String, String)], key: &str) -> Result<Option<String>> {
+    let mut matches = values.iter().filter(|(name, _)| name == key);
+    let value = matches.next().map(|(_, value)| value.clone());
+    if matches.next().is_some() {
+        return Err(GcpError::OAuthValidation(format!(
+            "OAuth callback contained duplicate {key} parameters"
+        )));
+    }
+    Ok(value)
 }
 
 fn random_secret(bytes: usize) -> SecretString {
@@ -486,5 +495,7 @@ mod tests {
             GoogleInstalledApp::validate_callback(&valid, &request).expect("valid"),
             "one-time-code"
         );
+        let duplicate = format!("/oauth/callback?state={state}&state={state}&code=one-time-code");
+        assert!(GoogleInstalledApp::validate_callback(&duplicate, &request).is_err());
     }
 }

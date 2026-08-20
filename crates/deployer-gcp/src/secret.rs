@@ -104,6 +104,12 @@ impl EncryptedFileStore {
     }
 
     fn derive_key(&self, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        if self.passphrase.expose_secret().chars().count() < 16 {
+            return Err(GcpError::CredentialStorage(
+                "encrypted credential fallback requires a passphrase of at least 16 characters"
+                    .into(),
+            ));
+        }
         let mut key = Zeroizing::new([0_u8; 32]);
         Argon2::default()
             .hash_password_into(
@@ -344,5 +350,20 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.expose_secret(), secret.expose_secret());
         assert!(!format!("{store:?}").contains(secret.expose_secret()));
+    }
+
+    #[test]
+    fn encrypted_file_rejects_weak_passphrase() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = EncryptedFileStore::new(
+            directory.path(),
+            "dirextalk-test",
+            SecretString::from("too-short"),
+        );
+        assert!(
+            store
+                .set("operator@example.com", &SecretString::from("refresh-token"))
+                .is_err()
+        );
     }
 }

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{GcpError, GoogleRestClient, Result};
+use crate::{GcpError, GoogleCloudClient, GoogleRestClient, Result};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -200,6 +200,7 @@ pub struct DnsRecordSet {
 #[serde(deny_unknown_fields)]
 pub struct DnsChange {
     pub managed_zone: String,
+    pub expected_current: Option<DnsRecordSet>,
     pub additions: Vec<DnsRecordSet>,
     pub deletions: Vec<DnsRecordSet>,
 }
@@ -517,9 +518,24 @@ impl GcpLifecycle for GoogleRestClient {
         change: &DnsChange,
     ) -> Result<Operation> {
         validate_name(&change.managed_zone)?;
-        if change.additions.is_empty() && change.deletions.is_empty() {
+        validate_dns_change(change)?;
+        self.revalidate_project(project_number).await?;
+        let record = change
+            .additions
+            .first()
+            .or_else(|| change.deletions.first())
+            .expect("validated DNS change has one record");
+        let current = crate::GcpDiscovery::dns_record_set(
+            self,
+            &self.project_id,
+            &change.managed_zone,
+            &record.name,
+            "A",
+        )
+        .await?;
+        if !dns_current_allows_resume(change, current.as_ref()) {
             return Err(GcpError::Contract(
-                "DNS change has no additions or deletions".into(),
+                "Cloud DNS A record changed after planning; a new explicit plan is required".into(),
             ));
         }
         self.revalidate_project(project_number).await?;
@@ -606,6 +622,11 @@ impl GcpLifecycle for GoogleRestClient {
         self.revalidate_project(project_number).await?;
         let (url, expected_location) = resource_url(&self.project_id, kind, name, location)?;
         let resource: ResourceWire = self.get(url).await?;
+        require_self_link(
+            &resource.self_link,
+            &self.project_id,
+            resource_collection(kind),
+        )?;
         let deployment_uuid = deployment_uuid(&resource)?;
         let observed_location = resource
             .zone
@@ -690,6 +711,857 @@ impl GoogleRestClient {
             ));
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl GcpLifecycle for GoogleCloudClient {
+    async fn start_network(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        spec: &NetworkSpec,
+    ) -> Result<Operation> {
+        validate_name(&spec.name)?;
+        self.revalidate_project(project_number).await?;
+        let body = google_cloud_compute_v1::model::Network::new()
+            .set_name(&spec.name)
+            .set_description(deployment_marker(spec.deployment_uuid))
+            .set_auto_create_subnetworks(false)
+            .set_routing_config(
+                google_cloud_compute_v1::model::NetworkRoutingConfig::new().set_routing_mode(
+                    google_cloud_compute_v1::model::network_routing_config::RoutingMode::Global,
+                ),
+            );
+        let response = self
+            .networks
+            .insert()
+            .set_project(&self.project_id)
+            .set_request_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        operation_from_sdk(response, project_number, OperationScope::Global)
+    }
+
+    async fn start_subnetwork(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        spec: &SubnetworkSpec,
+    ) -> Result<Operation> {
+        validate_name(&spec.name)?;
+        validate_name(&spec.region)?;
+        require_self_link(
+            &spec.network_self_link,
+            &self.project_id,
+            "/global/networks/",
+        )?;
+        self.revalidate_project(project_number).await?;
+        let body = google_cloud_compute_v1::model::Subnetwork::new()
+            .set_name(&spec.name)
+            .set_description(deployment_marker(spec.deployment_uuid))
+            .set_network(&spec.network_self_link)
+            .set_ip_cidr_range(&spec.cidr)
+            .set_stack_type(google_cloud_compute_v1::model::subnetwork::StackType::Ipv4Only);
+        let response = self
+            .subnetworks
+            .insert()
+            .set_project(&self.project_id)
+            .set_region(&spec.region)
+            .set_request_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        operation_from_sdk(
+            response,
+            project_number,
+            OperationScope::Region(spec.region.clone()),
+        )
+    }
+
+    async fn start_firewall(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        spec: &FirewallSpec,
+    ) -> Result<Operation> {
+        validate_name(&spec.name)?;
+        require_self_link(
+            &spec.network_self_link,
+            &self.project_id,
+            "/global/networks/",
+        )?;
+        if spec.source_ranges.is_empty() || spec.allowed.is_empty() || spec.target_tag.is_empty() {
+            return Err(GcpError::Contract(
+                "firewall scope and allowances must be explicit".into(),
+            ));
+        }
+        self.revalidate_project(project_number).await?;
+        let allowed = spec.allowed.iter().map(|item| {
+            google_cloud_compute_v1::model::firewall::Allowed::new()
+                .set_ip_protocol(&item.protocol)
+                .set_ports(item.ports.clone())
+        });
+        let body = google_cloud_compute_v1::model::Firewall::new()
+            .set_name(&spec.name)
+            .set_description(deployment_marker(spec.deployment_uuid))
+            .set_network(&spec.network_self_link)
+            .set_direction(google_cloud_compute_v1::model::firewall::Direction::Ingress)
+            .set_source_ranges(spec.source_ranges.clone())
+            .set_target_tags([spec.target_tag.clone()])
+            .set_allowed(allowed);
+        let response = self
+            .firewalls
+            .insert()
+            .set_project(&self.project_id)
+            .set_request_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        operation_from_sdk(response, project_number, OperationScope::Global)
+    }
+
+    async fn start_address(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        spec: &AddressSpec,
+    ) -> Result<Operation> {
+        validate_name(&spec.name)?;
+        validate_name(&spec.region)?;
+        self.revalidate_project(project_number).await?;
+        let body = google_cloud_compute_v1::model::Address::new()
+            .set_name(&spec.name)
+            .set_description(deployment_marker(spec.deployment_uuid))
+            .set_address_type(google_cloud_compute_v1::model::address::AddressType::External)
+            .set_ip_version(google_cloud_compute_v1::model::address::IpVersion::Ipv4)
+            .set_network_tier(google_cloud_compute_v1::model::address::NetworkTier::Premium);
+        let response = self
+            .addresses
+            .insert()
+            .set_project(&self.project_id)
+            .set_region(&spec.region)
+            .set_request_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        operation_from_sdk(
+            response,
+            project_number,
+            OperationScope::Region(spec.region.clone()),
+        )
+    }
+
+    async fn start_disk(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        spec: &DiskSpec,
+    ) -> Result<Operation> {
+        validate_name(&spec.name)?;
+        validate_name(&spec.zone)?;
+        if spec.size_gib < 10 {
+            return Err(GcpError::Contract(
+                "boot disk must be at least 10 GiB".into(),
+            ));
+        }
+        self.revalidate_project(project_number).await?;
+        let body = google_cloud_compute_v1::model::Disk::new()
+            .set_name(&spec.name)
+            .set_description(deployment_marker(spec.deployment_uuid))
+            .set_size_gb(i64::from(spec.size_gib))
+            .set_type(format!(
+                "{}/zones/{}/diskTypes/{}",
+                compute_project_url(&self.project_id),
+                spec.zone,
+                spec.disk_type
+            ))
+            .set_source_image(&spec.source_image)
+            .set_labels([("dirextalk-deployment", spec.deployment_uuid.to_string())]);
+        let response = self
+            .disks
+            .insert()
+            .set_project(&self.project_id)
+            .set_zone(&spec.zone)
+            .set_request_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        operation_from_sdk(
+            response,
+            project_number,
+            OperationScope::Zone(spec.zone.clone()),
+        )
+    }
+
+    async fn start_instance(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        spec: &InstanceSpec,
+    ) -> Result<Operation> {
+        validate_name(&spec.name)?;
+        validate_name(&spec.zone)?;
+        require_self_link(
+            &spec.subnetwork_self_link,
+            &self.project_id,
+            "/subnetworks/",
+        )?;
+        require_self_link(&spec.boot_disk_self_link, &self.project_id, "/disks/")?;
+        if spec.address.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(GcpError::Contract(
+                "instance address must be a reserved IPv4 address".into(),
+            ));
+        }
+        validate_ssh(&spec.ssh_username, &spec.ssh_public_key)?;
+        self.revalidate_project(project_number).await?;
+        let disk = google_cloud_compute_v1::model::AttachedDisk::new()
+            .set_boot(true)
+            .set_auto_delete(false)
+            .set_source(&spec.boot_disk_self_link);
+        let access = google_cloud_compute_v1::model::AccessConfig::new()
+            .set_name("External NAT")
+            .set_type(google_cloud_compute_v1::model::access_config::Type::OneToOneNat)
+            .set_nat_ip(&spec.address)
+            .set_network_tier(google_cloud_compute_v1::model::access_config::NetworkTier::Premium);
+        let interface = google_cloud_compute_v1::model::NetworkInterface::new()
+            .set_subnetwork(&spec.subnetwork_self_link)
+            .set_stack_type(google_cloud_compute_v1::model::network_interface::StackType::Ipv4Only)
+            .set_access_configs([access]);
+        let metadata = google_cloud_compute_v1::model::Metadata::new().set_items([
+            google_cloud_compute_v1::model::metadata::Items::new()
+                .set_key("ssh-keys")
+                .set_value(format!("{}:{}", spec.ssh_username, spec.ssh_public_key)),
+        ]);
+        let body = google_cloud_compute_v1::model::Instance::new()
+            .set_name(&spec.name)
+            .set_description(deployment_marker(spec.deployment_uuid))
+            .set_machine_type(format!(
+                "{}/zones/{}/machineTypes/{}",
+                compute_project_url(&self.project_id),
+                spec.zone,
+                spec.machine_type
+            ))
+            .set_can_ip_forward(false)
+            .set_deletion_protection(false)
+            .set_disks([disk])
+            .set_network_interfaces([interface])
+            .set_tags(
+                google_cloud_compute_v1::model::Tags::new().set_items(spec.network_tags.clone()),
+            )
+            .set_labels([("dirextalk-deployment", spec.deployment_uuid.to_string())])
+            .set_metadata(metadata);
+        if !body.service_accounts.is_empty() {
+            return Err(GcpError::Contract(
+                "VM service account must be absent".into(),
+            ));
+        }
+        let response = self
+            .instances
+            .insert()
+            .set_project(&self.project_id)
+            .set_zone(&spec.zone)
+            .set_request_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        operation_from_sdk(
+            response,
+            project_number,
+            OperationScope::Zone(spec.zone.clone()),
+        )
+    }
+
+    async fn start_dns_change(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        change: &DnsChange,
+    ) -> Result<Operation> {
+        validate_name(&change.managed_zone)?;
+        validate_dns_change(change)?;
+        self.revalidate_project(project_number).await?;
+        let record = change
+            .additions
+            .first()
+            .or_else(|| change.deletions.first())
+            .expect("validated DNS record");
+        let current = crate::GcpDiscovery::dns_record_set(
+            self,
+            &self.project_id,
+            &change.managed_zone,
+            &record.name,
+            "A",
+        )
+        .await?;
+        if !dns_current_allows_resume(change, current.as_ref()) {
+            return Err(GcpError::Contract(
+                "Cloud DNS A record changed after planning; a new explicit plan is required".into(),
+            ));
+        }
+        self.revalidate_project(project_number).await?;
+        let convert = |record: &DnsRecordSet| {
+            let mut value = google_cloud_dns_v1::model::ResourceRecordSet::new()
+                .set_name(&record.name)
+                .set_ttl(i32::try_from(record.ttl).expect("validated TTL"))
+                .set_rrdatas(record.rrdatas.clone());
+            value.r#type = Some(record.record_type.clone());
+            value
+        };
+        let body = google_cloud_dns_v1::model::Change::new()
+            .set_additions(change.additions.iter().map(convert))
+            .set_deletions(change.deletions.iter().map(convert));
+        let response = self
+            .dns_changes
+            .create()
+            .set_project(&self.project_id)
+            .set_managed_zone(&change.managed_zone)
+            .set_client_operation_id(request_id.to_string())
+            .set_body(body)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        let id = response
+            .id
+            .ok_or_else(|| GcpError::Infrastructure("Cloud DNS operation omitted id".into()))?;
+        Ok(Operation {
+            name: id.clone(),
+            self_link: format!(
+                "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes/{id}",
+                self.project_id, change.managed_zone
+            ),
+            project_number: project_number.into(),
+            scope: OperationScope::DnsZone(change.managed_zone.clone()),
+        })
+    }
+
+    async fn poll_operation(
+        &self,
+        project_number: &str,
+        operation: &Operation,
+    ) -> Result<OperationState> {
+        self.assert_operation_identity(project_number, operation)?;
+        self.revalidate_project(project_number).await?;
+        if let OperationScope::DnsZone(zone) = &operation.scope {
+            let response = self
+                .dns_changes
+                .get()
+                .set_project(&self.project_id)
+                .set_managed_zone(zone)
+                .set_change_id(&operation.name)
+                .send()
+                .await
+                .map_err(crate::official::official_error)?;
+            if response.id.as_deref() != Some(&operation.name) {
+                return Err(GcpError::Contract(
+                    "Cloud DNS change identity mismatch".into(),
+                ));
+            }
+            return match response
+                .status
+                .and_then(|status| status.name().map(str::to_owned))
+                .as_deref()
+            {
+                Some("PENDING") => Ok(OperationState::Pending),
+                Some("DONE") => Ok(OperationState::Succeeded),
+                _ => Err(GcpError::Infrastructure(
+                    "Cloud DNS returned unknown operation state".into(),
+                )),
+            };
+        }
+        let response = match &operation.scope {
+            OperationScope::Global => {
+                self.global_operations
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_operation(&operation.name)
+                    .send()
+                    .await
+            }
+            OperationScope::Region(region) => {
+                self.region_operations
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_region(region)
+                    .set_operation(&operation.name)
+                    .send()
+                    .await
+            }
+            OperationScope::Zone(zone) => {
+                self.zone_operations
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_zone(zone)
+                    .set_operation(&operation.name)
+                    .send()
+                    .await
+            }
+            OperationScope::DnsZone(_) => unreachable!(),
+        }
+        .map_err(crate::official::official_error)?;
+        validate_sdk_operation_identity(&response, operation)?;
+        operation_state_from_sdk(response)
+    }
+
+    async fn get_resource(
+        &self,
+        project_number: &str,
+        kind: ResourceKind,
+        name: &str,
+        location: Option<&str>,
+    ) -> Result<ResourceReceipt> {
+        self.get_resource_sdk(project_number, kind, name, location)
+            .await
+    }
+
+    async fn start_delete(
+        &self,
+        project_number: &str,
+        request_id: Uuid,
+        identity: &ResourceIdentity,
+    ) -> Result<Operation> {
+        if identity.project_number != project_number {
+            return Err(GcpError::Contract(
+                "delete project identity mismatch".into(),
+            ));
+        }
+        let observed = self
+            .get_resource_sdk(
+                project_number,
+                identity.kind,
+                &identity.name,
+                identity.location.as_deref(),
+            )
+            .await?;
+        validate_resource_identity(identity, &observed)?;
+        self.revalidate_project(project_number).await?;
+        let response = match identity.kind {
+            ResourceKind::Network => {
+                self.networks
+                    .delete()
+                    .set_project(&self.project_id)
+                    .set_network(&identity.name)
+                    .set_request_id(request_id.to_string())
+                    .send()
+                    .await
+            }
+            ResourceKind::Firewall => {
+                self.firewalls
+                    .delete()
+                    .set_project(&self.project_id)
+                    .set_firewall(&identity.name)
+                    .set_request_id(request_id.to_string())
+                    .send()
+                    .await
+            }
+            ResourceKind::Subnetwork => {
+                self.subnetworks
+                    .delete()
+                    .set_project(&self.project_id)
+                    .set_region(required_location(
+                        identity.kind,
+                        identity.location.as_deref(),
+                    )?)
+                    .set_subnetwork(&identity.name)
+                    .set_request_id(request_id.to_string())
+                    .send()
+                    .await
+            }
+            ResourceKind::Address => {
+                self.addresses
+                    .delete()
+                    .set_project(&self.project_id)
+                    .set_region(required_location(
+                        identity.kind,
+                        identity.location.as_deref(),
+                    )?)
+                    .set_address(&identity.name)
+                    .set_request_id(request_id.to_string())
+                    .send()
+                    .await
+            }
+            ResourceKind::Disk => {
+                self.disks
+                    .delete()
+                    .set_project(&self.project_id)
+                    .set_zone(required_location(
+                        identity.kind,
+                        identity.location.as_deref(),
+                    )?)
+                    .set_disk(&identity.name)
+                    .set_request_id(request_id.to_string())
+                    .send()
+                    .await
+            }
+            ResourceKind::Instance => {
+                self.instances
+                    .delete()
+                    .set_project(&self.project_id)
+                    .set_zone(required_location(
+                        identity.kind,
+                        identity.location.as_deref(),
+                    )?)
+                    .set_instance(&identity.name)
+                    .set_request_id(request_id.to_string())
+                    .send()
+                    .await
+            }
+        }
+        .map_err(crate::official::official_error)?;
+        operation_from_sdk(response, project_number, scope_for_resource(identity)?)
+    }
+}
+
+impl GoogleCloudClient {
+    async fn revalidate_project(&self, expected_project_number: &str) -> Result<()> {
+        if expected_project_number != self.project_number {
+            return Err(GcpError::Contract(
+                "official client project identity mismatch".into(),
+            ));
+        }
+        let project = self
+            .projects
+            .get_project()
+            .set_name(format!("projects/{}", self.project_id))
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        let observed_number = project
+            .name
+            .strip_prefix("projects/")
+            .unwrap_or(&project.name);
+        if observed_number != expected_project_number || project.state.name() != Some("ACTIVE") {
+            return Err(GcpError::Contract(
+                "project identity changed or project is not active".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn assert_operation_identity(&self, project_number: &str, operation: &Operation) -> Result<()> {
+        if project_number != self.project_number || operation.project_number != project_number {
+            return Err(GcpError::Contract(
+                "operation project identity mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each GCE resource has a distinct official SDK client and receipt shape"
+    )]
+    async fn get_resource_sdk(
+        &self,
+        project_number: &str,
+        kind: ResourceKind,
+        name: &str,
+        location: Option<&str>,
+    ) -> Result<ResourceReceipt> {
+        validate_name(name)?;
+        self.revalidate_project(project_number).await?;
+        match kind {
+            ResourceKind::Network => {
+                let value = self
+                    .networks
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_network(name)
+                    .send()
+                    .await
+                    .map_err(crate::official::official_error)?;
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    None,
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    None,
+                    BTreeMap::from([(
+                        "auto_create_subnetworks".into(),
+                        json!(value.auto_create_subnetworks),
+                    )]),
+                )
+            }
+            ResourceKind::Firewall => {
+                let value = self
+                    .firewalls
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_firewall(name)
+                    .send()
+                    .await
+                    .map_err(crate::official::official_error)?;
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    None,
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    None,
+                    BTreeMap::from([("network".into(), json!(value.network))]),
+                )
+            }
+            ResourceKind::Subnetwork => {
+                let region = required_location(kind, location)?;
+                let value = self
+                    .subnetworks
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_region(region)
+                    .set_subnetwork(name)
+                    .send()
+                    .await
+                    .map_err(crate::official::official_error)?;
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    Some(region),
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    None,
+                    BTreeMap::from([
+                        ("ip_cidr_range".into(), json!(value.ip_cidr_range)),
+                        ("network".into(), json!(value.network)),
+                    ]),
+                )
+            }
+            ResourceKind::Address => {
+                let region = required_location(kind, location)?;
+                let value = self
+                    .addresses
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_region(region)
+                    .set_address(name)
+                    .send()
+                    .await
+                    .map_err(crate::official::official_error)?;
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    Some(region),
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    Some(&value.labels),
+                    BTreeMap::from([("address".into(), json!(value.address))]),
+                )
+            }
+            ResourceKind::Disk => {
+                let zone = required_location(kind, location)?;
+                let value = self
+                    .disks
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_zone(zone)
+                    .set_disk(name)
+                    .send()
+                    .await
+                    .map_err(crate::official::official_error)?;
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    Some(zone),
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    Some(&value.labels),
+                    BTreeMap::from([
+                        ("size_gb".into(), json!(value.size_gb)),
+                        ("type".into(), json!(value.r#type)),
+                    ]),
+                )
+            }
+            ResourceKind::Instance => {
+                let zone = required_location(kind, location)?;
+                let value = self
+                    .instances
+                    .get()
+                    .set_project(&self.project_id)
+                    .set_zone(zone)
+                    .set_instance(name)
+                    .send()
+                    .await
+                    .map_err(crate::official::official_error)?;
+                if !value.service_accounts.is_empty() {
+                    return Err(GcpError::Contract(
+                        "observed VM unexpectedly has a project service account".into(),
+                    ));
+                }
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    Some(zone),
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    Some(&value.labels),
+                    BTreeMap::from([
+                        ("machine_type".into(), json!(value.machine_type)),
+                        ("service_accounts".into(), json!([])),
+                    ]),
+                )
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
+    reason = "the helper normalizes identity fields shared by six generated GCE model types"
+)]
+fn sdk_receipt(
+    kind: ResourceKind,
+    expected_name: &str,
+    project_id: &str,
+    project_number: &str,
+    location: Option<&str>,
+    id: Option<u64>,
+    self_link: Option<String>,
+    description: Option<String>,
+    labels: Option<&std::collections::HashMap<String, String>>,
+    observed_attributes: BTreeMap<String, Value>,
+) -> Result<ResourceReceipt> {
+    let numeric_id = id
+        .ok_or_else(|| GcpError::Infrastructure("GCP resource omitted numeric id".into()))?
+        .to_string();
+    let self_link = self_link
+        .ok_or_else(|| GcpError::Infrastructure("GCP resource omitted self-link".into()))?;
+    require_self_link(&self_link, project_id, resource_collection(kind))?;
+    if let Some(location) = location {
+        let location_scope = match kind {
+            ResourceKind::Subnetwork | ResourceKind::Address => "regions",
+            ResourceKind::Disk | ResourceKind::Instance => "zones",
+            ResourceKind::Network | ResourceKind::Firewall => "global",
+        };
+        if !Url::parse(&self_link)?
+            .path()
+            .contains(&format!("/{location_scope}/{location}/"))
+        {
+            return Err(GcpError::Contract(
+                "resource self-link location mismatch".into(),
+            ));
+        }
+    }
+    let deployment = description
+        .as_deref()
+        .and_then(|value| value.strip_prefix("dirextalk-deployment:"))
+        .or_else(|| {
+            labels.and_then(|labels| labels.get("dirextalk-deployment").map(String::as_str))
+        })
+        .ok_or_else(|| {
+            GcpError::Contract("resource has no Dirextalk deployment identity".into())
+        })?;
+    let deployment_uuid = Uuid::parse_str(deployment)
+        .map_err(|_| GcpError::Contract("resource deployment identity is invalid".into()))?;
+    if last_path_segment(&self_link) != Some(expected_name) {
+        return Err(GcpError::Contract(
+            "resource self-link name mismatch".into(),
+        ));
+    }
+    Ok(ResourceReceipt {
+        identity: ResourceIdentity {
+            kind,
+            name: expected_name.into(),
+            project_number: project_number.into(),
+            location: location.map(str::to_owned),
+            numeric_id,
+            self_link,
+            deployment_uuid,
+        },
+        observed_attributes,
+    })
+}
+
+fn operation_from_sdk(
+    response: google_cloud_compute_v1::model::Operation,
+    project_number: &str,
+    scope: OperationScope,
+) -> Result<Operation> {
+    let name = response
+        .name
+        .ok_or_else(|| GcpError::Infrastructure("compute operation omitted name".into()))?;
+    let self_link = response
+        .self_link
+        .ok_or_else(|| GcpError::Infrastructure("compute operation omitted selfLink".into()))?;
+    Ok(Operation {
+        name,
+        self_link,
+        project_number: project_number.into(),
+        scope,
+    })
+}
+
+fn validate_sdk_operation_identity(
+    response: &google_cloud_compute_v1::model::Operation,
+    expected: &Operation,
+) -> Result<()> {
+    if response.name.as_deref() != Some(&expected.name)
+        || response.self_link.as_deref() != Some(&expected.self_link)
+    {
+        return Err(GcpError::Contract(
+            "compute operation identity mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn operation_state_from_sdk(
+    response: google_cloud_compute_v1::model::Operation,
+) -> Result<OperationState> {
+    let status = response
+        .status
+        .and_then(|value| value.name().map(str::to_owned))
+        .ok_or_else(|| GcpError::Infrastructure("compute operation omitted status".into()))?;
+    match status.as_str() {
+        "PENDING" | "RUNNING" => Ok(OperationState::Pending),
+        "DONE"
+            if response
+                .error
+                .as_ref()
+                .is_none_or(|error| error.errors.is_empty()) =>
+        {
+            Ok(OperationState::Succeeded)
+        }
+        "DONE" => {
+            let error = response
+                .error
+                .and_then(|error| error.errors.into_iter().next())
+                .expect("DONE error checked non-empty");
+            Ok(OperationState::Failed(OperationFailure {
+                code: error.code,
+                message: error
+                    .message
+                    .unwrap_or_else(|| "Google operation failed".into()),
+            }))
+        }
+        other => Err(GcpError::Infrastructure(format!(
+            "Google operation returned unknown status {other}"
+        ))),
     }
 }
 
@@ -869,6 +1741,49 @@ fn validate_ssh(username: &str, public_key: &str) -> Result<()> {
     }
 }
 
+fn validate_dns_change(change: &DnsChange) -> Result<()> {
+    if change.additions.len() > 1
+        || change.deletions.len() > 1
+        || (change.additions.is_empty() && change.deletions.is_empty())
+    {
+        return Err(GcpError::Contract(
+            "v0.1 DNS change must affect exactly one A record".into(),
+        ));
+    }
+    let addition = change.additions.first();
+    let deletion = change.deletions.first();
+    for record in addition.into_iter().chain(deletion) {
+        if record.record_type != "A"
+            || !record.name.ends_with('.')
+            || record.rrdatas.len() != 1
+            || record.rrdatas[0].parse::<std::net::Ipv4Addr>().is_err()
+            || record.ttl == 0
+            || record.ttl > i32::MAX.cast_unsigned()
+        {
+            return Err(GcpError::Contract(
+                "v0.1 DNS changes require one absolute IPv4 A record".into(),
+            ));
+        }
+    }
+    if let (Some(addition), Some(deletion)) = (addition, deletion)
+        && (addition.name != deletion.name || addition.record_type != deletion.record_type)
+    {
+        return Err(GcpError::Contract(
+            "DNS replacement must preserve record name and type".into(),
+        ));
+    }
+    if deletion != change.expected_current.as_ref() {
+        return Err(GcpError::Contract(
+            "DNS deletion must exactly match the plan-bound current record".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn dns_current_allows_resume(change: &DnsChange, current: Option<&DnsRecordSet>) -> bool {
+    current == change.expected_current.as_ref() || current == change.additions.first()
+}
+
 fn last_path_segment(value: &str) -> Option<&str> {
     value
         .trim_end_matches('/')
@@ -879,7 +1794,48 @@ fn last_path_segment(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use http::Method;
+    use secrecy::SecretString;
+
     use super::*;
+    use crate::{HttpTransport, RestResponse};
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        calls: Mutex<Vec<(Method, Url, Option<Value>)>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for RecordingTransport {
+        async fn request(
+            &self,
+            method: Method,
+            url: Url,
+            _bearer_token: &SecretString,
+            body: Option<Value>,
+        ) -> Result<RestResponse> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push((method.clone(), url, body));
+            let response = if method == Method::GET {
+                json!({ "projectNumber": "123", "lifecycleState": "ACTIVE" })
+            } else {
+                json!({
+                    "name": "operation-1",
+                    "selfLink": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-1",
+                    "status": "PENDING"
+                })
+            };
+            Ok(RestResponse {
+                status: 200,
+                body: serde_json::to_vec(&response).expect("response JSON"),
+            })
+        }
+    }
 
     fn operation_wire(status: &str, error: Option<OperationErrorWire>) -> OperationState {
         OperationState::from_wire(status, error).expect("known status")
@@ -924,5 +1880,74 @@ mod tests {
         assert!(
             matches!(error, GcpError::Contract(message) if message.contains("identity mismatch"))
         );
+    }
+
+    #[test]
+    fn dns_change_requires_exact_owned_value() {
+        let owned = DnsRecordSet {
+            name: "node.example.com.".into(),
+            record_type: "A".into(),
+            ttl: 300,
+            rrdatas: vec!["203.0.113.10".into()],
+        };
+        let change = DnsChange {
+            managed_zone: "example".into(),
+            expected_current: Some(owned.clone()),
+            additions: vec![],
+            deletions: vec![owned.clone()],
+        };
+        validate_dns_change(&change).expect("exact deletion");
+        let stale = DnsChange {
+            expected_current: Some(DnsRecordSet {
+                rrdatas: vec!["203.0.113.11".into()],
+                ..owned
+            }),
+            ..change.clone()
+        };
+        assert!(validate_dns_change(&stale).is_err());
+        assert!(dns_current_allows_resume(
+            &change,
+            change.expected_current.as_ref()
+        ));
+        assert!(dns_current_allows_resume(&change, None));
+    }
+
+    #[tokio::test]
+    async fn instance_insert_has_request_id_and_no_service_account() {
+        let transport = Arc::new(RecordingTransport::default());
+        let client = GoogleRestClient::with_transport(
+            "test-project",
+            "123",
+            SecretString::from("access-token"),
+            transport.clone(),
+        );
+        let request_id = Uuid::new_v4();
+        let spec = InstanceSpec {
+            name: "dirextalk-node".into(),
+            zone: "us-central1-a".into(),
+            machine_type: "e2-custom-2-4096".into(),
+            subnetwork_self_link: "https://compute.googleapis.com/compute/v1/projects/test-project/regions/us-central1/subnetworks/dirextalk-subnet".into(),
+            address: "203.0.113.10".into(),
+            boot_disk_self_link: "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/disks/dirextalk-disk".into(),
+            network_tags: vec!["dirextalk-node".into()],
+            ssh_username: "dirextalk".into(),
+            ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".into(),
+            deployment_uuid: Uuid::new_v4(),
+        };
+        client
+            .start_instance("123", request_id, &spec)
+            .await
+            .expect("insert");
+        let calls = transport.calls.lock().expect("calls lock");
+        let (_, url, body) = calls.last().expect("insert call");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "requestId")
+                .map(|(_, value)| value.into_owned()),
+            Some(request_id.to_string())
+        );
+        let body = body.as_ref().expect("insert body");
+        assert!(body.get("serviceAccounts").is_none());
+        assert_eq!(body["metadata"]["items"][0]["key"], "ssh-keys");
     }
 }

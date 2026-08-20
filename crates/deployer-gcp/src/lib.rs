@@ -25,8 +25,9 @@ pub use oauth::{
 };
 pub use official::GoogleCloudClient;
 pub use preflight::{
-    BillingStatus, DnsZone, GcpDiscovery, Preflight, PreflightReport, ProjectStatus, Quota,
-    RequiredService, ServiceStatus, SkuPrice, longest_matching_zone,
+    BillingStatus, DnsZone, GcpDiscovery, Preflight, PreflightReport, PriceTier, ProjectStatus,
+    Quota, QuotaAssessment, RequiredQuota, RequiredService, ServiceStatus, SkuPrice,
+    longest_matching_zone,
 };
 pub use rest::{GoogleRestClient, HttpTransport, ReqwestTransport, RestResponse};
 pub use secret::{CredentialStore, EncryptedFileStore, KeyringStore, SecretStore};

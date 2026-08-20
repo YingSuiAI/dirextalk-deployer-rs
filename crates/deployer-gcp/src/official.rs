@@ -8,8 +8,8 @@ use secrecy::{ExposeSecret as _, SecretString};
 use async_trait::async_trait;
 
 use crate::{
-    BillingStatus, DnsRecordSet, DnsZone, GcpDiscovery, GcpError, GoogleRestClient, ProjectStatus,
-    Quota, Result, ServiceStatus, SkuPrice,
+    BillingStatus, DnsRecordSet, DnsZone, GcpDiscovery, GcpError, GoogleRestClient, PriceTier,
+    ProjectStatus, Quota, Result, ServiceStatus, SkuPrice,
 };
 
 #[derive(Clone)]
@@ -52,19 +52,19 @@ impl CredentialsProvider for InstalledAppAccessToken {
 /// generated Rust client in the stable cloud library set.
 #[derive(Clone, Debug)]
 pub struct GoogleCloudClient {
-    _project_id: String,
-    _project_number: String,
-    _networks: google_cloud_compute_v1::client::Networks,
-    _subnetworks: google_cloud_compute_v1::client::Subnetworks,
-    _firewalls: google_cloud_compute_v1::client::Firewalls,
-    _addresses: google_cloud_compute_v1::client::Addresses,
-    _disks: google_cloud_compute_v1::client::Disks,
-    _instances: google_cloud_compute_v1::client::Instances,
-    _global_operations: google_cloud_compute_v1::client::GlobalOperations,
-    _region_operations: google_cloud_compute_v1::client::RegionOperations,
-    _zone_operations: google_cloud_compute_v1::client::ZoneOperations,
+    pub(crate) project_id: String,
+    pub(crate) project_number: String,
+    pub(crate) networks: google_cloud_compute_v1::client::Networks,
+    pub(crate) subnetworks: google_cloud_compute_v1::client::Subnetworks,
+    pub(crate) firewalls: google_cloud_compute_v1::client::Firewalls,
+    pub(crate) addresses: google_cloud_compute_v1::client::Addresses,
+    pub(crate) disks: google_cloud_compute_v1::client::Disks,
+    pub(crate) instances: google_cloud_compute_v1::client::Instances,
+    pub(crate) global_operations: google_cloud_compute_v1::client::GlobalOperations,
+    pub(crate) region_operations: google_cloud_compute_v1::client::RegionOperations,
+    pub(crate) zone_operations: google_cloud_compute_v1::client::ZoneOperations,
     pub(crate) regions: google_cloud_compute_v1::client::Regions,
-    _dns_changes: google_cloud_dns_v1::client::Changes,
+    pub(crate) dns_changes: google_cloud_dns_v1::client::Changes,
     pub(crate) dns_zones: google_cloud_dns_v1::client::ManagedZones,
     pub(crate) dns_records: google_cloud_dns_v1::client::ResourceRecordSets,
     pub(crate) billing: google_cloud_billing_v1::client::CloudBilling,
@@ -94,6 +94,7 @@ impl GoogleCloudClient {
             ($client:path) => {
                 <$client>::builder()
                     .with_credentials(credentials.clone())
+                    .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry)
                     .build()
                     .await
                     .map_err(|error| {
@@ -106,19 +107,19 @@ impl GoogleCloudClient {
         let service_usage =
             GoogleRestClient::new(project_id.clone(), project_number.clone(), access_token);
         Ok(Self {
-            _project_id: project_id,
-            _project_number: project_number,
-            _networks: build!(google_cloud_compute_v1::client::Networks),
-            _subnetworks: build!(google_cloud_compute_v1::client::Subnetworks),
-            _firewalls: build!(google_cloud_compute_v1::client::Firewalls),
-            _addresses: build!(google_cloud_compute_v1::client::Addresses),
-            _disks: build!(google_cloud_compute_v1::client::Disks),
-            _instances: build!(google_cloud_compute_v1::client::Instances),
-            _global_operations: build!(google_cloud_compute_v1::client::GlobalOperations),
-            _region_operations: build!(google_cloud_compute_v1::client::RegionOperations),
-            _zone_operations: build!(google_cloud_compute_v1::client::ZoneOperations),
+            project_id,
+            project_number,
+            networks: build!(google_cloud_compute_v1::client::Networks),
+            subnetworks: build!(google_cloud_compute_v1::client::Subnetworks),
+            firewalls: build!(google_cloud_compute_v1::client::Firewalls),
+            addresses: build!(google_cloud_compute_v1::client::Addresses),
+            disks: build!(google_cloud_compute_v1::client::Disks),
+            instances: build!(google_cloud_compute_v1::client::Instances),
+            global_operations: build!(google_cloud_compute_v1::client::GlobalOperations),
+            region_operations: build!(google_cloud_compute_v1::client::RegionOperations),
+            zone_operations: build!(google_cloud_compute_v1::client::ZoneOperations),
             regions: build!(google_cloud_compute_v1::client::Regions),
-            _dns_changes: build!(google_cloud_dns_v1::client::Changes),
+            dns_changes: build!(google_cloud_dns_v1::client::Changes),
             dns_zones: build!(google_cloud_dns_v1::client::ManagedZones),
             dns_records: build!(google_cloud_dns_v1::client::ResourceRecordSets),
             billing: build!(google_cloud_billing_v1::client::CloudBilling),
@@ -129,7 +130,7 @@ impl GoogleCloudClient {
     }
 }
 
-fn official_error(error: impl std::fmt::Display) -> GcpError {
+pub(crate) fn official_error(error: impl std::fmt::Display) -> GcpError {
     GcpError::Infrastructure(format!("official Google API request failed: {error}"))
 }
 
@@ -153,13 +154,22 @@ fn project_status(project: google_cloud_resourcemanager_v3::model::Project) -> P
 #[async_trait]
 impl GcpDiscovery for GoogleCloudClient {
     async fn list_projects(&self) -> Result<Vec<ProjectStatus>> {
-        let response = self
-            .projects
-            .search_projects()
-            .send()
-            .await
-            .map_err(official_error)?;
-        Ok(response.projects.into_iter().map(project_status).collect())
+        let mut token = String::new();
+        let mut projects = Vec::new();
+        loop {
+            let response = self
+                .projects
+                .search_projects()
+                .set_page_token(&token)
+                .send()
+                .await
+                .map_err(official_error)?;
+            projects.extend(response.projects.into_iter().map(project_status));
+            token = response.next_page_token;
+            if token.is_empty() {
+                return Ok(projects);
+            }
+        }
     }
 
     async fn project(&self, project_id: &str) -> Result<ProjectStatus> {
@@ -186,6 +196,22 @@ impl GcpDiscovery for GoogleCloudClient {
                 .then_some(info.billing_account_name),
             billing_enabled: info.billing_enabled,
         })
+    }
+
+    async fn iam_permissions(
+        &self,
+        project_id: &str,
+        permissions: &[String],
+    ) -> Result<Vec<String>> {
+        let response = self
+            .projects
+            .test_iam_permissions()
+            .set_resource(format!("projects/{project_id}"))
+            .set_permissions(permissions.iter().cloned())
+            .send()
+            .await
+            .map_err(official_error)?;
+        Ok(response.permissions)
     }
 
     async fn service(&self, project_number: &str, service: &str) -> Result<ServiceStatus> {
@@ -216,17 +242,18 @@ impl GcpDiscovery for GoogleCloudClient {
     }
 
     async fn public_dns_zones(&self, project_id: &str) -> Result<Vec<DnsZone>> {
-        let response = self
-            .dns_zones
-            .list()
-            .set_project(project_id)
-            .send()
-            .await
-            .map_err(official_error)?;
-        Ok(response
-            .managed_zones
-            .into_iter()
-            .filter_map(|zone| {
+        let mut token = String::new();
+        let mut zones = Vec::new();
+        loop {
+            let response = self
+                .dns_zones
+                .list()
+                .set_project(project_id)
+                .set_page_token(&token)
+                .send()
+                .await
+                .map_err(official_error)?;
+            zones.extend(response.managed_zones.into_iter().filter_map(|zone| {
                 let visibility = zone
                     .visibility
                     .and_then(|value| value.name().map(str::to_ascii_lowercase))
@@ -237,8 +264,12 @@ impl GcpDiscovery for GoogleCloudClient {
                     visibility,
                     id: zone.id.unwrap_or_default().to_string(),
                 })
-            })
-            .collect())
+            }));
+            token = response.next_page_token.unwrap_or_default();
+            if token.is_empty() {
+                return Ok(zones);
+            }
+        }
     }
 
     async fn dns_record_set(
@@ -272,43 +303,61 @@ impl GcpDiscovery for GoogleCloudClient {
     }
 
     async fn prices(&self, billing_service: &str, region: &str) -> Result<Vec<SkuPrice>> {
-        let response = self
-            .catalog
-            .list_skus()
-            .set_parent(format!("services/{billing_service}"))
-            .set_currency_code("USD")
-            .send()
-            .await
-            .map_err(official_error)?;
-        Ok(response
-            .skus
-            .into_iter()
-            .filter(|sku| {
-                sku.service_regions.is_empty()
-                    || sku
-                        .service_regions
-                        .iter()
-                        .any(|value| value == region || value == "global")
-            })
-            .filter_map(|sku| {
-                let money = sku
-                    .pricing_info
-                    .first()?
-                    .pricing_expression
-                    .as_ref()?
-                    .tiered_rates
-                    .first()?
-                    .unit_price
-                    .as_ref()?;
-                Some(SkuPrice {
-                    sku_id: sku.sku_id,
-                    description: sku.description,
-                    service_regions: sku.service_regions,
-                    currency_code: money.currency_code.clone(),
-                    units: money.units,
-                    nanos: money.nanos,
-                })
-            })
-            .collect())
+        let mut token = String::new();
+        let mut prices = Vec::new();
+        loop {
+            let response = self
+                .catalog
+                .list_skus()
+                .set_parent(format!("services/{billing_service}"))
+                .set_currency_code("USD")
+                .set_page_token(&token)
+                .send()
+                .await
+                .map_err(official_error)?;
+            prices.extend(
+                response
+                    .skus
+                    .into_iter()
+                    .filter(|sku| {
+                        sku.service_regions.is_empty()
+                            || sku
+                                .service_regions
+                                .iter()
+                                .any(|value| value == region || value == "global")
+                    })
+                    .filter_map(|sku| {
+                        let expression = sku.pricing_info.first()?.pricing_expression.as_ref()?;
+                        let money = expression.tiered_rates.first()?.unit_price.as_ref()?;
+                        Some(SkuPrice {
+                            sku_id: sku.sku_id,
+                            description: sku.description,
+                            service_regions: sku.service_regions,
+                            currency_code: money.currency_code.clone(),
+                            usage_unit: expression.usage_unit.clone(),
+                            usage_unit_description: expression.usage_unit_description.clone(),
+                            base_unit: expression.base_unit.clone(),
+                            base_unit_conversion_factor: expression.base_unit_conversion_factor,
+                            display_quantity: expression.display_quantity,
+                            tiers: expression
+                                .tiered_rates
+                                .iter()
+                                .filter_map(|tier| {
+                                    let price = tier.unit_price.as_ref()?;
+                                    Some(PriceTier {
+                                        start_usage_amount: tier.start_usage_amount,
+                                        units: price.units,
+                                        nanos: price.nanos,
+                                    })
+                                })
+                                .collect(),
+                        })
+                    }),
+            );
+            token = response.next_page_token;
+            if token.is_empty() {
+                return Ok(prices);
+            }
+        }
     }
 }
