@@ -9,7 +9,8 @@
     "release",
     "source_repository",
     "source_revision",
-    "artifacts"
+    "artifacts",
+    "runtime_bundle"
   ],
   "properties": {
     "schema_version": {
@@ -29,15 +30,15 @@
     },
     "artifacts": {
       "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
+      "minItems": 7,
+      "maxItems": 7,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["component", "file", "sha256", "size_bytes", "target"],
         "properties": {
           "component": {
-            "enum": ["cli", "host-installer"]
+            "enum": ["cli", "host-installer", "runtime-bundle", "runtime-manifest"]
           },
           "file": {
             "type": "string",
@@ -59,6 +60,234 @@
               "aarch64-apple-darwin"
             ]
           }
+        }
+      }
+    },
+    "runtime_bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle_file",
+        "bundle_sha256",
+        "manifest_sha256",
+        "provenance",
+        "release_signing_public_key",
+        "signed_manifest_file"
+      ],
+      "properties": {
+        "bundle_file": {
+          "type": "string",
+          "pattern": "^dirextalk-runtime-bundle-v[0-9]+\\.[0-9]+\\.[0-9]+-linux-amd64\\.tar$"
+        },
+        "bundle_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "release_signing_public_key": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signed_manifest_file": {
+          "type": "string",
+          "pattern": "^dirextalk-runtime-manifest-v[0-9]+\\.[0-9]+\\.[0-9]+-linux-amd64\\.json$"
+        },
+        "provenance": {
+          "$ref": "#/$defs/runtimeProvenance"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sourceRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "runtimeProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "release",
+        "oauth_client_id_sha256",
+        "oauth_consent_audit_revision",
+        "oauth_scope_review_sha256",
+        "source_revision",
+        "runtime_assets",
+        "updater",
+        "message_server",
+        "agent",
+        "images"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "release": {
+          "$ref": "#/$defs/version"
+        },
+        "oauth_client_id_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "oauth_consent_audit_revision": {
+          "$ref": "#/$defs/sourceRevision"
+        },
+        "oauth_scope_review_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_revision": {
+          "$ref": "#/$defs/sourceRevision"
+        },
+        "runtime_assets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "compose_file",
+            "caddyfile",
+            "message_server_initializer",
+            "agent_secret_materializer",
+            "message_server_entrypoint",
+            "capability_ca_initializer",
+            "postgres_entrypoint",
+            "postgres_initializer",
+            "updater_unit"
+          ],
+          "properties": {
+            "compose_file": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "caddyfile": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "message_server_initializer": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "agent_secret_materializer": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "message_server_entrypoint": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "capability_ca_initializer": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "postgres_entrypoint": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "postgres_initializer": {
+              "$ref": "#/$defs/runtimeAsset"
+            },
+            "updater_unit": {
+              "$ref": "#/$defs/runtimeAsset"
+            }
+          }
+        },
+        "updater": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "source_revision",
+            "binary_url",
+            "binary_sha256"
+          ],
+          "properties": {
+            "version": {
+              "$ref": "#/$defs/version"
+            },
+            "source_revision": {
+              "$ref": "#/$defs/sourceRevision"
+            },
+            "binary_url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "binary_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "message_server": {
+          "$ref": "#/$defs/applicationImage"
+        },
+        "agent": {
+          "$ref": "#/$defs/applicationImage"
+        },
+        "images": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/imageReference"
+          }
+        }
+      }
+    },
+    "applicationImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "digest", "source_revision"],
+      "properties": {
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_revision": {
+          "$ref": "#/$defs/sourceRevision"
+        }
+      }
+    },
+    "runtimeAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "imageReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "repository", "tag", "digest", "source_revision"],
+      "properties": {
+        "role": {
+          "enum": ["postgres", "utility", "message_server", "agent", "caddy", "coturn"]
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": ["string", "null"]
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_revision": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sourceRevision"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     }

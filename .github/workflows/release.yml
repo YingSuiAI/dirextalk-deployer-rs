@@ -9,8 +9,61 @@ permissions:
   contents: read
 
 jobs:
+  release-contract:
+    name: Validate audited release inputs
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      SOURCE_REVISION: ${{ github.sha }}
+      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID }}
+      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256 }}
+      DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
+      DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
+      DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256 }}
+      DIREXTALK_UPDATER_VERSION: ${{ vars.DIREXTALK_UPDATER_VERSION }}
+      DIREXTALK_UPDATER_SOURCE_REVISION: ${{ vars.DIREXTALK_UPDATER_SOURCE_REVISION }}
+      DIREXTALK_UPDATER_BINARY_URL: ${{ vars.DIREXTALK_UPDATER_BINARY_URL }}
+      DIREXTALK_UPDATER_BINARY_SHA256: ${{ vars.DIREXTALK_UPDATER_BINARY_SHA256 }}
+      DIREXTALK_MESSAGE_SERVER_VERSION: ${{ vars.DIREXTALK_MESSAGE_SERVER_VERSION }}
+      DIREXTALK_MESSAGE_SERVER_DIGEST: ${{ vars.DIREXTALK_MESSAGE_SERVER_DIGEST }}
+      DIREXTALK_MESSAGE_SERVER_SOURCE_REVISION: ${{ vars.DIREXTALK_MESSAGE_SERVER_SOURCE_REVISION }}
+      DIREXTALK_AGENT_VERSION: ${{ vars.DIREXTALK_AGENT_VERSION }}
+      DIREXTALK_AGENT_DIGEST: ${{ vars.DIREXTALK_AGENT_DIGEST }}
+      DIREXTALK_AGENT_SOURCE_REVISION: ${{ vars.DIREXTALK_AGENT_SOURCE_REVISION }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${GITHUB_SHA}"
+          manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          test "${RELEASE_TAG}" = "v${manifest_version}"
+
+      - name: Require audited OAuth consent and scopes
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${DIREXTALK_GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]
+          client_hash="$(printf '%s' "${DIREXTALK_GOOGLE_OAUTH_CLIENT_ID}" | sha256sum | awk '{print $1}')"
+          test "${client_hash}" = "${DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256}"
+          scope_hash="$(printf '%s\n' \
+            installed-public-client loopback-redirect pkce-s256 openid email \
+            https://www.googleapis.com/auth/cloud-platform | sha256sum | awk '{print $1}')"
+          test "${scope_hash}" = "${DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256}"
+          test "${DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED}" = true
+
+      - name: Validate immutable runtime input pins
+        run: python3 packaging/prepare_runtime_inputs.py --validate-only
+
   build:
     name: Build ${{ matrix.label }}
+    needs: release-contract
     strategy:
       fail-fast: false
       matrix:
@@ -32,19 +85,20 @@ jobs:
             target: aarch64-apple-darwin
             archive: tar
     runs-on: ${{ matrix.os }}
+    env:
+      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - name: Validate stable tag
+      - name: Revalidate stable tag
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(git rev-list -n 1 "${tag}")" = "${GITHUB_SHA}"
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
 
       - name: Install pinned Rust toolchain and target
         shell: bash
@@ -52,7 +106,7 @@ jobs:
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
 
-      - name: Build CLI
+      - name: Build OAuth-configured CLI
         run: cargo build --locked --release -p deployer-cli --target ${{ matrix.target }}
 
       - name: Build Linux host installer
@@ -71,11 +125,8 @@ jobs:
           cp LICENSE README.md "${cli_dir}/"
           tar -C "${cli_dir}" -czf "${release_dir}/dirextalk-deployer-${GITHUB_REF_NAME}-${{ matrix.label }}.tar.gz" .
           if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-            host_dir="${RUNNER_TEMP}/dirextalk-host-installer"
-            mkdir -p "${host_dir}"
-            cp "target/${{ matrix.target }}/release/dirextalk-host-installer" "${host_dir}/"
-            cp LICENSE "${host_dir}/"
-            tar -C "${host_dir}" -czf "${release_dir}/dirextalk-host-installer-${GITHUB_REF_NAME}-linux-amd64.tar.gz" .
+            cp "target/${{ matrix.target }}/release/dirextalk-host-installer" \
+              "${release_dir}/dirextalk-host-installer-${GITHUB_REF_NAME}-linux-amd64"
           fi
 
       - name: Package Windows artifact
@@ -98,9 +149,119 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  runtime-bundle:
+    name: Build signed Linux runtime bundle
+    needs: release-contract
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      SOURCE_REVISION: ${{ github.sha }}
+      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256 }}
+      DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
+      DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
+      DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256 }}
+      DIREXTALK_UPDATER_VERSION: ${{ vars.DIREXTALK_UPDATER_VERSION }}
+      DIREXTALK_UPDATER_SOURCE_REVISION: ${{ vars.DIREXTALK_UPDATER_SOURCE_REVISION }}
+      DIREXTALK_UPDATER_BINARY_URL: ${{ vars.DIREXTALK_UPDATER_BINARY_URL }}
+      DIREXTALK_UPDATER_BINARY_SHA256: ${{ vars.DIREXTALK_UPDATER_BINARY_SHA256 }}
+      DIREXTALK_MESSAGE_SERVER_VERSION: ${{ vars.DIREXTALK_MESSAGE_SERVER_VERSION }}
+      DIREXTALK_MESSAGE_SERVER_DIGEST: ${{ vars.DIREXTALK_MESSAGE_SERVER_DIGEST }}
+      DIREXTALK_MESSAGE_SERVER_SOURCE_REVISION: ${{ vars.DIREXTALK_MESSAGE_SERVER_SOURCE_REVISION }}
+      DIREXTALK_AGENT_VERSION: ${{ vars.DIREXTALK_AGENT_VERSION }}
+      DIREXTALK_AGENT_DIGEST: ${{ vars.DIREXTALK_AGENT_DIGEST }}
+      DIREXTALK_AGENT_SOURCE_REVISION: ${{ vars.DIREXTALK_AGENT_SOURCE_REVISION }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Build canonical bundle builder
+        run: cargo build --locked --release -p deployer-host --bin dirextalk-bundle-builder
+
+      - name: Fetch exact updater and prepare signed inputs
+        run: |
+          python3 packaging/prepare_runtime_inputs.py \
+            --work-dir "${RUNNER_TEMP}/runtime-work" \
+            --release-dir "${RUNNER_TEMP}/release"
+
+      - name: Validate Compose image variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --file runtime/docker-compose.yml \
+            config --no-interpolate --format json \
+            > "${RUNNER_TEMP}/runtime-work/docker-compose.json"
+          python3 packaging/validate_runtime_compose.py \
+            "${RUNNER_TEMP}/runtime-work/docker-compose.json" \
+            "${RUNNER_TEMP}/runtime-work/bundle-request.json"
+
+      - name: Verify application image manifests exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect \
+            "docker.io/dirextalk/message-server:${DIREXTALK_MESSAGE_SERVER_VERSION}@sha256:${DIREXTALK_MESSAGE_SERVER_DIGEST}" \
+            >/dev/null
+          docker buildx imagetools inspect \
+            "docker.io/dirextalk/agent:${DIREXTALK_AGENT_VERSION}@sha256:${DIREXTALK_AGENT_DIGEST}" \
+            >/dev/null
+
+      - name: Materialize temporary Ed25519 signing seed
+        env:
+          DIREXTALK_RELEASE_ED25519_SEED_HEX: ${{ secrets.DIREXTALK_RELEASE_ED25519_SEED_HEX }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          value = os.environ.get("DIREXTALK_RELEASE_ED25519_SEED_HEX", "")
+          if not re.fullmatch(r"[0-9a-f]{64}", value):
+              raise SystemExit("DIREXTALK_RELEASE_ED25519_SEED_HEX must be a raw 32-byte seed encoded as lowercase hex")
+          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "dirextalk-release-signing.seed"
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          try:
+              os.write(descriptor, bytes.fromhex(value))
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          PY
+
+      - name: Build and verify signed canonical runtime bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIREXTALK_BUNDLE_SIGNING_SEED_FILE="${RUNNER_TEMP}/dirextalk-release-signing.seed" \
+            target/release/dirextalk-bundle-builder \
+              --request "${RUNNER_TEMP}/runtime-work/bundle-request.json" \
+              > "${RUNNER_TEMP}/release/_runtime-build.json"
+          bundle="${RUNNER_TEMP}/release/dirextalk-runtime-bundle-${RELEASE_TAG}-linux-amd64.tar"
+          signed_manifest="${RUNNER_TEMP}/release/dirextalk-runtime-manifest-${RELEASE_TAG}-linux-amd64.json"
+          tar --extract --to-stdout --file "${bundle}" manifest.json > "${signed_manifest}"
+          python3 packaging/verify_runtime_bundle_output.py \
+            "${RUNNER_TEMP}/release" \
+            "${RUNNER_TEMP}/release/_runtime-build.json"
+
+      - name: Delete temporary signing material
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          (pathlib.Path(os.environ["RUNNER_TEMP"]) / "dirextalk-release-signing.seed").unlink(missing_ok=True)
+          PY
+
+      - name: Upload signed runtime artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-runtime-bundle
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish immutable release
-    needs: build
+    needs: [build, runtime-bundle]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -117,15 +278,12 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Validate artifacts and create checksums and manifest
+      - name: Create checksums and source-bound manifest
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           SOURCE_REVISION: ${{ github.sha }}
           SOURCE_REPOSITORY: ${{ github.repository }}
-        run: |
-          manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
-          test "${RELEASE_TAG}" = "v${manifest_version}"
-          python3 packaging/create_release_manifest.py release-assets
+        run: python3 packaging/create_release_manifest.py release-assets
 
       - name: Publish GitHub release
         env:
@@ -135,11 +293,13 @@ jobs:
           set -euo pipefail
           [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
+          test ! -e release-assets/_runtime-build.json
+          test ! -e release-assets/_runtime-provenance.json
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             echo "release ${GITHUB_REF_NAME} already exists; refusing to mutate it" >&2
             exit 1
           fi
-          printf 'Source revision: %s\n\nVerify every archive with SHA256SUMS and release-manifest.json before use.\n' "${GITHUB_SHA}" > release-notes.md
+          printf 'Source revision: %s\n\nVerify every asset with SHA256SUMS and release-manifest.json before use. The runtime manifest is canonical and Ed25519-signed.\n' "${GITHUB_SHA}" > release-notes.md
           gh release create "${GITHUB_REF_NAME}" release-assets/* \
             --verify-tag \
             --title "Dirextalk Deployer ${GITHUB_REF_NAME}" \

@@ -1,0 +1,372 @@
+name: dirextalk-p2p
+
+# This signed template is configured by the deployer after host staging. Every
+# image value is populated from the signed runtime manifest; no mutable image
+# fallback or local build is allowed.
+
+x-hardened-service: &hardened-service
+  read_only: true
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,mode=1777
+
+x-agent-service: &agent-service
+  <<: *hardened-service
+  image: ${AGENT_IMAGE:?set AGENT_IMAGE from the signed runtime manifest}
+  user: "65532:65532"
+  volumes:
+    - agent_config_material:/etc/dirextalk-agent:ro
+    - agent_secret_material:/run/secrets:ro
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE from the signed runtime manifest}
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "FOWNER", "DAC_OVERRIDE", "SETUID", "SETGID"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+      - /run/postgresql:rw,noexec,nosuid,nodev,mode=2775
+      - /run/dirextalk-postgres-secrets:rw,noexec,nosuid,nodev,mode=0700,uid=0,gid=0
+    entrypoint: ["/usr/local/bin/dirextalk-postgres-entrypoint"]
+    command: ["postgres"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: dirextalk_cluster_admin
+      POSTGRES_PASSWORD_FILE: /run/dirextalk-postgres-secrets/postgres_admin_password
+      POSTGRES_INIT_SECRET_DIR: /run/dirextalk-postgres-secrets
+    secrets:
+      - source: postgres_admin_password
+        target: postgres_admin_password
+      - source: message_postgres_password
+        target: message_postgres_password
+      - source: agent_postgres_password
+        target: agent_postgres_password
+    configs:
+      - source: postgres_entrypoint
+        target: /usr/local/bin/dirextalk-postgres-entrypoint
+        mode: 0555
+      - source: postgres_initializer
+        target: /docker-entrypoint-initdb.d/10-dirextalk-databases.sh
+        mode: 0555
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      message_database:
+        aliases: [message-postgres]
+      agent_database:
+        aliases: [agent-postgres]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  coturn:
+    image: ${COTURN_IMAGE:?set COTURN_IMAGE from the signed runtime manifest}
+    user: "0:0"
+    command: ["-c", "/run/secrets/turnserver.conf"]
+    network_mode: host
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH", "NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700
+    secrets:
+      - source: coturn_config
+        target: /run/secrets/turnserver.conf
+        mode: 0400
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "grep -Fqx 'listening-port=3478' /run/secrets/turnserver.conf && kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  message-init:
+    image: ${MESSAGE_SERVER_IMAGE:?set MESSAGE_SERVER_IMAGE from the signed runtime manifest}
+    entrypoint: ["/usr/local/bin/initialize-message-server"]
+    environment:
+      MESSAGE_SERVER_NAME: ${DOMAIN:?set DOMAIN to the reviewed public domain}
+      MESSAGE_CLIENT_BASE_URL: https://${DOMAIN:?set DOMAIN to the reviewed public domain}
+      MESSAGE_SERVER_TLS_MODE: edge-terminated
+      MESSAGE_DEPLOYMENT_MODE: production
+      MESSAGE_LOCAL_BOOTSTRAP_ENABLED: "false"
+    secrets:
+      - source: message_registration_shared_secret
+        target: /run/secrets/message_registration_shared_secret
+        mode: 0400
+      - source: turn_shared_secret
+        target: /run/secrets/turn_shared_secret
+        mode: 0400
+    configs:
+      - source: message_server_initializer
+        target: /usr/local/bin/initialize-message-server
+        mode: 0555
+      - source: capability_ca_initializer
+        target: /usr/local/bin/initialize-capability-ca
+        mode: 0555
+    volumes:
+      - message_server_config:/etc/dirextalk-message-server
+      - message_server_data:/var/dirextalk-message-server
+      - capability_authority_material:/var/lib/dirextalk-message-server/capability-authority
+      - capability_shared_material:/var/lib/dirextalk-message-server/capability
+      - capability_private_material:/var/lib/dirextalk-message-server/capability-private
+    networks: [message_private, message_database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  message-server:
+    image: ${MESSAGE_SERVER_IMAGE:?set MESSAGE_SERVER_IMAGE from the signed runtime manifest}
+    <<: *hardened-service
+    init: true
+    cap_add: ["DAC_READ_SEARCH"]
+    entrypoint: ["/usr/local/bin/message-server-entrypoint"]
+    command: ["--http-bind-address", ":8008"]
+    environment:
+      MESSAGE_SERVER_TLS_MODE: edge-terminated
+      P2P_PORTAL_CREDENTIALS_FILE: /var/dirextalk-message-server/p2p/bootstrap.json
+      P2P_PORTAL_PASSWORD_FILE: /run/secrets/message_portal_password
+      P2P_MESSAGE_SERVER_INSTANCE_ID: ${MESSAGE_SERVER_INSTANCE_ID:?set immutable Message Server instance id}
+      P2P_AGENT_INSTANCE_ID: ${AGENT_INSTANCE_ID:?set immutable Agent instance id}
+      P2P_ACCOUNT_GENERATION: ${ACCOUNT_GENERATION:?set fresh account generation}
+      P2P_PLUGIN_DOCKER_ENABLED: "false"
+      P2P_PLUGIN_BACKEND_BASE_URL: http://message-server:8008
+      P2P_AGENT_VERSION_URL: http://agent:8082/agent/v1/health
+      P2P_AGENT_VOICE_CALLBACK_URL: https://agent:8444
+      P2P_AGENT_VOICE_CALLBACK_AUTH_TOKEN_FILE: /run/capability/agent-voice-relay.token
+      P2P_AGENT_VOICE_CALLBACK_CA_FILE: /run/capability/ca-cert.pem
+      P2P_AGENT_VOICE_CALLBACK_CLIENT_CERT_FILE: /run/capability/ms-client-cert.pem
+      P2P_AGENT_VOICE_CALLBACK_CLIENT_KEY_FILE: /run/capability/ms-client-key.pem
+      P2P_AGENT_VOICE_CALLBACK_SERVER_NAME: dirextalk-agent
+      P2P_CAPABILITY_GRANT_PRIVATE_KEY_FILE: /run/capability-private/grant-private.key
+      P2P_CAPABILITY_GRANT_PUBLIC_KEY_FILE: /run/capability/grant-public.key
+      P2P_PRODUCT_CAPABILITY_LISTEN_ADDR: :50053
+      P2P_REQUIRE_PRODUCT_CAPABILITY: "true"
+      P2P_PRODUCT_CAPABILITY_CA_FILE: /run/capability/ca-cert.pem
+      P2P_PRODUCT_CAPABILITY_SERVER_CERT_FILE: /run/capability/ms-server-cert.pem
+      P2P_PRODUCT_CAPABILITY_SERVER_KEY_FILE: /run/capability/ms-server-key.pem
+      P2P_PRODUCT_CAPABILITY_TOKEN_FILE: /run/capability/agent-to-ms.token
+      P2P_PRODUCT_CAPABILITY_PEER_COMMON_NAME: agent-client
+      DIREXTALK_RELEASE_CATALOG_ORIGIN: ${RELEASE_CATALOG_ORIGIN:?set audited HTTPS release catalog origin}
+    secrets:
+      - source: message_database_url
+        target: /run/secrets/message_database_url
+        mode: 0400
+      - source: message_portal_password
+        target: /run/secrets/message_portal_password
+        mode: 0400
+    configs:
+      - source: message_server_entrypoint
+        target: /usr/local/bin/message-server-entrypoint
+        mode: 0555
+    volumes:
+      - message_server_config:/etc/dirextalk-message-server:ro
+      - message_server_data:/var/dirextalk-message-server
+      - capability_shared_material:/run/capability:ro
+      - capability_private_material:/run/capability-private:ro
+      - type: bind
+        source: /run/dirextalk-updater
+        target: /run/dirextalk-updater
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /etc/dirextalk-updater/control-token
+        target: /etc/dirextalk-updater/control-token
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [message_private, message_database, application, public]
+    depends_on:
+      coturn:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      message-init:
+        condition: service_completed_successfully
+    expose: ["8008", "50053"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-Y", "off", "-q", "-O", "-", "http://127.0.0.1:8008/_p2p/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  agent-secret-init:
+    image: ${UTILITY_IMAGE:?set UTILITY_IMAGE from the signed runtime manifest}
+    entrypoint: ["/usr/local/bin/materialize-agent-secrets"]
+    user: "0:0"
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "FOWNER", "DAC_READ_SEARCH", "DAC_OVERRIDE"]
+    security_opt: ["no-new-privileges:true"]
+    secrets:
+      - source: agent_database_url
+        target: database_url
+        mode: 0400
+      - source: core_secret_master_key
+        target: core_secret_master_key
+        mode: 0400
+      - source: message_mcp_token
+        target: message_mcp_token
+        mode: 0400
+    configs:
+      - source: agent_secret_materializer
+        target: /usr/local/bin/materialize-agent-secrets
+        mode: 0555
+    volumes:
+      - type: bind
+        source: ./agent-config.yaml
+        target: /bootstrap/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - agent_secret_material:/out
+      - agent_config_material:/out-config
+      - agent_knowledge_content:/out-data/knowledge-content
+      - agent_knowledge_mount:/out-data/knowledge-mount
+      - capability_shared_material:/bootstrap/capability:ro
+    networks: [agent_private]
+    depends_on:
+      message-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  agent-migrate:
+    <<: *agent-service
+    command: ["migrate"]
+    networks: [agent_private, agent_database]
+    depends_on:
+      agent-secret-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  agent:
+    <<: *agent-service
+    command: ["serve"]
+    environment:
+      AGENT_HEALTHCHECK_SERVER_NAME: dirextalk-agent
+    volumes:
+      - agent_config_material:/etc/dirextalk-agent:ro
+      - agent_secret_material:/run/secrets:ro
+      - agent_knowledge_content:/var/lib/dirextalk-agent/knowledge-content
+      - agent_knowledge_mount:/var/lib/dirextalk-agent/knowledge-mount:ro
+      - agent_core_data:/var/lib/dirextalk-agent/core-data
+    networks: [agent_private, agent_database, application, egress]
+    depends_on:
+      agent-migrate:
+        condition: service_completed_successfully
+      message-server:
+        condition: service_healthy
+    expose: ["8082", "8444", "9443"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/dirextalk-agent", "healthcheck", "--expect-instance-id", "${AGENT_INSTANCE_ID:?set immutable Agent instance id}"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  caddy:
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE from the signed runtime manifest}
+    <<: *hardened-service
+    cap_add: ["NET_BIND_SERVICE"]
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the reviewed public domain}
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+        mode: 0444
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+      - type: bind
+        source: /run/dirextalk-updater
+        target: /run/dirextalk-updater
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [public, application]
+    ports: ["80:80", "443:443"]
+    restart: unless-stopped
+
+networks:
+  message_private:
+    internal: true
+  message_database:
+    internal: true
+  agent_private:
+    internal: true
+  agent_database:
+    internal: true
+  application:
+    internal: true
+  public:
+  egress:
+
+volumes:
+  postgres_data:
+  message_server_config:
+  message_server_data:
+  capability_authority_material:
+  capability_shared_material:
+  capability_private_material:
+  agent_secret_material:
+  agent_config_material:
+  agent_knowledge_content:
+  agent_knowledge_mount:
+  agent_core_data:
+  caddy_data:
+  caddy_config:
+
+configs:
+  message_server_initializer:
+    file: ./runtime/initialize-message-server.sh
+  agent_secret_materializer:
+    file: ./runtime/materialize-agent-secrets.sh
+  message_server_entrypoint:
+    file: ./runtime/message-server-entrypoint.sh
+  capability_ca_initializer:
+    file: ./runtime/initialize-capability-ca.sh
+  postgres_entrypoint:
+    file: ./runtime/postgres-entrypoint.sh
+  postgres_initializer:
+    file: ./runtime/initialize-postgres.sh
+  caddyfile:
+    file: ./runtime/Caddyfile
+
+secrets:
+  coturn_config:
+    file: ./secrets/turnserver.conf
+  turn_shared_secret:
+    file: ./secrets/turn_shared_secret
+  postgres_admin_password:
+    file: ./secrets/postgres_admin_password
+  message_postgres_password:
+    file: ./secrets/message_postgres_password
+  agent_postgres_password:
+    file: ./secrets/agent_postgres_password
+  message_database_url:
+    file: ./secrets/message_database_url
+  message_registration_shared_secret:
+    file: ./secrets/message_registration_shared_secret
+  message_portal_password:
+    file: ./secrets/message_portal_password
+  agent_database_url:
+    file: ./secrets/agent_database_url
+  core_secret_master_key:
+    file: ./secrets/core_secret_master_key
+  message_mcp_token:
+    file: ./secrets/message_mcp_token

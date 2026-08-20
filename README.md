@@ -30,6 +30,12 @@ arm64 from the GitHub release. Download `SHA256SUMS` and
 confirm that the manifest names the expected release tag and source revision
 before placing `dirextalk-deployer` on `PATH`.
 
+Each release also contains the bare Linux amd64 host installer, deterministic
+runtime bundle, and canonical Ed25519-signed runtime manifest. The outer release
+manifest binds their SHA-256 values, signing public key, application/updater
+source revisions, and audited OAuth configuration hash. Do not use a release
+with a missing or mismatched trust-chain field.
+
 Stable release publication accepts only an exact `vX.Y.Z` tag. Release assets
 are documented in [`packaging/README.md`](packaging/README.md).
 
