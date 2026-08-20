@@ -73,10 +73,12 @@ dirextalk-deployer auth status
 dirextalk-deployer project inspect --project <project-id>
 ```
 
-`auth login` opens Google's authorization page in the default browser. Complete
-Google authentication only in that browser. Do not paste authorization codes
-or tokens into chat, configuration, shell arguments, or issue reports. Tokens
-are kept in the operating-system credential facility, not deployment state.
+`auth login` prints a clickable Google authorization URL and then tries to open
+it in the default browser. If the browser does not appear, open the printed URL
+manually while the CLI is still waiting. Complete Google authentication only in
+that browser. Do not paste authorization codes or tokens into chat,
+configuration, shell arguments, or issue reports. Tokens are kept in the
+operating-system credential facility, not deployment state.
 The product-owned OAuth client ID is compiled into the release; end users
 supply neither an OAuth client ID nor a client secret. Authorization requests
 only `openid` and Google Cloud access—never email, name, or profile scopes. The

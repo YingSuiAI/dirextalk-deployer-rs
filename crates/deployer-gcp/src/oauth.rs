@@ -183,7 +183,13 @@ impl GoogleInstalledApp {
             address.port()
         ))?;
         let request = self.login_request(redirect_uri);
-        self.browser.open(&request.authorization_url)?;
+        eprintln!(
+            "Open this Google authorization URL if the browser did not open automatically:\n{}",
+            request.authorization_url
+        );
+        if let Err(error) = self.browser.open(&request.authorization_url) {
+            eprintln!("The system browser could not be opened ({error}); use the URL above.");
+        }
 
         let timeout = self.config.callback_timeout;
         let raw_callback =
