@@ -34,8 +34,15 @@ impl RationalQuantity {
 }
 
 /// One normalized GCP SKU/tier line. `unit_price_nanos` is USD nanos per
-/// pricing unit; the exact calculation inputs and resulting micro-USD subtotal
-/// are both approval-bound.
+/// `usage_unit`, and `usage_quantity` is the chargeable quantity in that same
+/// unit. `tier_start_base_units` is the source tier threshold converted
+/// exactly to an integer number of `base_unit`s.
+///
+/// GCP's base-unit conversion is approval-bound provenance and is used by the
+/// quote producer to normalize the tier threshold; it does not enter the cost
+/// formula because both price and quantity use `usage_unit`. GCP's
+/// `display_quantity` is deliberately absent because the API defines it as
+/// display-only and says that it does not affect the pricing formula.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PricingLine {
@@ -60,7 +67,42 @@ impl PricingLine {
             return Err(CoreError::InvalidPlan("pricing line is incomplete"));
         }
         self.base_unit_conversion.validate()?;
-        self.usage_quantity.validate()
+        self.usage_quantity.validate()?;
+        if self.conservative_subtotal_microusd()? != self.subtotal_microusd {
+            return Err(CoreError::InvalidPlan(
+                "pricing line subtotal is not derived from price and usage",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Computes the line subtotal with exact integer arithmetic, conservatively
+    /// rounded up to the next micro-USD:
+    ///
+    /// `ceil(unit_price_nanos * usage_numerator / (1000 * usage_denominator))`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidPlan`] when the price or quantity is invalid
+    /// or the rounded subtotal does not fit in `u64` micro-USD.
+    pub fn conservative_subtotal_microusd(&self) -> Result<u64> {
+        if self.unit_price_nanos == 0 {
+            return Err(CoreError::InvalidPlan("pricing line price is invalid"));
+        }
+        self.usage_quantity.validate()?;
+        let numerator = u128::from(self.unit_price_nanos)
+            .checked_mul(u128::from(self.usage_quantity.numerator))
+            .ok_or(CoreError::InvalidPlan("pricing subtotal overflow"))?;
+        let denominator = u128::from(self.usage_quantity.denominator)
+            .checked_mul(1_000)
+            .ok_or(CoreError::InvalidPlan("pricing subtotal overflow"))?;
+        let quotient = numerator / denominator;
+        let rounded_up = quotient
+            .checked_add(u128::from(numerator % denominator != 0))
+            .ok_or(CoreError::InvalidPlan("pricing subtotal overflow"))?;
+        rounded_up
+            .try_into()
+            .map_err(|_| CoreError::InvalidPlan("pricing subtotal overflow"))
     }
 }
 
@@ -92,23 +134,21 @@ impl PricingQuote {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::InvalidPlan`] for malformed lines, repeated
-    /// SKU/tier units, arithmetic overflow, sum mismatch, or budget excess.
+    /// Returns [`CoreError::InvalidPlan`] for malformed or underquoted lines,
+    /// unsupported multi-tier SKUs, arithmetic overflow, sum mismatch, or
+    /// budget excess.
     pub fn validate(&self, maximum_monthly_microusd: u64) -> Result<()> {
         if self.lines.is_empty() || self.total_microusd == 0 {
             return Err(CoreError::InvalidPlan("pricing quote is empty"));
         }
-        let mut keys = BTreeSet::new();
+        let mut skus = BTreeSet::new();
         let mut total = 0_u64;
         for line in &self.lines {
             line.validate()?;
-            if !keys.insert((
-                line.sku_id.as_str(),
-                line.tier_start_base_units,
-                line.usage_unit.as_str(),
-                line.base_unit.as_str(),
-            )) {
-                return Err(CoreError::InvalidPlan("pricing SKU tier is repeated"));
+            if !skus.insert(line.sku_id.as_str()) {
+                return Err(CoreError::InvalidPlan(
+                    "pricing SKU has an unsupported multi-tier shape",
+                ));
             }
             total = total
                 .checked_add(line.subtotal_microusd)
@@ -184,7 +224,68 @@ mod tests {
     }
 
     #[test]
-    fn quote_rejects_budget_excess_and_repeated_sku_tiers() {
+    fn quote_rejects_underquoted_line_subtotal() {
+        let mut underquoted = line("SKU-VM", 7_299_999);
+        assert_eq!(
+            underquoted.conservative_subtotal_microusd().unwrap(),
+            7_300_000
+        );
+        let quote = PricingQuote {
+            currency: PricingCurrency::Usd,
+            lines: BTreeSet::from([underquoted.clone()]),
+            unpriced_exclusions: BTreeSet::new(),
+            total_microusd: underquoted.subtotal_microusd,
+        };
+        assert!(matches!(
+            quote.validate(8_000_000),
+            Err(CoreError::InvalidPlan(
+                "pricing line subtotal is not derived from price and usage"
+            ))
+        ));
+
+        underquoted.subtotal_microusd = 7_300_001;
+        assert!(matches!(
+            underquoted.validate(),
+            Err(CoreError::InvalidPlan(
+                "pricing line subtotal is not derived from price and usage"
+            ))
+        ));
+    }
+
+    #[test]
+    fn subtotal_rounds_fractional_microusd_up() {
+        let fractional = PricingLine {
+            usage_quantity: RationalQuantity {
+                numerator: 1,
+                denominator: 3,
+            },
+            unit_price_nanos: 1,
+            subtotal_microusd: 1,
+            ..line("SKU-FRACTIONAL", 1)
+        };
+        assert_eq!(fractional.conservative_subtotal_microusd().unwrap(), 1);
+        assert!(fractional.validate().is_ok());
+    }
+
+    #[test]
+    fn subtotal_rejects_values_that_do_not_fit_microusd() {
+        let overflow = PricingLine {
+            usage_quantity: RationalQuantity {
+                numerator: u64::MAX,
+                denominator: 1,
+            },
+            unit_price_nanos: u64::MAX,
+            subtotal_microusd: u64::MAX,
+            ..line("SKU-OVERFLOW", u64::MAX)
+        };
+        assert!(matches!(
+            overflow.conservative_subtotal_microusd(),
+            Err(CoreError::InvalidPlan("pricing subtotal overflow"))
+        ));
+    }
+
+    #[test]
+    fn quote_rejects_budget_excess_and_unsupported_multi_tiers() {
         let mut quote = PricingQuote {
             currency: PricingCurrency::Usd,
             lines: BTreeSet::from([line("SKU-VM", 7_300_000)]),
@@ -199,12 +300,49 @@ mod tests {
         ));
 
         let mut repeated = line("SKU-VM", 700_000);
-        repeated.unit_price_nanos += 1;
+        repeated.tier_start_base_units = 3_600;
+        repeated.usage_quantity = RationalQuantity {
+            numerator: 70,
+            denominator: 1,
+        };
         quote.lines.insert(repeated);
         quote.total_microusd = 8_000_000;
         assert!(matches!(
             quote.validate(8_000_000),
-            Err(CoreError::InvalidPlan("pricing SKU tier is repeated"))
+            Err(CoreError::InvalidPlan(
+                "pricing SKU has an unsupported multi-tier shape"
+            ))
+        ));
+    }
+
+    #[test]
+    fn one_exactly_normalized_nonzero_tier_is_supported() {
+        let mut priced_after_free_allowance = line("SKU-TIERED", 7_300_000);
+        priced_after_free_allowance.tier_start_base_units = 36_000;
+        priced_after_free_allowance.base_unit_conversion = RationalQuantity {
+            numerator: 3_600,
+            denominator: 1,
+        };
+        let quote = PricingQuote {
+            currency: PricingCurrency::Usd,
+            lines: BTreeSet::from([priced_after_free_allowance]),
+            unpriced_exclusions: BTreeSet::new(),
+            total_microusd: 7_300_000,
+        };
+        assert!(quote.validate(8_000_000).is_ok());
+
+        let mut noncanonical = quote;
+        let mut line = noncanonical.lines.pop_first().unwrap();
+        line.base_unit_conversion = RationalQuantity {
+            numerator: 7_200,
+            denominator: 2,
+        };
+        noncanonical.lines.insert(line);
+        assert!(matches!(
+            noncanonical.validate(8_000_000),
+            Err(CoreError::InvalidPlan(
+                "pricing quantity is not a positive reduced rational"
+            ))
         ));
     }
 

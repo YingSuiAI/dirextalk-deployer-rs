@@ -742,11 +742,11 @@ release = "stable"
                     numerator: 730,
                     denominator: 1,
                 },
-                unit_price_nanos: 136_986_301,
-                subtotal_microusd: 100_000_000,
+                unit_price_nanos: 136_986_370,
+                subtotal_microusd: 100_000_051,
             }]),
             unpriced_exclusions: BTreeSet::from([UnpricedExclusion::NetworkEgress]),
-            total_microusd: 100_000_000,
+            total_microusd: 100_000_051,
         }
     }
 
@@ -982,8 +982,8 @@ release = "stable"
             }),
             mutate_line(|line| {
                 line.usage_quantity = RationalQuantity {
-                    numerator: 731,
-                    denominator: 1,
+                    numerator: 730_000_001,
+                    denominator: 1_000_000,
                 };
             }),
             mutate_line(|line| line.unit_price_nanos += 1),
