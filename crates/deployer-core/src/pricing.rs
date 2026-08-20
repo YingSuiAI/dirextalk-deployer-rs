@@ -36,7 +36,8 @@ impl RationalQuantity {
 /// One normalized GCP SKU/tier line. `unit_price_nanos` is USD nanos per
 /// `usage_unit`, and `usage_quantity` is the chargeable quantity in that same
 /// unit. `tier_start_base_units` is the source tier threshold converted
-/// exactly to an integer number of `base_unit`s.
+/// exactly to an integer number of `base_unit`s, or zero for a normalized
+/// implicit free range before a source expression's first nonzero threshold.
 ///
 /// GCP's base-unit conversion is approval-bound provenance and is used by the
 /// quote producer to normalize the tier threshold; it does not enter the cost
@@ -61,8 +62,6 @@ impl PricingLine {
         if !safe_pricing_token(&self.sku_id)
             || !safe_pricing_token(&self.usage_unit)
             || !safe_pricing_token(&self.base_unit)
-            || self.unit_price_nanos == 0
-            || self.subtotal_microusd == 0
         {
             return Err(CoreError::InvalidPlan("pricing line is incomplete"));
         }
@@ -83,12 +82,10 @@ impl PricingLine {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::InvalidPlan`] when the price or quantity is invalid
-    /// or the rounded subtotal does not fit in `u64` micro-USD.
+    /// Returns [`CoreError::InvalidPlan`] when the quantity is invalid or the
+    /// rounded subtotal does not fit in `u64` micro-USD. A zero price is a
+    /// valid explicit free tier and produces a zero subtotal.
     pub fn conservative_subtotal_microusd(&self) -> Result<u64> {
-        if self.unit_price_nanos == 0 {
-            return Err(CoreError::InvalidPlan("pricing line price is invalid"));
-        }
         self.usage_quantity.validate()?;
         let numerator = u128::from(self.unit_price_nanos)
             .checked_mul(u128::from(self.usage_quantity.numerator))
@@ -135,19 +132,19 @@ impl PricingQuote {
     /// # Errors
     ///
     /// Returns [`CoreError::InvalidPlan`] for malformed or underquoted lines,
-    /// unsupported multi-tier SKUs, arithmetic overflow, sum mismatch, or
+    /// conflicting SKU tier identities, arithmetic overflow, sum mismatch, or
     /// budget excess.
     pub fn validate(&self, maximum_monthly_microusd: u64) -> Result<()> {
         if self.lines.is_empty() || self.total_microusd == 0 {
             return Err(CoreError::InvalidPlan("pricing quote is empty"));
         }
-        let mut skus = BTreeSet::new();
+        let mut sku_tiers = BTreeSet::new();
         let mut total = 0_u64;
         for line in &self.lines {
             line.validate()?;
-            if !skus.insert(line.sku_id.as_str()) {
+            if !sku_tiers.insert((line.sku_id.as_str(), line.tier_start_base_units)) {
                 return Err(CoreError::InvalidPlan(
-                    "pricing SKU has an unsupported multi-tier shape",
+                    "pricing quote repeats a SKU tier identity",
                 ));
             }
             total = total
@@ -285,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_rejects_budget_excess_and_unsupported_multi_tiers() {
+    fn quote_rejects_budget_excess_and_conflicting_tier_identities() {
         let mut quote = PricingQuote {
             currency: PricingCurrency::Usd,
             lines: BTreeSet::from([line("SKU-VM", 7_300_000)]),
@@ -300,7 +297,6 @@ mod tests {
         ));
 
         let mut repeated = line("SKU-VM", 700_000);
-        repeated.tier_start_base_units = 3_600;
         repeated.usage_quantity = RationalQuantity {
             numerator: 70,
             denominator: 1,
@@ -310,9 +306,26 @@ mod tests {
         assert!(matches!(
             quote.validate(8_000_000),
             Err(CoreError::InvalidPlan(
-                "pricing SKU has an unsupported multi-tier shape"
+                "pricing quote repeats a SKU tier identity"
             ))
         ));
+    }
+
+    #[test]
+    fn explicit_free_tier_is_valid_and_binds_zero_subtotal() {
+        let mut free = line("SKU-FREE", 0);
+        free.unit_price_nanos = 0;
+        assert_eq!(free.conservative_subtotal_microusd().unwrap(), 0);
+        assert!(free.validate().is_ok());
+
+        let paid = line("SKU-PAID", 7_300_000);
+        let quote = PricingQuote {
+            currency: PricingCurrency::Usd,
+            lines: BTreeSet::from([free, paid]),
+            unpriced_exclusions: BTreeSet::new(),
+            total_microusd: 7_300_000,
+        };
+        assert!(quote.validate(8_000_000).is_ok());
     }
 
     #[test]

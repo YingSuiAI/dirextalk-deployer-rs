@@ -1785,14 +1785,15 @@ fn pricing_quote(
     let mut lines = BTreeSet::new();
     let mut total = 0_u64;
     for (price, usage_quantity) in quantities {
-        let line = pricing_line(price, usage_quantity)?;
-        total = total
-            .checked_add(line.subtotal_microusd)
-            .ok_or_else(|| EngineError::Backend("pricing total overflowed".into()))?;
-        if !lines.insert(line) {
-            return Err(EngineError::Backend(
-                "pricing quote repeats a SKU expression".into(),
-            ));
+        for line in pricing_lines(price, usage_quantity)? {
+            total = total
+                .checked_add(line.subtotal_microusd)
+                .ok_or_else(|| EngineError::Backend("pricing total overflowed".into()))?;
+            if !lines.insert(line) {
+                return Err(EngineError::Backend(
+                    "pricing quote repeats a SKU tier expression".into(),
+                ));
+            }
         }
     }
     Ok(PricingQuote {
@@ -1847,18 +1848,105 @@ fn select_price_any<'a>(
         .ok_or_else(|| EngineError::Backend(format!("{name} price is unavailable")))
 }
 
-fn pricing_line(
+fn pricing_lines(
     price: &deployer_gcp::SkuPrice,
     usage_quantity: RationalQuantity,
-) -> Result<PricingLine> {
-    let [tier] = price.tiers.as_slice() else {
+) -> Result<Vec<PricingLine>> {
+    if usage_quantity.numerator == 0
+        || usage_quantity.denominator == 0
+        || greatest_common_divisor(usage_quantity.numerator, usage_quantity.denominator) != 1
+    {
         return Err(EngineError::Backend(
-            "multi-rate GCP pricing expressions are unsupported".into(),
+            "GCP pricing quantity is not a positive reduced rational".into(),
         ));
+    }
+    if price.tiers.is_empty() {
+        return Err(unsupported_tier_shape(price, "the tier list is empty"));
+    }
+    let base_unit_conversion =
+        exact_positive_f64(price.base_unit_conversion_factor).map_err(|_| {
+            EngineError::Backend(format!(
+                "GCP pricing SKU {} has an invalid base-unit conversion",
+                safe_sku_id(&price.sku_id)
+            ))
+        })?;
+    let mut normalized = Vec::with_capacity(price.tiers.len());
+    for tier in &price.tiers {
+        let start = exact_nonnegative_f64(tier.start_usage_amount)
+            .map_err(|_| unsupported_tier_shape(price, "a tier boundary is invalid"))?;
+        let start_base_units = multiply_to_integer(start, base_unit_conversion).map_err(|_| {
+            unsupported_tier_shape(price, "a tier boundary is not an exact base-unit integer")
+        })?;
+        let unit_price_nanos = tier_price_nanos(tier)
+            .ok_or_else(|| unsupported_tier_shape(price, "a Money value is invalid"))?;
+        normalized.push((start, start_base_units, unit_price_nanos));
+    }
+    if normalized
+        .windows(2)
+        .any(|tiers| rational_cmp(tiers[0].0, tiers[1].0) != std::cmp::Ordering::Less)
+    {
+        return Err(unsupported_tier_shape(
+            price,
+            "tier boundaries are not strictly increasing",
+        ));
+    }
+
+    let mut lines = Vec::new();
+    let zero = RationalQuantity {
+        numerator: 0,
+        denominator: 1,
     };
-    let base_unit_conversion = exact_positive_f64(price.base_unit_conversion_factor)?;
-    let tier_start = exact_nonnegative_f64(tier.start_usage_amount)?;
-    let tier_start_base_units = multiply_to_integer(tier_start, base_unit_conversion)?;
+    if normalized[0].0.numerator != 0 {
+        let free_end = if rational_cmp(normalized[0].0, usage_quantity) == std::cmp::Ordering::Less
+        {
+            normalized[0].0
+        } else {
+            usage_quantity
+        };
+        lines.push(pricing_line_for_tier(
+            price,
+            base_unit_conversion,
+            0,
+            subtract_quantity(free_end, zero)?,
+            0,
+        )?);
+    }
+    for (index, &(start, tier_start_base_units, unit_price_nanos)) in normalized.iter().enumerate()
+    {
+        if rational_cmp(start, usage_quantity) != std::cmp::Ordering::Less {
+            break;
+        }
+        let end = normalized.get(index + 1).map_or(usage_quantity, |next| {
+            if rational_cmp(next.0, usage_quantity) == std::cmp::Ordering::Less {
+                next.0
+            } else {
+                usage_quantity
+            }
+        });
+        lines.push(pricing_line_for_tier(
+            price,
+            base_unit_conversion,
+            tier_start_base_units,
+            subtract_quantity(end, start)?,
+            unit_price_nanos,
+        )?);
+    }
+    if lines.is_empty() {
+        return Err(EngineError::Backend(format!(
+            "GCP pricing SKU {} has no tier for the projected quantity",
+            safe_sku_id(&price.sku_id)
+        )));
+    }
+    Ok(lines)
+}
+
+fn pricing_line_for_tier(
+    price: &deployer_gcp::SkuPrice,
+    base_unit_conversion: RationalQuantity,
+    tier_start_base_units: u64,
+    usage_quantity: RationalQuantity,
+    unit_price_nanos: u64,
+) -> Result<PricingLine> {
     let mut line = PricingLine {
         sku_id: price.sku_id.clone(),
         tier_start_base_units,
@@ -1866,22 +1954,108 @@ fn pricing_line(
         base_unit: price.base_unit.clone(),
         base_unit_conversion,
         usage_quantity,
-        unit_price_nanos: price_nanos(price).ok_or_else(|| {
-            EngineError::Backend("GCP pricing expression has an invalid Money value".into())
-        })?,
-        subtotal_microusd: 1,
+        unit_price_nanos,
+        subtotal_microusd: 0,
     };
     line.subtotal_microusd = line.conservative_subtotal_microusd()?;
     Ok(line)
 }
 
+fn safe_sku_id(sku_id: &str) -> &str {
+    if (1..=128).contains(&sku_id.len())
+        && sku_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        sku_id
+    } else {
+        "<invalid>"
+    }
+}
+
+fn pricing_tier_shape(tiers: &[deployer_gcp::PriceTier]) -> String {
+    let shape = tiers
+        .iter()
+        .map(|tier| {
+            let rate = if tier.units == 0 && tier.nanos == 0 {
+                "free"
+            } else if tier.units >= 0 && (0..1_000_000_000).contains(&tier.nanos) {
+                "paid"
+            } else {
+                "invalid"
+            };
+            format!("{}:{rate}", tier.start_usage_amount)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("tiers={} [{shape}]", tiers.len())
+}
+
+fn unsupported_tier_shape(price: &deployer_gcp::SkuPrice, reason: &str) -> EngineError {
+    EngineError::Backend(format!(
+        "GCP pricing SKU {} has unsupported tier shape {}: {reason}",
+        safe_sku_id(&price.sku_id),
+        pricing_tier_shape(&price.tiers)
+    ))
+}
+
 fn price_nanos(price: &deployer_gcp::SkuPrice) -> Option<u64> {
-    let [tier] = price.tiers.as_slice() else {
+    price
+        .tiers
+        .iter()
+        .map(tier_price_nanos)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()
+}
+
+fn tier_price_nanos(tier: &deployer_gcp::PriceTier) -> Option<u64> {
+    if !(0..1_000_000_000).contains(&tier.nanos) {
         return None;
-    };
+    }
     let units = u64::try_from(tier.units).ok()?;
     let nanos = u64::try_from(tier.nanos).ok()?;
     units.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+fn rational_cmp(left: RationalQuantity, right: RationalQuantity) -> std::cmp::Ordering {
+    (u128::from(left.numerator) * u128::from(right.denominator))
+        .cmp(&(u128::from(right.numerator) * u128::from(left.denominator)))
+}
+
+fn subtract_quantity(
+    larger: RationalQuantity,
+    smaller: RationalQuantity,
+) -> Result<RationalQuantity> {
+    if larger.denominator == 0
+        || smaller.denominator == 0
+        || rational_cmp(larger, smaller) != std::cmp::Ordering::Greater
+    {
+        return Err(EngineError::Backend(
+            "GCP pricing tier quantity is invalid".into(),
+        ));
+    }
+    let denominator = u128::from(larger.denominator) * u128::from(smaller.denominator);
+    let numerator = u128::from(larger.numerator) * u128::from(smaller.denominator)
+        - u128::from(smaller.numerator) * u128::from(larger.denominator);
+    let divisor = greatest_common_divisor_u128(numerator, denominator);
+    Ok(RationalQuantity {
+        numerator: (numerator / divisor)
+            .try_into()
+            .map_err(|_| EngineError::Backend("pricing tier quantity overflowed".into()))?,
+        denominator: (denominator / divisor)
+            .try_into()
+            .map_err(|_| EngineError::Backend("pricing tier quantity overflowed".into()))?,
+    })
+}
+
+const fn greatest_common_divisor_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn checked_quantity(value: f64, hours: u64) -> Result<RationalQuantity> {
@@ -2733,6 +2907,149 @@ fn mcp_error(error: deployer_connect::McpError) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiered_price(tiers: &[(f64, i64, i32)]) -> deployer_gcp::SkuPrice {
+        deployer_gcp::SkuPrice {
+            sku_id: "66A2-68EA-56BE".into(),
+            description: "must-not-appear operator@example.test".into(),
+            service_regions: vec!["asia-east1".into()],
+            currency_code: "USD".into(),
+            usage_unit: "unit".into(),
+            usage_unit_description: "unit".into(),
+            base_unit: "unit".into(),
+            base_unit_conversion_factor: 1.0,
+            display_quantity: 1.0,
+            tiers: tiers
+                .iter()
+                .map(
+                    |&(start_usage_amount, units, nanos)| deployer_gcp::PriceTier {
+                        start_usage_amount,
+                        units,
+                        nanos,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn whole_quantity(numerator: u64) -> RationalQuantity {
+        RationalQuantity {
+            numerator,
+            denominator: 1,
+        }
+    }
+
+    #[test]
+    fn leading_free_tier_charges_only_usage_above_its_boundary() {
+        let price = tiered_price(&[(0.0, 0, 0), (1.0, 0, 2_000_000)]);
+
+        let at_boundary = pricing_lines(&price, whole_quantity(1)).expect("boundary quote");
+        assert_eq!(at_boundary.len(), 1);
+        assert_eq!(at_boundary[0].tier_start_base_units, 0);
+        assert_eq!(at_boundary[0].usage_quantity, whole_quantity(1));
+        assert_eq!(at_boundary[0].unit_price_nanos, 0);
+        assert_eq!(at_boundary[0].subtotal_microusd, 0);
+
+        let above_boundary = pricing_lines(&price, whole_quantity(3)).expect("tiered quote");
+        assert_eq!(above_boundary.len(), 2);
+        assert_eq!(above_boundary[0].usage_quantity, whole_quantity(1));
+        assert_eq!(above_boundary[0].subtotal_microusd, 0);
+        assert_eq!(above_boundary[1].tier_start_base_units, 1);
+        assert_eq!(above_boundary[1].usage_quantity, whole_quantity(2));
+        assert_eq!(above_boundary[1].unit_price_nanos, 2_000_000);
+        assert_eq!(above_boundary[1].subtotal_microusd, 4_000);
+    }
+
+    #[test]
+    fn paid_tier_boundary_selects_each_piece_once() {
+        let price = tiered_price(&[(0.0, 0, 0), (1.0, 0, 1_000_000), (3.0, 0, 2_000_000)]);
+
+        let at_boundary = pricing_lines(&price, whole_quantity(3)).expect("boundary quote");
+        assert_eq!(at_boundary.len(), 2);
+        assert_eq!(at_boundary[1].usage_quantity, whole_quantity(2));
+        assert_eq!(
+            at_boundary
+                .iter()
+                .map(|line| line.subtotal_microusd)
+                .sum::<u64>(),
+            2_000
+        );
+
+        let above_boundary = pricing_lines(&price, whole_quantity(4)).expect("tiered quote");
+        assert_eq!(above_boundary.len(), 3);
+        assert_eq!(above_boundary[2].tier_start_base_units, 3);
+        assert_eq!(above_boundary[2].usage_quantity, whole_quantity(1));
+        assert_eq!(
+            above_boundary
+                .iter()
+                .map(|line| line.subtotal_microusd)
+                .sum::<u64>(),
+            4_000
+        );
+    }
+
+    #[test]
+    fn nonzero_first_tier_normalizes_the_documented_implicit_free_range() {
+        let price = tiered_price(&[(2.0, 0, 1_000_000), (5.0, 0, 500_000)]);
+
+        let below_first_rate = pricing_lines(&price, whole_quantity(1)).expect("free quote");
+        assert_eq!(below_first_rate.len(), 1);
+        assert_eq!(below_first_rate[0].tier_start_base_units, 0);
+        assert_eq!(below_first_rate[0].usage_quantity, whole_quantity(1));
+        assert_eq!(below_first_rate[0].unit_price_nanos, 0);
+        assert_eq!(below_first_rate[0].subtotal_microusd, 0);
+
+        let across_rates = pricing_lines(&price, whole_quantity(6)).expect("tiered quote");
+        assert_eq!(across_rates.len(), 3);
+        assert_eq!(across_rates[0].usage_quantity, whole_quantity(2));
+        assert_eq!(across_rates[1].usage_quantity, whole_quantity(3));
+        assert_eq!(across_rates[2].usage_quantity, whole_quantity(1));
+        assert_eq!(
+            across_rates
+                .iter()
+                .map(|line| line.subtotal_microusd)
+                .sum::<u64>(),
+            3_500
+        );
+    }
+
+    #[test]
+    fn malformed_tier_shapes_fail_with_only_safe_identity_and_shape() {
+        let malformed = [
+            tiered_price(&[]),
+            tiered_price(&[(0.0, 0, 0), (0.0, 0, 1)]),
+            tiered_price(&[(0.0, 0, 0), (2.0, 0, 1), (1.0, 0, 2)]),
+            tiered_price(&[(0.0, -1, 0)]),
+            tiered_price(&[(0.0, 0, 1_000_000_000)]),
+        ];
+        for price in malformed {
+            let error = pricing_lines(&price, whole_quantity(4))
+                .expect_err("malformed shape")
+                .to_string();
+            assert!(error.contains("66A2-68EA-56BE"));
+            assert!(error.contains("tier"));
+            assert!(!error.contains("operator@example.test"));
+            assert!(!error.contains("must-not-appear"));
+        }
+
+        let mut untrusted = tiered_price(&[(0.0, 0, 0), (0.0, 0, 1)]);
+        untrusted.sku_id = "operator@example.test".into();
+        let error = pricing_lines(&untrusted, whole_quantity(4))
+            .expect_err("untrusted SKU")
+            .to_string();
+        assert!(error.contains("<invalid>"));
+        assert!(!error.contains("operator@example.test"));
+    }
+
+    #[test]
+    fn nonintegral_base_unit_boundary_is_rejected() {
+        let price = tiered_price(&[(0.0, 0, 0), (0.5, 0, 1)]);
+        let error = pricing_lines(&price, whole_quantity(4))
+            .expect_err("nonintegral boundary")
+            .to_string();
+        assert!(error.contains("66A2-68EA-56BE"));
+        assert!(error.contains("exact base-unit integer"));
+    }
 
     fn binding_success(transaction_id: [u8; 12]) -> Vec<u8> {
         let mut response = vec![0_u8; 32];
