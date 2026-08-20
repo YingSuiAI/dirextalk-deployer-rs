@@ -6,6 +6,7 @@ use http::{Extensions, HeaderMap, HeaderValue};
 use secrecy::{ExposeSecret as _, SecretString};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     BillingStatus, DnsRecordSet, DnsZone, GcpDiscovery, GcpError, GoogleRestClient, PriceTier,
@@ -59,6 +60,7 @@ pub struct GoogleCloudClient {
     pub(crate) firewalls: google_cloud_compute_v1::client::Firewalls,
     pub(crate) addresses: google_cloud_compute_v1::client::Addresses,
     pub(crate) disks: google_cloud_compute_v1::client::Disks,
+    pub(crate) images: google_cloud_compute_v1::client::Images,
     pub(crate) instances: google_cloud_compute_v1::client::Instances,
     pub(crate) global_operations: google_cloud_compute_v1::client::GlobalOperations,
     pub(crate) region_operations: google_cloud_compute_v1::client::RegionOperations,
@@ -114,6 +116,7 @@ impl GoogleCloudClient {
             firewalls: build!(google_cloud_compute_v1::client::Firewalls),
             addresses: build!(google_cloud_compute_v1::client::Addresses),
             disks: build!(google_cloud_compute_v1::client::Disks),
+            images: build!(google_cloud_compute_v1::client::Images),
             instances: build!(google_cloud_compute_v1::client::Instances),
             global_operations: build!(google_cloud_compute_v1::client::GlobalOperations),
             region_operations: build!(google_cloud_compute_v1::client::RegionOperations),
@@ -128,6 +131,126 @@ impl GoogleCloudClient {
             service_usage,
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImageIdentity {
+    pub project_id: String,
+    pub family: String,
+    pub name: String,
+    pub numeric_id: String,
+    pub self_link: String,
+    pub status: String,
+    pub architecture: String,
+}
+
+#[async_trait]
+pub trait GcpImageDiscovery: Send + Sync {
+    async fn resolve_image_family(&self, project_id: &str, family: &str) -> Result<ImageIdentity>;
+    async fn revalidate_image(&self, expected: &ImageIdentity) -> Result<()>;
+}
+
+#[async_trait]
+impl GcpImageDiscovery for GoogleCloudClient {
+    async fn resolve_image_family(&self, project_id: &str, family: &str) -> Result<ImageIdentity> {
+        if project_id != "ubuntu-os-cloud" || family != "ubuntu-2404-lts-amd64" {
+            return Err(GcpError::Contract(
+                "unsupported GCP boot image family".into(),
+            ));
+        }
+        let image = self
+            .images
+            .get_from_family()
+            .set_project(project_id)
+            .set_family(family)
+            .send()
+            .await
+            .map_err(official_error)?;
+        image_identity(project_id, family, image)
+    }
+
+    async fn revalidate_image(&self, expected: &ImageIdentity) -> Result<()> {
+        if expected.project_id != "ubuntu-os-cloud" || expected.family != "ubuntu-2404-lts-amd64" {
+            return Err(GcpError::Contract(
+                "unsupported GCP boot image identity".into(),
+            ));
+        }
+        let image = self
+            .images
+            .get()
+            .set_project(&expected.project_id)
+            .set_image(&expected.name)
+            .send()
+            .await
+            .map_err(official_error)?;
+        let observed = image_identity(&expected.project_id, &expected.family, image)?;
+        validate_image_identity(expected, &observed)
+    }
+}
+
+pub fn validate_image_identity(expected: &ImageIdentity, observed: &ImageIdentity) -> Result<()> {
+    if expected != observed {
+        return Err(GcpError::Contract(
+            "GCP boot image immutable identity changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn image_identity(
+    project_id: &str,
+    family: &str,
+    image: google_cloud_compute_v1::model::Image,
+) -> Result<ImageIdentity> {
+    let name = image
+        .name
+        .ok_or_else(|| GcpError::Infrastructure("GCP image omitted name".into()))?;
+    let numeric_id = image
+        .id
+        .ok_or_else(|| GcpError::Infrastructure("GCP image omitted numeric id".into()))?
+        .to_string();
+    let self_link = image
+        .self_link
+        .ok_or_else(|| GcpError::Infrastructure("GCP image omitted self-link".into()))?;
+    let status = image
+        .status
+        .and_then(|value| value.name().map(str::to_owned))
+        .ok_or_else(|| GcpError::Infrastructure("GCP image omitted status".into()))?;
+    let architecture = image
+        .architecture
+        .and_then(|value| value.name().map(str::to_owned))
+        .ok_or_else(|| GcpError::Infrastructure("GCP image omitted architecture".into()))?;
+    let expected_path = format!("/projects/{project_id}/global/images/{name}");
+    let trusted_link = url::Url::parse(&self_link).is_ok_and(|url| {
+        url.scheme() == "https"
+            && matches!(
+                url.host_str(),
+                Some("compute.googleapis.com" | "www.googleapis.com")
+            )
+            && url.path().strip_prefix("/compute/v1") == Some(expected_path.as_str())
+            && url.query().is_none()
+            && url.fragment().is_none()
+    });
+    if image.family.as_deref() != Some(family)
+        || status != "READY"
+        || architecture != "X86_64"
+        || !trusted_link
+        || image.deprecated.is_some()
+    {
+        return Err(GcpError::Contract(
+            "resolved GCP boot image does not satisfy the frozen Ubuntu amd64 contract".into(),
+        ));
+    }
+    Ok(ImageIdentity {
+        project_id: project_id.into(),
+        family: family.into(),
+        name,
+        numeric_id,
+        self_link,
+        status,
+        architecture,
+    })
 }
 
 pub(crate) fn official_error(error: impl std::fmt::Display) -> GcpError {
@@ -359,5 +482,62 @@ impl GcpDiscovery for GoogleCloudClient {
                 return Ok(prices);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use google_cloud_compute_v1::model::image::{Architecture, Status};
+
+    use super::*;
+
+    fn ubuntu_image() -> google_cloud_compute_v1::model::Image {
+        let mut image = google_cloud_compute_v1::model::Image::new();
+        image.name = Some("ubuntu-2404-noble-amd64-v20260801".into());
+        image.id = Some(123_456_789);
+        image.self_link = Some("https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260801".into());
+        image.family = Some("ubuntu-2404-lts-amd64".into());
+        image.status = Some(Status::Ready);
+        image.architecture = Some(Architecture::X8664);
+        image
+    }
+
+    #[test]
+    fn resolved_image_identity_is_exact_and_immutable() {
+        let identity = image_identity("ubuntu-os-cloud", "ubuntu-2404-lts-amd64", ubuntu_image())
+            .expect("valid image");
+        assert_eq!(identity.numeric_id, "123456789");
+        assert_eq!(identity.status, "READY");
+        assert_eq!(identity.architecture, "X86_64");
+        validate_image_identity(&identity, &identity).expect("same image");
+
+        let mut replacement = identity.clone();
+        replacement.numeric_id = "987654321".into();
+        assert!(matches!(
+            validate_image_identity(&identity, &replacement),
+            Err(GcpError::Contract(_))
+        ));
+    }
+
+    #[test]
+    fn image_resolution_rejects_wrong_architecture_or_family_link() {
+        let mut wrong_architecture = ubuntu_image();
+        wrong_architecture.architecture = Some(Architecture::Arm64);
+        assert!(
+            image_identity(
+                "ubuntu-os-cloud",
+                "ubuntu-2404-lts-amd64",
+                wrong_architecture
+            )
+            .is_err()
+        );
+
+        let mut family_link = ubuntu_image();
+        family_link.self_link = Some("https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64".into());
+        assert!(image_identity("ubuntu-os-cloud", "ubuntu-2404-lts-amd64", family_link).is_err());
+
+        let mut confused_link = ubuntu_image();
+        confused_link.self_link = Some("https://www.googleapis.com/compute/v1/prefix/projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260801".into());
+        assert!(image_identity("ubuntu-os-cloud", "ubuntu-2404-lts-amd64", confused_link).is_err());
     }
 }

@@ -183,6 +183,7 @@ pub struct DiskSpec {
     pub size_gib: u32,
     pub disk_type: String,
     pub source_image: String,
+    pub source_image_id: String,
     pub deployment_uuid: Uuid,
 }
 
@@ -639,11 +640,10 @@ impl GcpLifecycle for GoogleRestClient {
         operation: &Operation,
     ) -> Result<OperationState> {
         self.assert_operation_identity(project_number, operation)?;
+        let operation_url = validate_operation_self_link(operation, &self.project_id)?;
         self.revalidate_project(project_number).await?;
         if matches!(operation.scope, OperationScope::DnsZone(_)) {
-            require_self_link(&operation.self_link, &self.project_id, "/changes/")?;
-            let url = Url::parse(&operation.self_link)?;
-            let change: DnsChangeWire = self.get(url).await?;
+            let change: DnsChangeWire = self.get(operation_url).await?;
             if change.id != operation.name {
                 return Err(GcpError::Contract(
                     "Cloud DNS change identity mismatch".into(),
@@ -657,8 +657,7 @@ impl GcpLifecycle for GoogleRestClient {
                 ))),
             };
         }
-        let url = trusted_operation_url(&operation.self_link, &self.project_id)?;
-        let response: OperationWire = self.get(url).await?;
+        let response: OperationWire = self.get(operation_url).await?;
         if response.name != operation.name
             || response.self_link.as_deref() != Some(operation.self_link.as_str())
         {
@@ -684,11 +683,6 @@ impl GcpLifecycle for GoogleRestClient {
             Err(GcpError::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        require_self_link(
-            &resource.self_link,
-            &self.project_id,
-            resource_collection(kind),
-        )?;
         let deployment_uuid = deployment_uuid(&resource)?;
         let observed_location = resource
             .zone
@@ -701,6 +695,13 @@ impl GcpLifecycle for GoogleRestClient {
                 "resource name or location changed".into(),
             ));
         }
+        validate_resource_self_link(
+            &resource.self_link,
+            &self.project_id,
+            kind,
+            name,
+            expected_location.as_deref(),
+        )?;
         Ok(Some(ResourceReceipt {
             identity: ResourceIdentity {
                 kind,
@@ -739,10 +740,12 @@ impl GcpLifecycle for GoogleRestClient {
         };
         validate_resource_identity(identity, &observed)?;
         let mut url = Url::parse(&identity.self_link)?;
-        require_self_link(
-            identity.self_link.as_str(),
+        validate_resource_self_link(
+            &identity.self_link,
             &self.project_id,
-            resource_collection(identity.kind),
+            identity.kind,
+            &identity.name,
+            identity.location.as_deref(),
         )?;
         self.revalidate_project(project_number).await?;
         url.query_pairs_mut()
@@ -1111,6 +1114,7 @@ impl GcpLifecycle for GoogleCloudClient {
         operation: &Operation,
     ) -> Result<OperationState> {
         self.assert_operation_identity(project_number, operation)?;
+        validate_operation_self_link(operation, &self.project_id)?;
         self.revalidate_project(project_number).await?;
         if let OperationScope::DnsZone(zone) = &operation.scope {
             let response = self
@@ -1504,6 +1508,7 @@ impl GoogleCloudClient {
                         "source_image".into(),
                         json!(value.source_image.as_deref().and_then(last_path_segment)),
                     ),
+                    ("source_image_id".into(), json!(value.source_image_id)),
                     (
                         "type".into(),
                         json!(value.r#type.as_deref().and_then(last_path_segment)),
@@ -1664,22 +1669,7 @@ fn sdk_receipt(
         .to_string();
     let self_link = self_link
         .ok_or_else(|| GcpError::Infrastructure("GCP resource omitted self-link".into()))?;
-    require_self_link(&self_link, project_id, resource_collection(kind))?;
-    if let Some(location) = location {
-        let location_scope = match kind {
-            ResourceKind::Subnetwork | ResourceKind::Address => "regions",
-            ResourceKind::Disk | ResourceKind::Instance => "zones",
-            ResourceKind::Network | ResourceKind::Firewall => "global",
-        };
-        if !Url::parse(&self_link)?
-            .path()
-            .contains(&format!("/{location_scope}/{location}/"))
-        {
-            return Err(GcpError::Contract(
-                "resource self-link location mismatch".into(),
-            ));
-        }
-    }
+    validate_resource_self_link(&self_link, project_id, kind, expected_name, location)?;
     let deployment = description
         .as_deref()
         .and_then(|value| value.strip_prefix("dirextalk-deployment:"))
@@ -1854,17 +1844,6 @@ fn scope_for_resource(identity: &ResourceIdentity) -> Result<OperationScope> {
     }
 }
 
-fn resource_collection(kind: ResourceKind) -> &'static str {
-    match kind {
-        ResourceKind::Network => "/global/networks/",
-        ResourceKind::Firewall => "/global/firewalls/",
-        ResourceKind::Subnetwork => "/subnetworks/",
-        ResourceKind::Address => "/addresses/",
-        ResourceKind::Disk => "/disks/",
-        ResourceKind::Instance => "/instances/",
-    }
-}
-
 fn deployment_uuid(resource: &ResourceWire) -> Result<Uuid> {
     let marker = resource
         .description
@@ -1890,20 +1869,111 @@ fn compute_project_url(project_id: &str) -> String {
     format!("https://compute.googleapis.com/compute/v1/projects/{project_id}")
 }
 
-fn trusted_operation_url(value: &str, project_id: &str) -> Result<Url> {
-    require_self_link(value, project_id, "/operations/")?;
-    Url::parse(value).map_err(Into::into)
+fn validate_operation_self_link(operation: &Operation, project_id: &str) -> Result<Url> {
+    let url = Url::parse(&operation.self_link)?;
+    let expected = match &operation.scope {
+        OperationScope::Global => {
+            format!(
+                "/projects/{project_id}/global/operations/{}",
+                operation.name
+            )
+        }
+        OperationScope::Region(region) => format!(
+            "/projects/{project_id}/regions/{region}/operations/{}",
+            operation.name
+        ),
+        OperationScope::Zone(zone) => format!(
+            "/projects/{project_id}/zones/{zone}/operations/{}",
+            operation.name
+        ),
+        OperationScope::DnsZone(zone) => format!(
+            "/projects/{project_id}/managedZones/{zone}/changes/{}",
+            operation.name
+        ),
+    };
+    let observed = match &operation.scope {
+        OperationScope::DnsZone(_) => canonical_dns_path(&url),
+        OperationScope::Global | OperationScope::Region(_) | OperationScope::Zone(_) => {
+            canonical_compute_path(&url)
+        }
+    };
+    if url.scheme() != "https"
+        || observed != Some(expected.as_str())
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(GcpError::Contract(
+            "operation self-link does not match its exact project, scope, and name".into(),
+        ));
+    }
+    Ok(url)
+}
+
+fn validate_resource_self_link(
+    value: &str,
+    project_id: &str,
+    kind: ResourceKind,
+    name: &str,
+    location: Option<&str>,
+) -> Result<()> {
+    let url = Url::parse(value)?;
+    let expected = match kind {
+        ResourceKind::Network => format!("/projects/{project_id}/global/networks/{name}"),
+        ResourceKind::Firewall => format!("/projects/{project_id}/global/firewalls/{name}"),
+        ResourceKind::Subnetwork => format!(
+            "/projects/{project_id}/regions/{}/subnetworks/{name}",
+            required_location(kind, location)?
+        ),
+        ResourceKind::Address => format!(
+            "/projects/{project_id}/regions/{}/addresses/{name}",
+            required_location(kind, location)?
+        ),
+        ResourceKind::Disk => format!(
+            "/projects/{project_id}/zones/{}/disks/{name}",
+            required_location(kind, location)?
+        ),
+        ResourceKind::Instance => format!(
+            "/projects/{project_id}/zones/{}/instances/{name}",
+            required_location(kind, location)?
+        ),
+    };
+    if url.scheme() != "https"
+        || canonical_compute_path(&url) != Some(expected.as_str())
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(GcpError::Contract(
+            "resource self-link does not match its exact project, scope, kind, and name".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_compute_path(url: &Url) -> Option<&str> {
+    match url.host_str()? {
+        "compute.googleapis.com" | "www.googleapis.com" => url.path().strip_prefix("/compute/v1"),
+        _ => None,
+    }
+}
+
+fn canonical_dns_path(url: &Url) -> Option<&str> {
+    match url.host_str()? {
+        "dns.googleapis.com" => url.path().strip_prefix("/dns/v1"),
+        _ => None,
+    }
 }
 
 fn require_self_link(value: &str, project_id: &str, collection: &str) -> Result<()> {
     let url = Url::parse(value)?;
-    let trusted_api = matches!(url.host_str(), Some("compute.googleapis.com"))
-        || (url.host_str() == Some("www.googleapis.com") && url.path().starts_with("/compute/v1/"))
-        || matches!(url.host_str(), Some("dns.googleapis.com"));
+    let path = canonical_compute_path(&url).or_else(|| canonical_dns_path(&url));
+    let expected_prefix = format!("/projects/{project_id}/");
     if url.scheme() != "https"
-        || !trusted_api
-        || !url.path().contains(&format!("/projects/{project_id}/"))
-        || !url.path().contains(collection)
+        || path.is_none_or(|path| {
+            !path.starts_with(&expected_prefix)
+                || !path
+                    .rsplit_once(collection)
+                    .is_some_and(|(_, leaf)| !leaf.is_empty() && !leaf.contains('/'))
+        })
         || url.query().is_some()
         || url.fragment().is_some()
     {
@@ -2073,6 +2143,7 @@ fn expected_resource_properties(
                     "source_image".into(),
                     json!(last_path_segment(&spec.source_image).unwrap_or(&spec.source_image)),
                 ),
+                ("source_image_id".into(), json!(spec.source_image_id)),
                 ("type".into(), json!(spec.disk_type)),
             ]),
         ),
@@ -2394,6 +2465,61 @@ mod tests {
                 "https://www.googleapis.com/storage/v1/projects/test-project/global/networks/dirextalk-network",
                 "test-project",
                 "/global/networks/",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn operation_self_link_requires_exact_scope_and_name_path() {
+        let valid = Operation {
+            name: "operation-1".into(),
+            self_link: "https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-1".into(),
+            project_number: "123".into(),
+            scope: OperationScope::Zone("us-central1-a".into()),
+        };
+        validate_operation_self_link(&valid, "test-project").expect("exact operation path");
+
+        let cross_scope = Operation {
+            scope: OperationScope::Region("us-central1-a".into()),
+            ..valid.clone()
+        };
+        assert!(validate_operation_self_link(&cross_scope, "test-project").is_err());
+        let confused = Operation {
+            self_link: format!("{}/extra", valid.self_link),
+            ..valid
+        };
+        assert!(validate_operation_self_link(&confused, "test-project").is_err());
+    }
+
+    #[test]
+    fn resource_self_link_rejects_cross_zone_and_collection_confusion() {
+        let exact = "https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/instances/dirextalk-node";
+        validate_resource_self_link(
+            exact,
+            "test-project",
+            ResourceKind::Instance,
+            "dirextalk-node",
+            Some("us-central1-a"),
+        )
+        .expect("exact resource path");
+        assert!(
+            validate_resource_self_link(
+                exact,
+                "test-project",
+                ResourceKind::Instance,
+                "dirextalk-node",
+                Some("us-central1-b"),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_resource_self_link(
+                "https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/disks/instances/dirextalk-node",
+                "test-project",
+                ResourceKind::Instance,
+                "dirextalk-node",
+                Some("us-central1-a"),
             )
             .is_err()
         );

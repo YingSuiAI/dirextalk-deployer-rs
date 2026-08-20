@@ -25,11 +25,11 @@ pub use oauth::{
     BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, LoginRequest, OAuthToken,
     SystemBrowser,
 };
-pub use official::GoogleCloudClient;
+pub use official::{GcpImageDiscovery, GoogleCloudClient, ImageIdentity, validate_image_identity};
 pub use preflight::{
-    BillingStatus, DnsZone, GcpDiscovery, Preflight, PreflightReport, PriceTier, ProjectStatus,
-    Quota, QuotaAssessment, RequiredQuota, RequiredService, ServiceStatus, SkuPrice,
-    longest_matching_zone,
+    BillingStatus, DnsPreflightMode, DnsPreflightStatus, DnsZone, GcpDiscovery, Preflight,
+    PreflightReport, PriceTier, ProjectStatus, Quota, QuotaAssessment, RequiredQuota,
+    RequiredService, ServiceStatus, SkuPrice, longest_matching_zone,
 };
 pub use rest::{GoogleRestClient, HttpTransport, ReqwestTransport, RestResponse};
 pub use secret::{

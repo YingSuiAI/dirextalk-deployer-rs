@@ -118,8 +118,25 @@ pub struct PreflightReport {
     pub quotas: Vec<Quota>,
     pub quota_assessments: Vec<QuotaAssessment>,
     pub zones: Vec<DnsZone>,
+    pub dns: DnsPreflightStatus,
     pub prices: Vec<SkuPrice>,
     pub unpriced_costs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsPreflightMode {
+    CloudDns,
+    Auto,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsPreflightStatus {
+    Available,
+    External,
+    ApiDisabled,
+    PermissionMissing,
+    NoPublicZone,
 }
 
 #[async_trait]
@@ -203,6 +220,20 @@ impl<'a, D: GcpDiscovery> Preflight<'a, D> {
     }
 
     pub async fn inspect(&self, project_id: &str, region: &str) -> Result<PreflightReport> {
+        self.inspect_with_dns_mode(project_id, region, DnsPreflightMode::CloudDns)
+            .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the preflight keeps the ordered project, IAM, API, quota, DNS, and price checks in one auditable workflow"
+    )]
+    pub async fn inspect_with_dns_mode(
+        &self,
+        project_id: &str,
+        region: &str,
+        dns_mode: DnsPreflightMode,
+    ) -> Result<PreflightReport> {
         let project = self.discovery.project(project_id).await?;
         if !project.is_active() {
             return Err(GcpError::Contract(format!(
@@ -219,29 +250,72 @@ impl<'a, D: GcpDiscovery> Preflight<'a, D> {
                 "project {project_id} does not have enabled billing"
             )));
         }
+        let requested_permissions: Vec<_> = self
+            .required_permissions
+            .iter()
+            .filter(|permission| {
+                dns_mode != DnsPreflightMode::External || !permission.starts_with("dns.")
+            })
+            .cloned()
+            .collect();
         let granted_permissions = self
             .discovery
-            .iam_permissions(project_id, &self.required_permissions)
+            .iam_permissions(project_id, &requested_permissions)
             .await?;
         let missing: Vec<_> = self
             .required_permissions
             .iter()
+            .filter(|permission| requested_permissions.contains(permission))
             .filter(|permission| !granted_permissions.contains(permission))
             .cloned()
             .collect();
-        if !missing.is_empty() {
+        let missing_core: Vec<_> = missing
+            .iter()
+            .filter(|permission| !permission.starts_with("dns."))
+            .cloned()
+            .collect();
+        if !missing_core.is_empty() {
             return Err(GcpError::Contract(format!(
                 "OAuth principal lacks required project permissions: {}",
-                missing.join(", ")
+                missing_core.join(", ")
             )));
         }
+        let mut dns = match dns_mode {
+            DnsPreflightMode::External => DnsPreflightStatus::External,
+            DnsPreflightMode::Auto
+                if missing
+                    .iter()
+                    .any(|permission| permission.starts_with("dns.")) =>
+            {
+                DnsPreflightStatus::PermissionMissing
+            }
+            DnsPreflightMode::CloudDns
+                if missing
+                    .iter()
+                    .any(|permission| permission.starts_with("dns.")) =>
+            {
+                return Err(GcpError::Contract(format!(
+                    "OAuth principal lacks required Cloud DNS permissions: {}",
+                    missing.join(", ")
+                )));
+            }
+            DnsPreflightMode::Auto | DnsPreflightMode::CloudDns => DnsPreflightStatus::Available,
+        };
         let mut services = Vec::with_capacity(self.required_services.len());
         for required in &self.required_services {
+            if required.name == "dns.googleapis.com" && dns_mode == DnsPreflightMode::External {
+                continue;
+            }
             let service = self
                 .discovery
                 .service(&project.project_number, &required.name)
                 .await?;
             if !service.enabled {
+                if required.name == "dns.googleapis.com" && dns_mode == DnsPreflightMode::Auto {
+                    dns = DnsPreflightStatus::ApiDisabled;
+                    services.push(service);
+                    continue;
+                }
                 return Err(GcpError::Contract(format!(
                     "required API {} is not enabled",
                     service.name
@@ -249,11 +323,19 @@ impl<'a, D: GcpDiscovery> Preflight<'a, D> {
             }
             services.push(service);
         }
-        let (quotas, zones, prices) = tokio::try_join!(
+        let (quotas, prices) = tokio::try_join!(
             self.discovery.regional_quotas(project_id, region),
-            self.discovery.public_dns_zones(project_id),
             self.discovery.prices(&self.billing_service, region),
         )?;
+        let zones = if dns == DnsPreflightStatus::Available {
+            let zones = self.discovery.public_dns_zones(project_id).await?;
+            if zones.is_empty() && dns_mode == DnsPreflightMode::Auto {
+                dns = DnsPreflightStatus::NoPublicZone;
+            }
+            zones
+        } else {
+            Vec::new()
+        };
         let quota_assessments: Vec<_> = self
             .required_quotas
             .iter()
@@ -289,6 +371,7 @@ impl<'a, D: GcpDiscovery> Preflight<'a, D> {
             quotas,
             quota_assessments,
             zones,
+            dns,
             prices,
             unpriced_costs: vec![
                 "internet egress varies by destination and usage".into(),
@@ -303,21 +386,25 @@ fn required_permissions() -> Vec<String> {
         "compute.addresses.create",
         "compute.addresses.delete",
         "compute.addresses.get",
+        "compute.addresses.use",
         "compute.disks.create",
         "compute.disks.delete",
         "compute.disks.get",
+        "compute.disks.use",
         "compute.firewalls.create",
         "compute.firewalls.delete",
         "compute.firewalls.get",
         "compute.instances.create",
         "compute.instances.delete",
         "compute.instances.get",
+        "compute.regions.get",
         "compute.networks.create",
         "compute.networks.delete",
         "compute.networks.get",
         "compute.subnetworks.create",
         "compute.subnetworks.delete",
         "compute.subnetworks.get",
+        "compute.subnetworks.use",
         "compute.globalOperations.get",
         "compute.regionOperations.get",
         "compute.zoneOperations.get",
@@ -679,16 +766,27 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
 
     use super::*;
 
     #[derive(Clone)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "independent booleans let focused tests inject each preflight failure boundary"
+    )]
     struct Fake {
         project_state: &'static str,
         billing_enabled: bool,
         iam_granted: bool,
         quota_sufficient: bool,
+        dns_permissions_granted: bool,
+        dns_service_enabled: bool,
+        dns_zone_failure: bool,
+        dns_zone_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -716,7 +814,13 @@ mod tests {
             permissions: &[String],
         ) -> Result<Vec<String>> {
             Ok(if self.iam_granted {
-                permissions.to_vec()
+                permissions
+                    .iter()
+                    .filter(|permission| {
+                        self.dns_permissions_granted || !permission.starts_with("dns.")
+                    })
+                    .cloned()
+                    .collect()
             } else {
                 vec![]
             })
@@ -724,7 +828,7 @@ mod tests {
         async fn service(&self, _project_number: &str, service: &str) -> Result<ServiceStatus> {
             Ok(ServiceStatus {
                 name: service.into(),
-                enabled: true,
+                enabled: service != "dns.googleapis.com" || self.dns_service_enabled,
             })
         }
         async fn regional_quotas(&self, _project_id: &str, _region: &str) -> Result<Vec<Quota>> {
@@ -739,6 +843,10 @@ mod tests {
                 .collect())
         }
         async fn public_dns_zones(&self, _project_id: &str) -> Result<Vec<DnsZone>> {
+            self.dns_zone_calls.fetch_add(1, Ordering::SeqCst);
+            if self.dns_zone_failure {
+                return Err(GcpError::Infrastructure("DNS listing failed".into()));
+            }
             Ok(vec![])
         }
         async fn dns_record_set(
@@ -762,6 +870,10 @@ mod tests {
             billing_enabled: true,
             iam_granted: true,
             quota_sufficient: true,
+            dns_permissions_granted: true,
+            dns_service_enabled: true,
+            dns_zone_failure: false,
+            dns_zone_calls: Arc::new(AtomicUsize::new(0)),
         };
         let error = Preflight::new(&fake, vec![], "compute")
             .inspect("project", "us-central1")
@@ -777,6 +889,10 @@ mod tests {
             billing_enabled: false,
             iam_granted: true,
             quota_sufficient: true,
+            dns_permissions_granted: true,
+            dns_service_enabled: true,
+            dns_zone_failure: false,
+            dns_zone_calls: Arc::new(AtomicUsize::new(0)),
         };
         let error = Preflight::new(&fake, vec![], "compute")
             .inspect("project", "us-central1")
@@ -792,6 +908,10 @@ mod tests {
             billing_enabled: true,
             iam_granted: false,
             quota_sufficient: true,
+            dns_permissions_granted: true,
+            dns_service_enabled: true,
+            dns_zone_failure: false,
+            dns_zone_calls: Arc::new(AtomicUsize::new(0)),
         };
         let error = Preflight::new(&fake, vec![], "compute")
             .inspect("project", "us-central1")
@@ -807,12 +927,90 @@ mod tests {
             billing_enabled: true,
             iam_granted: true,
             quota_sufficient: false,
+            dns_permissions_granted: true,
+            dns_service_enabled: true,
+            dns_zone_failure: false,
+            dns_zone_calls: Arc::new(AtomicUsize::new(0)),
         };
         let error = Preflight::new(&fake, vec![], "compute")
             .inspect("project", "us-central1")
             .await
             .expect_err("quota");
         assert!(matches!(error, GcpError::Contract(message) if message.contains("quota")));
+    }
+
+    fn dns_fake() -> Fake {
+        Fake {
+            project_state: "ACTIVE",
+            billing_enabled: true,
+            iam_granted: true,
+            quota_sufficient: true,
+            dns_permissions_granted: true,
+            dns_service_enabled: true,
+            dns_zone_failure: false,
+            dns_zone_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_dns_mode_skips_dns_permission_service_and_zone_reads() {
+        let mut fake = dns_fake();
+        fake.dns_permissions_granted = false;
+        fake.dns_service_enabled = false;
+        fake.dns_zone_failure = true;
+        let calls = Arc::clone(&fake.dns_zone_calls);
+
+        let report = Preflight::new(&fake, vec![], "compute")
+            .inspect_with_dns_mode("project", "us-central1", DnsPreflightMode::External)
+            .await
+            .expect("external DNS preflight");
+
+        assert_eq!(report.dns, DnsPreflightStatus::External);
+        assert!(report.zones.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            report
+                .services
+                .iter()
+                .all(|service| service.name != "dns.googleapis.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_dns_distinguishes_unavailable_from_infrastructure_failure() {
+        let mut unavailable = dns_fake();
+        unavailable.dns_permissions_granted = false;
+        let unavailable_report = Preflight::new(&unavailable, vec![], "compute")
+            .inspect_with_dns_mode("project", "us-central1", DnsPreflightMode::Auto)
+            .await
+            .expect("positive DNS unavailability");
+        assert_eq!(
+            unavailable_report.dns,
+            DnsPreflightStatus::PermissionMissing
+        );
+        assert_eq!(unavailable.dns_zone_calls.load(Ordering::SeqCst), 0);
+
+        let mut failed = dns_fake();
+        failed.dns_zone_failure = true;
+        assert!(matches!(
+            Preflight::new(&failed, vec![], "compute")
+                .inspect_with_dns_mode("project", "us-central1", DnsPreflightMode::Auto)
+                .await,
+            Err(GcpError::Infrastructure(_))
+        ));
+    }
+
+    #[test]
+    fn required_permissions_cover_fresh_state_create_dependencies() {
+        let permissions = required_permissions();
+        for permission in [
+            "compute.addresses.use",
+            "compute.disks.use",
+            "compute.regions.get",
+            "compute.subnetworks.use",
+        ] {
+            assert!(permissions.iter().any(|value| value == permission));
+        }
     }
 
     #[test]

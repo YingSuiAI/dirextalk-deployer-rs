@@ -15,6 +15,7 @@ use crate::{GcpError, Result, SecretStore};
 
 const REFRESH_TOKEN_ACCOUNT: &str = "google-oauth-refresh-token";
 const MAX_CALLBACK_HEADER_BYTES: usize = 8192;
+const ACCESS_TOKEN_EXPIRY_MARGIN: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Clone)]
 pub struct InstalledAppConfig {
@@ -33,20 +34,12 @@ impl InstalledAppConfig {
     /// Release builds may provide `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID` at compile
     /// time; development may set the same name at runtime.
     pub fn from_environment() -> Result<Self> {
-        let client_id = std::env::var("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                option_env!("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID")
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_owned)
-            })
-            .ok_or_else(|| {
-                GcpError::Contract(
-                    "Google OAuth client id is not configured; set DIREXTALK_GOOGLE_OAUTH_CLIENT_ID for development or embed it in the release build"
-                        .into(),
-                )
-            })?;
+        let compiled = option_env!("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID");
+        let runtime = compiled
+            .is_none()
+            .then(|| std::env::var("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID").ok())
+            .flatten();
+        let client_id = resolve_client_id(compiled, runtime.as_deref())?;
         Self::google(client_id)
     }
 
@@ -65,6 +58,24 @@ impl InstalledAppConfig {
             userinfo_endpoint: Url::parse("https://openidconnect.googleapis.com/v1/userinfo")?,
             callback_timeout: Duration::from_mins(5),
         })
+    }
+}
+
+fn resolve_client_id(compiled: Option<&str>, runtime: Option<&str>) -> Result<String> {
+    match compiled {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
+        Some(_) => Err(GcpError::Contract(
+            "embedded Google OAuth client id is empty".into(),
+        )),
+        None => runtime
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                GcpError::Contract(
+                    "Google OAuth client id is not configured; set DIREXTALK_GOOGLE_OAUTH_CLIENT_ID for development or embed it in the release build"
+                        .into(),
+                )
+            }),
     }
 }
 
@@ -88,6 +99,8 @@ pub struct GoogleInstalledApp {
     secrets: Arc<dyn SecretStore>,
     browser: Arc<dyn BrowserLauncher>,
     client: reqwest::Client,
+    refresh_lock: tokio::sync::Mutex<()>,
+    token_cache: std::sync::Mutex<Option<CachedToken>>,
 }
 
 impl std::fmt::Debug for GoogleInstalledApp {
@@ -109,6 +122,7 @@ pub struct LoginRequest {
     verifier: SecretString,
 }
 
+#[derive(Clone)]
 pub struct OAuthToken {
     pub access_token: SecretString,
     /// Stable Google OIDC subject (`sub`) used for authorization
@@ -117,6 +131,11 @@ pub struct OAuthToken {
     /// Verified Google account email for human-readable output only.
     pub verified_email: String,
     pub expires_at: Option<Instant>,
+}
+
+struct CachedToken {
+    credential_fingerprint: [u8; 32],
+    token: OAuthToken,
 }
 
 impl std::fmt::Debug for OAuthToken {
@@ -170,6 +189,8 @@ impl GoogleInstalledApp {
             secrets,
             browser,
             client: reqwest::Client::new(),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            token_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -195,13 +216,24 @@ impl GoogleInstalledApp {
                     GcpError::Infrastructure(format!("OAuth listener failed: {error}"))
                 })??;
         let code = Self::validate_callback(&raw_callback, &request)?;
+        let _refresh = self.refresh_lock.lock().await;
         self.exchange_code(&code, &request).await
     }
 
     pub async fn refresh(&self) -> Result<Option<OAuthToken>> {
+        self.usable_token().await
+    }
+
+    pub async fn usable_token(&self) -> Result<Option<OAuthToken>> {
+        let _refresh = self.refresh_lock.lock().await;
         let Some(refresh_token) = self.secrets.get(REFRESH_TOKEN_ACCOUNT)? else {
+            self.clear_token_cache()?;
             return Ok(None);
         };
+        let credential_fingerprint = self.credential_fingerprint(&refresh_token);
+        if let Some(token) = self.cached_token(&credential_fingerprint)? {
+            return Ok(Some(token));
+        }
         let mut fields = vec![
             ("client_id", self.config.client_id.as_str()),
             ("grant_type", "refresh_token"),
@@ -228,10 +260,19 @@ impl GoogleInstalledApp {
         }
         let token: TokenResponse = serde_json::from_slice(&bytes)
             .map_err(|_| GcpError::Authentication("token response was invalid".into()))?;
-        self.finish_token(token, TokenFlow::Refresh).await.map(Some)
+        let rotated_refresh = token.refresh_token.clone();
+        let token = self.finish_token(token, TokenFlow::Refresh).await?;
+        let cache_fingerprint = rotated_refresh.as_ref().map_or_else(
+            || credential_fingerprint,
+            |refresh_token| self.credential_fingerprint(refresh_token),
+        );
+        self.store_cached_token(cache_fingerprint, &token)?;
+        Ok(Some(token))
     }
 
     pub async fn logout(&self) -> Result<()> {
+        let _refresh = self.refresh_lock.lock().await;
+        self.clear_token_cache()?;
         let token = self.secrets.get(REFRESH_TOKEN_ACCOUNT)?;
         if let Some(token) = token {
             let response = self
@@ -374,6 +415,7 @@ impl GoogleInstalledApp {
             }
             (TokenFlow::Login | TokenFlow::Refresh, Some(refresh_token)) => {
                 self.secrets.set(REFRESH_TOKEN_ACCOUNT, refresh_token)?;
+                self.clear_token_cache()?;
             }
             (TokenFlow::Refresh, None) => {}
         }
@@ -386,6 +428,57 @@ impl GoogleInstalledApp {
                 .map(|seconds| Instant::now() + Duration::from_secs(seconds)),
         })
     }
+
+    fn credential_fingerprint(&self, refresh_token: &SecretString) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"dirextalk-google-oauth-cache-v1\0");
+        digest.update(self.config.client_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(refresh_token.expose_secret().as_bytes());
+        digest.finalize().into()
+    }
+
+    fn cached_token(&self, credential_fingerprint: &[u8; 32]) -> Result<Option<OAuthToken>> {
+        let cache = self.token_cache.lock().map_err(|_| {
+            GcpError::Infrastructure("OAuth access-token cache lock was poisoned".into())
+        })?;
+        Ok(cache
+            .as_ref()
+            .filter(|cached| {
+                &cached.credential_fingerprint == credential_fingerprint
+                    && token_is_usable(&cached.token, Instant::now())
+            })
+            .map(|cached| cached.token.clone()))
+    }
+
+    fn store_cached_token(
+        &self,
+        credential_fingerprint: [u8; 32],
+        token: &OAuthToken,
+    ) -> Result<()> {
+        let mut cache = self.token_cache.lock().map_err(|_| {
+            GcpError::Infrastructure("OAuth access-token cache lock was poisoned".into())
+        })?;
+        *cache = token_is_usable(token, Instant::now()).then(|| CachedToken {
+            credential_fingerprint,
+            token: token.clone(),
+        });
+        Ok(())
+    }
+
+    fn clear_token_cache(&self) -> Result<()> {
+        let mut cache = self.token_cache.lock().map_err(|_| {
+            GcpError::Infrastructure("OAuth access-token cache lock was poisoned".into())
+        })?;
+        *cache = None;
+        Ok(())
+    }
+}
+
+fn token_is_usable(token: &OAuthToken, now: Instant) -> bool {
+    token
+        .expires_at
+        .is_some_and(|expires_at| expires_at > now + ACCESS_TOKEN_EXPIRY_MARGIN)
 }
 
 fn validate_user_info(user: UserInfo) -> Result<ValidatedUserIdentity> {
@@ -517,13 +610,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use secrecy::{ExposeSecret as _, SecretString};
     use url::Url;
 
     use super::{
         BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, OAuthToken, TokenFlow,
-        TokenResponse, UserInfo, read_callback_headers, validate_user_info,
+        TokenResponse, UserInfo, read_callback_headers, resolve_client_id, token_is_usable,
+        validate_user_info,
     };
     use crate::{GcpError, Result, SecretStore};
 
@@ -654,6 +749,21 @@ mod tests {
         .expect_err("wrong state must fail");
         assert!(matches!(error, GcpError::OAuthValidation(_)));
         assert!(!format!("{error:?}").contains("secret-code"));
+    }
+
+    #[test]
+    fn compiled_client_id_is_authoritative_over_runtime_environment() {
+        assert_eq!(
+            resolve_client_id(Some("audited-compiled-id"), Some("runtime-override"))
+                .expect("compiled id"),
+            "audited-compiled-id"
+        );
+        assert_eq!(
+            resolve_client_id(None, Some("development-runtime-id")).expect("development id"),
+            "development-runtime-id"
+        );
+        assert!(resolve_client_id(Some(""), Some("runtime-override")).is_err());
+        assert!(resolve_client_id(None, None).is_err());
     }
 
     #[test]
@@ -799,5 +909,26 @@ mod tests {
         let debug = format!("{token:?}");
         assert!(!debug.contains("access-token-secret"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn cached_access_token_requires_conservative_remaining_lifetime() {
+        let now = Instant::now();
+        let token = |expires_at| OAuthToken {
+            access_token: SecretString::from("access-token-secret"),
+            principal: "stable-subject".into(),
+            verified_email: "operator@example.com".into(),
+            expires_at,
+        };
+
+        assert!(token_is_usable(
+            &token(Some(now + Duration::from_secs(61))),
+            now
+        ));
+        assert!(!token_is_usable(
+            &token(Some(now + Duration::from_mins(1))),
+            now
+        ));
+        assert!(!token_is_usable(&token(None), now));
     }
 }

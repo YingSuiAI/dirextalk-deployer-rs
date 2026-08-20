@@ -1,5 +1,9 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+#[cfg(not(target_os = "linux"))]
+use std::fs;
+use std::fs::File;
+#[cfg(not(target_os = "linux"))]
+use std::fs::OpenOptions;
+use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,8 +55,7 @@ impl KeyringStore {
     }
 
     fn entry(&self, account: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(&self.service, account)
-            .map_err(|error| GcpError::CredentialStorage(error.to_string()))
+        keyring::Entry::new(&self.service, account).map_err(classify_keyring_error)
     }
 }
 
@@ -61,20 +64,20 @@ impl SecretStore for KeyringStore {
         match self.entry(account)?.get_password() {
             Ok(value) => Ok(Some(SecretString::from(value))),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(GcpError::CredentialStorage(error.to_string())),
+            Err(error) => Err(classify_keyring_error(error)),
         }
     }
 
     fn set(&self, account: &str, value: &SecretString) -> Result<()> {
         self.entry(account)?
             .set_password(value.expose_secret())
-            .map_err(|error| GcpError::CredentialStorage(error.to_string()))
+            .map_err(classify_keyring_error)
     }
 
     fn delete(&self, account: &str) -> Result<()> {
         match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(GcpError::CredentialStorage(error.to_string())),
+            Err(error) => Err(classify_keyring_error(error)),
         }
     }
 }
@@ -158,38 +161,16 @@ impl EncryptedFileStore {
         Ok(key)
     }
 
-    fn ensure_directory(&self) -> Result<()> {
-        fs::create_dir_all(&self.directory)?;
-        set_directory_permissions(&self.directory)?;
-        Ok(())
-    }
-
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        self.ensure_directory()?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        set_file_permissions(path)?;
-        Ok(())
+        atomic_write_secure(&self.directory, path, bytes)
     }
 }
 
 impl SecretStore for EncryptedFileStore {
     fn get(&self, account: &str) -> Result<Option<SecretString>> {
         let path = self.path(account);
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(bytes) = read_secure(&self.directory, &path)? else {
+            return Ok(None);
         };
         let envelope: Envelope = serde_json::from_slice(&bytes)
             .map_err(|_| GcpError::CredentialStorage("credential envelope is invalid".into()))?;
@@ -251,11 +232,7 @@ impl SecretStore for EncryptedFileStore {
     }
 
     fn delete(&self, account: &str) -> Result<()> {
-        match fs::remove_file(self.path(account)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        delete_secure(&self.directory, &self.path(account))
     }
 }
 
@@ -290,7 +267,9 @@ impl SecretStore for CredentialStore {
     fn get(&self, account: &str) -> Result<Option<SecretString>> {
         match self.primary.get(account) {
             Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) | Err(_) => self.fallback.get(account),
+            Ok(None) => Ok(None),
+            Err(GcpError::CredentialStorageUnavailable(_)) => self.fallback.get(account),
+            Err(error) => Err(error),
         }
     }
 
@@ -300,17 +279,31 @@ impl SecretStore for CredentialStore {
                 self.fallback.delete(account)?;
                 Ok(())
             }
-            Err(_) => self.fallback.set(account, value),
+            Err(GcpError::CredentialStorageUnavailable(_)) => self.fallback.set(account, value),
+            Err(error) => Err(error),
         }
     }
 
     fn delete(&self, account: &str) -> Result<()> {
-        let primary = self.primary.delete(account);
-        let fallback = self.fallback.delete(account);
-        match (primary, fallback) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(()) | Err(_)) | (Ok(()), Err(error)) => Err(error),
+        match self.primary.delete(account) {
+            Ok(()) | Err(GcpError::CredentialStorageUnavailable(_)) => {
+                self.fallback.delete(account)
+            }
+            Err(error) => Err(error),
         }
+    }
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "keyring map_err callbacks consume their error value"
+)]
+fn classify_keyring_error(error: keyring::Error) -> GcpError {
+    match error {
+        keyring::Error::NoDefaultStore | keyring::Error::NotSupportedByStore(_) => {
+            GcpError::CredentialStorageUnavailable(error.to_string())
+        }
+        _ => GcpError::CredentialStorage(error.to_string()),
     }
 }
 
@@ -330,7 +323,236 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn open_secure_directory(directory: &Path, create: bool) -> Result<std::os::fd::OwnedFd> {
+    use std::path::Component;
+
+    use rustix::fs::{CWD, Mode, OFlags, fchmod, mkdirat, openat};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut descriptor = openat(
+        CWD,
+        if directory.is_absolute() { "/" } else { "." },
+        flags,
+        Mode::empty(),
+    )
+    .map_err(rustix_io)?;
+    let mut saw_normal_component = false;
+    for component in directory.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(GcpError::CredentialStorage(
+                    "credential directory may not contain parent or platform-prefix components"
+                        .into(),
+                ));
+            }
+        };
+        saw_normal_component = true;
+        let next = match openat(&descriptor, name, flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(error) if create && error == rustix::io::Errno::NOENT => {
+                match mkdirat(&descriptor, name, Mode::from_raw_mode(0o700)) {
+                    Ok(()) => {}
+                    Err(error) if error == rustix::io::Errno::EXIST => {}
+                    Err(error) => return Err(rustix_io(error)),
+                }
+                openat(&descriptor, name, flags, Mode::empty()).map_err(rustix_io)?
+            }
+            Err(error) => return Err(rustix_io(error)),
+        };
+        descriptor = next;
+    }
+    if !saw_normal_component {
+        return Err(GcpError::CredentialStorage(
+            "credential directory must name a dedicated directory".into(),
+        ));
+    }
+    validate_directory_descriptor(&descriptor, false)?;
+    if create {
+        fchmod(&descriptor, Mode::from_raw_mode(0o700)).map_err(rustix_io)?;
+    }
+    validate_directory_descriptor(&descriptor, true)?;
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_directory_descriptor(
+    descriptor: &impl std::os::fd::AsFd,
+    require_restricted_mode: bool,
+) -> Result<()> {
+    use rustix::fs::{FileType, fstat};
+
+    let metadata = fstat(descriptor).map_err(rustix_io)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || (require_restricted_mode && metadata.st_mode & 0o077 != 0)
+    {
+        return Err(GcpError::CredentialStorage(
+            "credential directory has an unsafe type, owner, or mode".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_file_descriptor(descriptor: &impl std::os::fd::AsFd) -> Result<()> {
+    use rustix::fs::{FileType, fstat};
+
+    let metadata = fstat(descriptor).map_err(rustix_io)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_mode & 0o777 != 0o600
+        || metadata.st_nlink != 1
+    {
+        return Err(GcpError::CredentialStorage(
+            "credential file has an unsafe type, owner, mode, or link count".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn credential_name(path: &Path) -> Result<&std::ffi::OsStr> {
+    path.file_name()
+        .ok_or_else(|| GcpError::CredentialStorage("credential path has no file name".into()))
+}
+
+#[cfg(target_os = "linux")]
+fn read_secure(directory: &Path, path: &Path) -> Result<Option<Vec<u8>>> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let directory = match open_secure_directory(directory, false) {
+        Ok(directory) => directory,
+        Err(GcpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let descriptor = match openat(
+        &directory,
+        credential_name(path)?,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(rustix_io(error)),
+    };
+    validate_file_descriptor(&descriptor)?;
+    let mut file = File::from(descriptor);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_write_secure(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, fchmod, fsync, openat, renameat, unlinkat};
+
+    let directory = open_secure_directory(directory, true)?;
+    let destination = credential_name(path)?;
+    match openat(
+        &directory,
+        destination,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(existing) => validate_file_descriptor(&existing)?,
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Err(error) => return Err(rustix_io(error)),
+    }
+    let temporary = format!(".credential-{:032x}.tmp", rand::random::<u128>());
+    let descriptor = openat(
+        &directory,
+        &temporary,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(rustix_io)?;
+    let result = (|| {
+        fchmod(&descriptor, Mode::from_raw_mode(0o600)).map_err(rustix_io)?;
+        validate_file_descriptor(&descriptor)?;
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        validate_directory_descriptor(&directory, true)?;
+        renameat(&directory, &temporary, &directory, destination).map_err(rustix_io)?;
+        fsync(&directory).map_err(rustix_io)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = unlinkat(&directory, &temporary, AtFlags::empty());
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn delete_secure(directory: &Path, path: &Path) -> Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, unlinkat};
+
+    let directory = match open_secure_directory(directory, false) {
+        Ok(directory) => directory,
+        Err(GcpError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let name = credential_name(path)?;
+    let descriptor = match openat(
+        &directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+        Err(error) => return Err(rustix_io(error)),
+    };
+    validate_file_descriptor(&descriptor)?;
+    validate_directory_descriptor(&directory, true)?;
+    unlinkat(&directory, name, AtFlags::empty()).map_err(rustix_io)?;
+    fsync(&directory).map_err(rustix_io)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rustix_io(error: rustix::io::Errno) -> GcpError {
+    std::io::Error::from_raw_os_error(error.raw_os_error()).into()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_secure(_directory: &Path, path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn atomic_write_secure(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    set_directory_permissions(directory)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    set_file_permissions(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn delete_secure(_directory: &Path, path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn set_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -342,7 +564,7 @@ fn set_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn set_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -362,7 +584,7 @@ mod tests {
     use secrecy::{ExposeSecret as _, SecretString};
 
     use super::{CredentialStore, EncryptedFileStore, PassphraseProvider, SecretStore};
-    use crate::Result;
+    use crate::{GcpError, Result};
 
     struct CountingProvider {
         calls: Arc<AtomicUsize>,
@@ -379,6 +601,8 @@ mod tests {
     enum PrimaryValue {
         Present(&'static str),
         Missing,
+        Unavailable,
+        Failure,
     }
 
     struct FakePrimaryStore(PrimaryValue);
@@ -388,11 +612,39 @@ mod tests {
             match self.0 {
                 PrimaryValue::Present(value) => Ok(Some(SecretString::from(value))),
                 PrimaryValue::Missing => Ok(None),
+                PrimaryValue::Unavailable => Err(GcpError::CredentialStorageUnavailable(
+                    "no keyring backend".into(),
+                )),
+                PrimaryValue::Failure => Err(GcpError::CredentialStorage("keyring locked".into())),
             }
         }
 
         fn set(&self, _account: &str, _value: &SecretString) -> Result<()> {
             Ok(())
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SetPrimaryStore {
+        unavailable: bool,
+    }
+
+    impl SecretStore for SetPrimaryStore {
+        fn get(&self, _account: &str) -> Result<Option<SecretString>> {
+            Ok(None)
+        }
+
+        fn set(&self, _account: &str, _value: &SecretString) -> Result<()> {
+            if self.unavailable {
+                Err(GcpError::CredentialStorageUnavailable(
+                    "no keyring backend".into(),
+                ))
+            } else {
+                Err(GcpError::CredentialStorage("keyring locked".into()))
+            }
         }
 
         fn delete(&self, _account: &str) -> Result<()> {
@@ -434,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_primary_and_fallback_file_do_not_request_passphrase() {
+    fn missing_primary_does_not_read_stale_fallback() {
         let directory = tempfile::tempdir().expect("tempdir");
         let calls = Arc::new(AtomicUsize::new(0));
         let fallback = EncryptedFileStore::with_passphrase_provider(
@@ -442,10 +694,95 @@ mod tests {
             "dirextalk-test",
             counting_provider(&calls, "correct horse battery staple"),
         );
+        fallback
+            .set(
+                "operator@example.com",
+                &SecretString::from("stale-fallback-secret"),
+            )
+            .expect("seed fallback");
+        calls.store(0, Ordering::SeqCst);
         let store = CredentialStore::new(FakePrimaryStore(PrimaryValue::Missing), fallback);
 
         assert!(store.get("operator@example.com").expect("load").is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn explicitly_unavailable_primary_uses_existing_fallback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        fallback
+            .set(
+                "operator@example.com",
+                &SecretString::from("fallback-secret"),
+            )
+            .expect("seed fallback");
+        calls.store(0, Ordering::SeqCst);
+        let store = CredentialStore::new(FakePrimaryStore(PrimaryValue::Unavailable), fallback);
+
+        let loaded = store
+            .get("operator@example.com")
+            .expect("fallback load")
+            .expect("fallback present");
+
+        assert_eq!(loaded.expose_secret(), "fallback-secret");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn primary_failure_does_not_read_or_write_fallback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let get_store = CredentialStore::new(FakePrimaryStore(PrimaryValue::Failure), fallback);
+        assert!(matches!(
+            get_store.get("operator@example.com"),
+            Err(GcpError::CredentialStorage(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let write_fallback = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-write-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let set_store =
+            CredentialStore::new(SetPrimaryStore { unavailable: false }, write_fallback);
+        assert!(matches!(
+            set_store.set("operator@example.com", &SecretString::from("new-secret")),
+            Err(GcpError::CredentialStorage(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn primary_unavailable_allows_fallback_write() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let store = CredentialStore::new(SetPrimaryStore { unavailable: true }, fallback);
+
+        store
+            .set(
+                "operator@example.com",
+                &SecretString::from("fallback-secret"),
+            )
+            .expect("fallback write");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -520,5 +857,71 @@ mod tests {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn encrypted_file_rejects_symlinked_directory_without_prompting() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        let link = root.path().join("credentials");
+        symlink(&real, &link).expect("directory symlink");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = EncryptedFileStore::with_passphrase_provider(
+            &link,
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+
+        assert!(store.get("operator@example.com").is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn secure_directory_creation_never_follows_intermediate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        let link = root.path().join("link");
+        symlink(&real, &link).expect("directory symlink");
+        let target = link.join("nested");
+
+        assert!(super::open_secure_directory(&target, true).is_err());
+        assert!(!real.join("nested").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn encrypted_file_rejects_symlinked_or_insecure_credential() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let external = directory.path().join("external");
+        std::fs::write(&external, b"not a credential").expect("external file");
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600))
+            .expect("external mode");
+        let credential = store.path("operator@example.com");
+        symlink(&external, &credential).expect("credential symlink");
+        assert!(store.get("operator@example.com").is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        std::fs::remove_file(&credential).expect("remove symlink");
+        std::fs::write(&credential, b"not a credential").expect("credential file");
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o644))
+            .expect("insecure mode");
+        assert!(store.get("operator@example.com").is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
