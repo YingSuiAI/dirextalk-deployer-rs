@@ -12,7 +12,8 @@ long-lived domain, and no migration or adoption of an existing node.
 You need:
 
 - a Google account with access to an existing, billing-enabled GCP project;
-- permission to enable APIs and create the resources shown by the plan;
+- the required GCP APIs already enabled, plus permission to create the
+  resources shown by the plan;
 - an existing long-lived domain and control of its DNS; and
 - an operator public IPv4 address expressed as a `/32` SSH CIDR.
 
@@ -35,6 +36,11 @@ runtime bundle, and canonical Ed25519-signed runtime manifest. The outer release
 manifest binds their SHA-256 values, signing public key, application/updater
 source revisions, and audited OAuth configuration hash. Do not use a release
 with a missing or mismatched trust-chain field.
+
+The audited runtime-signing public key is compiled into each CLI. A key rotation
+therefore requires a new CLI release with an explicitly reviewed key identity;
+the CLI never trusts a replacement key merely because it appears beside a
+downloaded runtime manifest.
 
 Stable release publication accepts only an exact `vX.Y.Z` tag. Release assets
 are documented in [`packaging/README.md`](packaging/README.md).

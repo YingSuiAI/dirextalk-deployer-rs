@@ -20,12 +20,28 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check patch whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == pull_request ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+            if [[ "${base}" =~ ^0+$ ]]; then
+              base="$(git hash-object -t tree /dev/null)"
+            fi
+          fi
+          git diff --check "${base}" HEAD
 
       - name: Run workspace tests
         run: cargo test --locked --workspace

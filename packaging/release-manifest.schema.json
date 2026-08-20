@@ -120,6 +120,8 @@
         "oauth_client_id_sha256",
         "oauth_consent_audit_revision",
         "oauth_scope_review_sha256",
+        "release_signing_public_key",
+        "release_signing_public_key_audited_sha256",
         "source_revision",
         "runtime_assets",
         "updater",
@@ -141,6 +143,12 @@
           "$ref": "#/$defs/sourceRevision"
         },
         "oauth_scope_review_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "release_signing_public_key": {
+          "$ref": "#/$defs/sha256"
+        },
+        "release_signing_public_key_audited_sha256": {
           "$ref": "#/$defs/sha256"
         },
         "source_revision": {

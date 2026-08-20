@@ -34,7 +34,7 @@ def required(name: str) -> str:
 
 
 def exact(value: str, pattern: re.Pattern[str], name: str) -> str:
-    if not pattern.fullmatch(value):
+    if not pattern.fullmatch(value) or set(value) == {"0"}:
         fail(f"{name} has an invalid immutable value")
     return value
 
@@ -115,6 +115,21 @@ def inputs() -> dict[str, object]:
         HEX_64,
         "DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256",
     )
+    release_public_key = exact(
+        required("DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX"),
+        HEX_64,
+        "DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX",
+    )
+    release_public_key_audit_hash = exact(
+        required("DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256"),
+        HEX_64,
+        "DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256",
+    )
+    if (
+        hashlib.sha256(bytes.fromhex(release_public_key)).hexdigest()
+        != release_public_key_audit_hash
+    ):
+        fail("release Ed25519 public key does not match its audited SHA-256")
     if required("DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED") != "true":
         fail("DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED must be exactly true")
     updater_version = exact(
@@ -164,6 +179,8 @@ def inputs() -> dict[str, object]:
         "oauth_client_id_sha256": oauth_hash,
         "oauth_consent_audit_revision": oauth_audit_revision,
         "oauth_scope_review_sha256": oauth_scope_hash,
+        "release_signing_public_key": release_public_key,
+        "release_signing_public_key_audited_sha256": release_public_key_audit_hash,
         "source_revision": source_revision,
         "updater": {
             "version": updater_version,
@@ -307,6 +324,7 @@ def main() -> None:
         "updater_binary_path": str(updater_path),
         "updater_unit_path": str(updater_unit_path),
         "updater_version": updater["version"],
+        "updater_source_revision": updater["source_revision"],
         "updater_source_url": updater["binary_url"],
         "updater_sha256": updater["binary_sha256"],
         "output_bundle_path": str(bundle_path),

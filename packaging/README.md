@@ -36,6 +36,8 @@ GitHub variables with audited immutable values:
 - `DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION`
 - `DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED` (exactly `true`)
 - `DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256`
+- `DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX` and
+  `DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256`
 - `DIREXTALK_UPDATER_VERSION`, `DIREXTALK_UPDATER_SOURCE_REVISION`,
   `DIREXTALK_UPDATER_BINARY_URL`, and `DIREXTALK_UPDATER_BINARY_SHA256`
 - Message Server and Agent `VERSION`, `DIGEST`, and `SOURCE_REVISION` variables
@@ -59,6 +61,19 @@ The only release secret is
 temporary file, passes only that file path to the host-owned builder, and
 deletes the file in an unconditional cleanup step. Never store the seed in a
 repository variable, request JSON, artifact, log, or command argument.
+
+The public-key audit hash is SHA-256 over the decoded 32 public-key bytes, not
+over its 64-character hexadecimal representation. Every CLI embeds the audited
+public key, and CI requires the bundle builder to derive that exact key from the
+protected seed. Rotate the key only through a new CLI release with a newly
+reviewed public-key identity and audit hash; never silently accept a second key
+or fall back to a key supplied only beside the runtime manifest.
+
+For each Message Server and Agent pin, CI also proves that the exact version tag
+selects the supplied Linux amd64 manifest digest, hashes the registry manifest
+and config bytes, and requires `org.opencontainers.image.revision` to equal the
+supplied full source revision. The short-lived registry bearer token remains in
+memory and is never printed or uploaded.
 
 Publishing fails if the GitHub release already exists. This prevents a rerun
 from replacing assets or the manifest under an existing stable version.

@@ -20,6 +20,8 @@ jobs:
       DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
       DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
       DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256 }}
+      DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX }}
+      DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256 }}
       DIREXTALK_UPDATER_VERSION: ${{ vars.DIREXTALK_UPDATER_VERSION }}
       DIREXTALK_UPDATER_SOURCE_REVISION: ${{ vars.DIREXTALK_UPDATER_SOURCE_REVISION }}
       DIREXTALK_UPDATER_BINARY_URL: ${{ vars.DIREXTALK_UPDATER_BINARY_URL }}
@@ -45,7 +47,7 @@ jobs:
           manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
           test "${RELEASE_TAG}" = "v${manifest_version}"
 
-      - name: Require audited OAuth consent and scopes
+      - name: Require audited OAuth and release trust root
         shell: bash
         run: |
           set -euo pipefail
@@ -57,6 +59,10 @@ jobs:
             https://www.googleapis.com/auth/cloud-platform | sha256sum | awk '{print $1}')"
           test "${scope_hash}" = "${DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256}"
           test "${DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED}" = true
+          [[ "${DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX}" =~ ^[0-9a-f]{64}$ ]]
+          test "${DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX}" != "$(printf '0%.0s' {1..64})"
+          key_hash="$(python3 -c 'import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ["DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX"])).hexdigest())')"
+          test "${key_hash}" = "${DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256}"
 
       - name: Validate immutable runtime input pins
         run: python3 packaging/prepare_runtime_inputs.py --validate-only
@@ -87,6 +93,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       DIREXTALK_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID }}
+      DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -160,6 +167,8 @@ jobs:
       DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
       DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
       DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256 }}
+      DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX }}
+      DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256 }}
       DIREXTALK_UPDATER_VERSION: ${{ vars.DIREXTALK_UPDATER_VERSION }}
       DIREXTALK_UPDATER_SOURCE_REVISION: ${{ vars.DIREXTALK_UPDATER_SOURCE_REVISION }}
       DIREXTALK_UPDATER_BINARY_URL: ${{ vars.DIREXTALK_UPDATER_BINARY_URL }}
@@ -199,16 +208,20 @@ jobs:
             "${RUNNER_TEMP}/runtime-work/docker-compose.json" \
             "${RUNNER_TEMP}/runtime-work/bundle-request.json"
 
-      - name: Verify application image manifests exist
+      - name: Verify application image provenance
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect \
-            "docker.io/dirextalk/message-server:${DIREXTALK_MESSAGE_SERVER_VERSION}@sha256:${DIREXTALK_MESSAGE_SERVER_DIGEST}" \
-            >/dev/null
-          docker buildx imagetools inspect \
-            "docker.io/dirextalk/agent:${DIREXTALK_AGENT_VERSION}@sha256:${DIREXTALK_AGENT_DIGEST}" \
-            >/dev/null
+          python3 packaging/verify_application_image.py \
+            dirextalk/message-server \
+            "${DIREXTALK_MESSAGE_SERVER_VERSION}" \
+            "${DIREXTALK_MESSAGE_SERVER_DIGEST}" \
+            "${DIREXTALK_MESSAGE_SERVER_SOURCE_REVISION}"
+          python3 packaging/verify_application_image.py \
+            dirextalk/agent \
+            "${DIREXTALK_AGENT_VERSION}" \
+            "${DIREXTALK_AGENT_DIGEST}" \
+            "${DIREXTALK_AGENT_SOURCE_REVISION}"
 
       - name: Materialize temporary Ed25519 signing seed
         env:

@@ -45,7 +45,20 @@ def main() -> None:
         fail("host builder report has an unexpected schema")
     if pathlib.Path(report["output_path"]).resolve() != bundle:
         fail("host builder reported an unexpected bundle path")
-    if not HEX_64.fullmatch(report.get("release_signing_public_key", "")):
+    release_public_key = provenance.get("release_signing_public_key")
+    release_public_key_audit_hash = provenance.get(
+        "release_signing_public_key_audited_sha256"
+    )
+    if (
+        not isinstance(release_public_key, str)
+        or not HEX_64.fullmatch(release_public_key)
+        or report.get("release_signing_public_key") != release_public_key
+        or os.environ.get("DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX")
+        != release_public_key
+        or not isinstance(release_public_key_audit_hash, str)
+        or hashlib.sha256(bytes.fromhex(release_public_key)).hexdigest()
+        != release_public_key_audit_hash
+    ):
         fail("host builder returned an invalid Ed25519 public key")
     if report.get("bundle_sha256") != digest(bundle):
         fail("runtime bundle does not match the host builder report")
@@ -68,6 +81,7 @@ def main() -> None:
     updater = provenance.get("updater")
     if not isinstance(updater, dict) or manifest.get("updater") != {
         "version": updater.get("version"),
+        "source_revision": updater.get("source_revision"),
         "source_url": updater.get("binary_url"),
         "sha256": updater.get("binary_sha256"),
     }:
