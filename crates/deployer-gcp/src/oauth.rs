@@ -110,7 +110,11 @@ pub struct LoginRequest {
 
 pub struct OAuthToken {
     pub access_token: SecretString,
+    /// Stable Google OIDC subject (`sub`) used for authorization
+    /// and persisted identity comparisons.
     pub principal: String,
+    /// Verified Google account email for human-readable output only.
+    pub verified_email: String,
     pub expires_at: Option<Instant>,
 }
 
@@ -120,6 +124,7 @@ impl std::fmt::Debug for OAuthToken {
             .debug_struct("OAuthToken")
             .field("access_token", &"[REDACTED]")
             .field("principal", &self.principal)
+            .field("verified_email", &self.verified_email)
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -134,8 +139,22 @@ struct TokenResponse {
 
 #[derive(Deserialize)]
 struct UserInfo {
+    #[serde(default)]
+    sub: String,
     email: String,
     email_verified: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TokenFlow {
+    Login,
+    Refresh,
+}
+
+#[derive(Debug)]
+struct ValidatedUserIdentity {
+    principal: String,
+    verified_email: String,
 }
 
 impl GoogleInstalledApp {
@@ -208,7 +227,7 @@ impl GoogleInstalledApp {
         }
         let token: TokenResponse = serde_json::from_slice(&bytes)
             .map_err(|_| GcpError::Authentication("token response was invalid".into()))?;
-        self.finish_token(token).await.map(Some)
+        self.finish_token(token, TokenFlow::Refresh).await.map(Some)
     }
 
     pub async fn logout(&self) -> Result<()> {
@@ -313,13 +332,10 @@ impl GoogleInstalledApp {
         }
         let token: TokenResponse = serde_json::from_slice(&bytes)
             .map_err(|_| GcpError::Authentication("token response was invalid".into()))?;
-        self.finish_token(token).await
+        self.finish_token(token, TokenFlow::Login).await
     }
 
-    async fn finish_token(&self, token: TokenResponse) -> Result<OAuthToken> {
-        if let Some(refresh_token) = &token.refresh_token {
-            self.secrets.set(REFRESH_TOKEN_ACCOUNT, refresh_token)?;
-        }
+    async fn finish_token(&self, token: TokenResponse, flow: TokenFlow) -> Result<OAuthToken> {
         let response = self
             .client
             .get(self.config.userinfo_endpoint.clone())
@@ -338,19 +354,54 @@ impl GoogleInstalledApp {
         }
         let user: UserInfo = serde_json::from_slice(&bytes)
             .map_err(|_| GcpError::Authentication("userinfo response was invalid".into()))?;
-        if user.email_verified == Some(false) {
-            return Err(GcpError::Authentication(
-                "Google account email is not verified".into(),
-            ));
+        self.complete_token(token, user, flow)
+    }
+
+    fn complete_token(
+        &self,
+        token: TokenResponse,
+        user: UserInfo,
+        flow: TokenFlow,
+    ) -> Result<OAuthToken> {
+        let identity = validate_user_info(user)?;
+        match (flow, token.refresh_token.as_ref()) {
+            (TokenFlow::Login, None) => {
+                return Err(GcpError::Authentication(
+                    "login did not return an offline refresh credential; existing credential was not changed"
+                        .into(),
+                ));
+            }
+            (TokenFlow::Login | TokenFlow::Refresh, Some(refresh_token)) => {
+                self.secrets.set(REFRESH_TOKEN_ACCOUNT, refresh_token)?;
+            }
+            (TokenFlow::Refresh, None) => {}
         }
         Ok(OAuthToken {
             access_token: token.access_token,
-            principal: user.email,
+            principal: identity.principal,
+            verified_email: identity.verified_email,
             expires_at: token
                 .expires_in
                 .map(|seconds| Instant::now() + Duration::from_secs(seconds)),
         })
     }
+}
+
+fn validate_user_info(user: UserInfo) -> Result<ValidatedUserIdentity> {
+    if user.sub.trim().is_empty() {
+        return Err(GcpError::Authentication(
+            "Google userinfo subject was missing".into(),
+        ));
+    }
+    if user.email_verified != Some(true) || user.email.trim().is_empty() {
+        return Err(GcpError::Authentication(
+            "Google account email is not verified".into(),
+        ));
+    }
+    Ok(ValidatedUserIdentity {
+        principal: user.sub,
+        verified_email: user.email,
+    })
 }
 
 fn unique_parameter(values: &[(String, String)], key: &str) -> Result<Option<String>> {
@@ -414,11 +465,16 @@ fn receive_callback(listener: &TcpListener, timeout: Duration) -> Result<String>
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret as _, SecretString};
     use url::Url;
 
-    use super::{BrowserLauncher, GoogleInstalledApp, InstalledAppConfig};
+    use super::{
+        BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, OAuthToken, TokenFlow,
+        TokenResponse, UserInfo, validate_user_info,
+    };
     use crate::{GcpError, Result, SecretStore};
 
     struct NoBrowser;
@@ -440,12 +496,67 @@ mod tests {
         }
     }
 
-    fn app() -> GoogleInstalledApp {
+    struct RecordingSecrets {
+        value: Mutex<Option<String>>,
+        set_calls: AtomicUsize,
+    }
+
+    impl RecordingSecrets {
+        fn with_value(value: &str) -> Self {
+            Self {
+                value: Mutex::new(Some(value.to_owned())),
+                set_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn value(&self) -> Option<String> {
+            self.value.lock().expect("credential lock").clone()
+        }
+    }
+
+    impl SecretStore for RecordingSecrets {
+        fn get(&self, _account: &str) -> Result<Option<SecretString>> {
+            Ok(self.value().map(SecretString::from))
+        }
+
+        fn set(&self, _account: &str, value: &SecretString) -> Result<()> {
+            self.set_calls.fetch_add(1, Ordering::SeqCst);
+            *self.value.lock().expect("credential lock") = Some(value.expose_secret().to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            *self.value.lock().expect("credential lock") = None;
+            Ok(())
+        }
+    }
+
+    fn app_with_secrets(secrets: Arc<dyn SecretStore>) -> GoogleInstalledApp {
         GoogleInstalledApp::new(
             InstalledAppConfig::google("client-id").expect("config"),
-            Arc::new(NoSecrets),
+            secrets,
             Arc::new(NoBrowser),
         )
+    }
+
+    fn app() -> GoogleInstalledApp {
+        app_with_secrets(Arc::new(NoSecrets))
+    }
+
+    fn token(refresh_token: Option<&str>) -> TokenResponse {
+        TokenResponse {
+            access_token: SecretString::from("access-token-secret"),
+            refresh_token: refresh_token.map(SecretString::from),
+            expires_in: Some(3600),
+        }
+    }
+
+    fn user(sub: &str, email: &str) -> UserInfo {
+        UserInfo {
+            sub: sub.to_owned(),
+            email: email.to_owned(),
+            email_verified: Some(true),
+        }
     }
 
     #[test]
@@ -497,5 +608,101 @@ mod tests {
         );
         let duplicate = format!("/oauth/callback?state={state}&state={state}&code=one-time-code");
         assert!(GoogleInstalledApp::validate_callback(&duplicate, &request).is_err());
+    }
+
+    #[test]
+    fn userinfo_rejects_missing_and_empty_subject() {
+        for raw in [
+            r#"{"email":"operator@example.com","email_verified":true}"#,
+            r#"{"sub":"","email":"operator@example.com","email_verified":true}"#,
+        ] {
+            let user: UserInfo = serde_json::from_str(raw).expect("userinfo shape");
+            let error = validate_user_info(user).expect_err("subject is required");
+            assert!(matches!(error, GcpError::Authentication(_)));
+            assert!(!format!("{error:?}").contains("operator@example.com"));
+        }
+    }
+
+    #[test]
+    fn oauth_principal_is_stable_subject_not_mutable_email() {
+        let before = validate_user_info(user("stable-subject-123", "old@example.com"))
+            .expect("valid identity");
+        let after = validate_user_info(user("stable-subject-123", "new@example.com"))
+            .expect("valid identity");
+
+        assert_eq!(before.principal, "stable-subject-123");
+        assert_eq!(before.principal, after.principal);
+        assert_eq!(before.verified_email, "old@example.com");
+        assert_eq!(after.verified_email, "new@example.com");
+    }
+
+    #[test]
+    fn login_validates_identity_before_committing_refresh_credential() {
+        let secrets = Arc::new(RecordingSecrets::with_value("old-account-refresh"));
+        let app = app_with_secrets(secrets.clone());
+
+        let error = app
+            .complete_token(
+                token(Some("new-account-refresh")),
+                user("", "new@example.com"),
+                TokenFlow::Login,
+            )
+            .expect_err("invalid subject must fail");
+
+        assert_eq!(secrets.value().as_deref(), Some("old-account-refresh"));
+        assert_eq!(secrets.set_calls.load(Ordering::SeqCst), 0);
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("access-token-secret"));
+        assert!(!debug.contains("new-account-refresh"));
+    }
+
+    #[test]
+    fn login_requires_a_new_offline_refresh_credential() {
+        let secrets = Arc::new(RecordingSecrets::with_value("old-account-refresh"));
+        let app = app_with_secrets(secrets.clone());
+
+        let error = app
+            .complete_token(
+                token(None),
+                user("new-subject", "new@example.com"),
+                TokenFlow::Login,
+            )
+            .expect_err("login without refresh token must fail");
+
+        assert_eq!(secrets.value().as_deref(), Some("old-account-refresh"));
+        assert_eq!(secrets.set_calls.load(Ordering::SeqCst), 0);
+        assert!(!format!("{error:?}").contains("access-token-secret"));
+    }
+
+    #[test]
+    fn refresh_may_retain_existing_credential_after_subject_validation() {
+        let secrets = Arc::new(RecordingSecrets::with_value("existing-refresh"));
+        let app = app_with_secrets(secrets.clone());
+
+        let refreshed = app
+            .complete_token(
+                token(None),
+                user("stable-subject", "operator@example.com"),
+                TokenFlow::Refresh,
+            )
+            .expect("refresh without token rotation");
+
+        assert_eq!(refreshed.principal, "stable-subject");
+        assert_eq!(secrets.value().as_deref(), Some("existing-refresh"));
+        assert_eq!(secrets.set_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn oauth_token_debug_redacts_access_token() {
+        let token = OAuthToken {
+            access_token: SecretString::from("access-token-secret"),
+            principal: "stable-subject".into(),
+            verified_email: "operator@example.com".into(),
+            expires_at: None,
+        };
+
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("access-token-secret"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }
