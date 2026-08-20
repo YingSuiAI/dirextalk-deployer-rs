@@ -158,16 +158,7 @@ impl GcloudAuthBroker {
         let status = std::str::from_utf8(&output.stdout).map_err(|_| {
             GcpError::Contract("gcloud authentication status output is invalid".into())
         })?;
-        let status = status.trim();
-        if status.is_empty() {
-            Ok(false)
-        } else if status.lines().all(|line| line.trim() == "ACTIVE") {
-            Ok(true)
-        } else {
-            Err(GcpError::Contract(
-                "gcloud authentication status output is invalid".into(),
-            ))
-        }
+        parse_active_status(status)
     }
 
     async fn run(&self, args: &[&'static str], output: OutputMode) -> Result<GcloudProcessOutput> {
@@ -193,6 +184,18 @@ impl GcloudAuthBroker {
             process,
             subject_resolver,
         }
+    }
+}
+
+fn parse_active_status(status: &str) -> Result<bool> {
+    match status.trim() {
+        "" => Ok(false),
+        // Current gcloud renders the active status as `*` for value(status).
+        // Older supported releases returned the underlying `ACTIVE` value.
+        "*" | "ACTIVE" => Ok(true),
+        _ => Err(GcpError::Contract(
+            "gcloud authentication status output is invalid".into(),
+        )),
     }
 }
 
@@ -518,7 +521,8 @@ mod tests {
 
     use super::{
         GcloudAuthBroker, GcloudInvocation, GcloudProcess, GcloudProcessOutput, OAuthToken,
-        OutputMode, SubjectResolver, gcloud_command, relay_buffered, require_oauth_principal,
+        OutputMode, SubjectResolver, gcloud_command, parse_active_status, relay_buffered,
+        require_oauth_principal,
     };
     use crate::{GcpError, Result};
 
@@ -591,7 +595,7 @@ mod tests {
     async fn token_uses_isolated_fixed_commands_and_preserves_subject() {
         let home = tempfile::tempdir().expect("home");
         let process = Arc::new(FakeProcess::new([
-            Ok(success(b"ACTIVE\n")),
+            Ok(success(b"*\n")),
             Ok(success(b"secret-access-token\n")),
         ]));
         let auth = broker(home.path(), Arc::clone(&process), "opaque-subject-1");
@@ -619,6 +623,15 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn active_status_accepts_current_and_legacy_markers_only() {
+        assert!(parse_active_status("*\n").expect("current marker"));
+        assert!(parse_active_status("ACTIVE\n").expect("legacy marker"));
+        assert!(!parse_active_status("\n").expect("no active account"));
+        assert!(parse_active_status("account@example.com\n").is_err());
+        assert!(parse_active_status("*\n*\n").is_err());
     }
 
     #[tokio::test]
