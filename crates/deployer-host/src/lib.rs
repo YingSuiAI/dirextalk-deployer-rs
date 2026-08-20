@@ -46,7 +46,8 @@ const RUNTIME_ROOT: &str = "/var/dirextalk-message-server";
 const COMPOSE_PATH: &str = "/var/dirextalk-message-server/docker-compose.yml";
 #[cfg(target_os = "linux")]
 const COMPOSE_PROJECT: &str = "dirextalk-p2p";
-const UPDATER_CONFIG: &[u8] = br#"{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","caddy_mode":"compose","compose_project":"dirextalk-p2p","watchdog_enabled":false}"#;
+const UPDATER_CONFIG: &[u8] = br#"{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","watchdog_enabled":false}"#;
+pub const MAX_ACCOUNT_GENERATION: u64 = (1_u64 << 53) - 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +87,7 @@ impl InstallRequest {
         }
         validate_region(&self.region)?;
         validate_https_origin(&self.release_catalog_origin)?;
-        if self.account_generation == 0 || self.account_generation > i64::MAX as u64 {
+        if self.account_generation == 0 || self.account_generation > MAX_ACCOUNT_GENERATION {
             return Err(InstallError::InvalidRequest("account_generation"));
         }
         if self.authoritative_dns_ipv4 == self.public_recursive_dns_ipv4
@@ -1409,6 +1410,7 @@ impl InstallBackend for LinuxBackend {
                 install_file(input.artifact()?, "/usr/local/bin/dirextalk-updater", 0o755)?;
             }
             FixedStep::InstallUpdaterConfig => {
+                ensure_secure_directory(Path::new("/etc/dirextalk-updater"), 0o700)?;
                 install_file(
                     input.artifact()?,
                     "/etc/dirextalk-updater/config.json",
@@ -1507,11 +1509,11 @@ fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
     ensure_secure_directory(Path::new("/var/dirextalk-message-server/runtime"), 0o700)?;
     ensure_secure_directory(Path::new("/var/dirextalk-message-server/secrets"), 0o700)?;
 
-    let postgres_admin = read_or_create_hex_secret("postgres_admin_password", 24)?;
-    let message_password = read_or_create_hex_secret("message_postgres_password", 24)?;
-    let agent_password = read_or_create_hex_secret("agent_postgres_password", 24)?;
-    let registration = read_or_create_hex_secret("message_registration_shared_secret", 32)?;
-    let turn = read_or_create_hex_secret("turn_shared_secret", 32)?;
+    let postgres_admin = read_or_create_hex_secret("postgres_admin_password", 24, 0o400)?;
+    let message_password = read_or_create_hex_secret("message_postgres_password", 24, 0o400)?;
+    let agent_password = read_or_create_hex_secret("agent_postgres_password", 24, 0o400)?;
+    let registration = read_or_create_hex_secret("message_registration_shared_secret", 32, 0o600)?;
+    let turn = read_or_create_hex_secret("turn_shared_secret", 32, 0o600)?;
     let portal = read_or_create_numeric_secret("message_portal_password", 8)?;
     let master = read_or_create_raw_secret("core_secret_master_key", 32)?;
     let mcp_path = runtime_secret_path("message_mcp_token");
@@ -1608,7 +1610,7 @@ fn render_runtime_env(
 #[cfg(target_os = "linux")]
 fn render_agent_config(request: &InstallRequest, agent_instance: Uuid) -> String {
     format!(
-        "instance_id: {agent_instance}\ndatabase_url_file: /run/secrets/database_url\ngrpc_listen: \":9443\"\nagent_http_enabled: true\nagent_http_listen: 0.0.0.0:8082\ntls_cert_file: /run/secrets/tls_cert\ntls_key_file: /run/secrets/tls_key\nservice_token_file: /run/secrets/service_token\ncore_voice_callback_relay_token_file: /run/secrets/voice_relay_token\nenable_health_service: true\nenable_reflection: false\ncapability_grant_public_key_file: /run/secrets/grant_public_key\ncapability_account_generation: {}\nproduct_capability_enabled: true\nproduct_capability_address: message-server:50053\nproduct_capability_ca_cert_file: /run/secrets/product_ca\nproduct_capability_tls_cert_file: /run/secrets/product_tls_cert\nproduct_capability_tls_key_file: /run/secrets/product_tls_key\nproduct_capability_token_file: /run/secrets/agent_to_ms_token\nproduct_capability_server_name: dirextalk-message-server\nproduct_capability_instance_id: {agent_instance}\nproduct_capability_account_generation: {}\ncore_task_max_concurrency: 4\ncore_task_lease_ttl: 30s\ncore_schedule_sweep_interval: 1s\ncore_shutdown_grace: 30s\ncore_extension_enabled: false\ncore_message_mcp_enabled: true\ncore_message_mcp_endpoint: http://message-server:8008/mcp\ncore_message_mcp_token_file: /run/secrets/message_mcp_token\ncore_static_sites_enabled: false\ncore_workload_enabled: false\ncore_secret_master_key_file: /run/secrets/core_secret_master_key\ncore_secret_master_key_version: 1\ncore_knowledge_enabled: false\n",
+        "instance_id: {agent_instance}\ndatabase_url_file: /run/secrets/database_url\ngrpc_listen: \":9443\"\nagent_http_enabled: true\nagent_http_listen: 0.0.0.0:8082\ntls_cert_file: /run/secrets/tls_cert\ntls_key_file: /run/secrets/tls_key\nservice_token_file: /run/secrets/service_token\ncore_voice_callback_relay_token_file: /run/secrets/voice_relay_token\nenable_health_service: true\nenable_reflection: false\ncapability_grant_public_key_file: /run/secrets/grant_public_key\ncapability_account_generation: {}\nproduct_capability_enabled: true\nproduct_capability_address: message-server:50053\nproduct_capability_ca_cert_file: /run/secrets/product_ca\nproduct_capability_tls_cert_file: /run/secrets/product_tls_cert\nproduct_capability_tls_key_file: /run/secrets/product_tls_key\nproduct_capability_token_file: /run/secrets/agent_to_ms_token\nproduct_capability_server_name: dirextalk-message-server\nproduct_capability_instance_id: {agent_instance}\nproduct_capability_account_generation: {}\ncore_task_max_concurrency: 4\ncore_task_lease_ttl: 30s\ncore_schedule_sweep_interval: 1s\ncore_shutdown_grace: 30s\ncore_extension_enabled: false\ncore_extension_staging_root: /var/lib/dirextalk-agent/extension-staging\ncore_message_mcp_enabled: true\ncore_message_mcp_endpoint: http://message-server:8008/mcp\ncore_message_mcp_token_file: /run/secrets/message_mcp_token\ncore_static_sites_enabled: false\ncore_workload_enabled: false\ncore_secret_master_key_file: /run/secrets/core_secret_master_key\ncore_secret_master_key_version: 1\ncore_knowledge_enabled: false\n",
         request.account_generation, request.account_generation
     )
 }
@@ -1622,10 +1624,15 @@ fn runtime_secret_path(name: &str) -> PathBuf {
 fn read_or_create_hex_secret(
     name: &str,
     random_bytes: usize,
+    mode: u32,
 ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
     let path = runtime_secret_path(name);
     if path.exists() {
-        let bytes = Zeroizing::new(read_runtime_secret(&path, random_bytes * 2)?);
+        let bytes = Zeroizing::new(
+            read_stable_regular(&path, Some(0), Some(mode), random_bytes * 2).map_err(|error| {
+                BackendError::Infrastructure(format!("read protected runtime state: {error}"))
+            })?,
+        );
         if bytes.len() != random_bytes * 2
             || !bytes
                 .iter()
@@ -1642,7 +1649,7 @@ fn read_or_create_hex_secret(
         .and_then(|mut source| source.read_exact(&mut random))
         .map_err(|error| BackendError::Infrastructure(format!("read OS RNG: {error}")))?;
     let encoded = Zeroizing::new(hex::encode(&*random).into_bytes());
-    create_secret_noclobber(&path, &encoded)?;
+    create_secret_noclobber_with_mode(&path, &encoded, mode)?;
     Ok(encoded)
 }
 
@@ -1731,6 +1738,15 @@ fn read_runtime_secret(path: &Path, maximum: usize) -> Result<Vec<u8>, BackendEr
 
 #[cfg(target_os = "linux")]
 fn create_secret_noclobber(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
+    create_secret_noclobber_with_mode(path, bytes, 0o600)
+}
+
+#[cfg(target_os = "linux")]
+fn create_secret_noclobber_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), BackendError> {
     let parent = path
         .parent()
         .ok_or_else(|| BackendError::Infrastructure("secret has no parent".into()))?;
@@ -1743,7 +1759,7 @@ fn create_secret_noclobber(path: &Path, bytes: &[u8]) -> Result<(), BackendError
         .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
     temporary
         .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))
+        .set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
     temporary.persist_noclobber(path).map_err(|error| {
         BackendError::Infrastructure(format!("publish protected runtime state: {}", error.error))
@@ -1797,12 +1813,14 @@ fn run_compose(arguments: &[&str]) -> Result<std::process::Output, BackendError>
 struct BootstrapCredentials {
     access_token: String,
     agent_token: String,
+    password: String,
 }
 
 #[cfg(target_os = "linux")]
 struct BootstrapSecrets {
     access_token: Zeroizing<String>,
     agent_token: Zeroizing<String>,
+    password: Zeroizing<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1856,6 +1874,7 @@ fn read_bootstrap_credentials() -> Result<BootstrapSecrets, BackendError> {
     Ok(BootstrapSecrets {
         access_token: Zeroizing::new(credentials.access_token),
         agent_token: Zeroizing::new(credentials.agent_token),
+        password: Zeroizing::new(credentials.password),
     })
 }
 
@@ -1952,6 +1971,13 @@ fn verify_https(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
             "--show-error",
             "--max-time",
             "15",
+            "--retry",
+            "12",
+            "--retry-delay",
+            "2",
+            "--retry-max-time",
+            "30",
+            "--retry-all-errors",
             "--resolve",
             &resolve,
             &matrix_url,
@@ -1966,6 +1992,13 @@ fn verify_https(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
             "--show-error",
             "--max-time",
             "15",
+            "--retry",
+            "12",
+            "--retry-delay",
+            "2",
+            "--retry-max-time",
+            "30",
+            "--retry-all-errors",
             "--resolve",
             &resolve,
             &agent_url,
@@ -1990,18 +2023,19 @@ fn verify_https(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
 
 #[cfg(target_os = "linux")]
 fn verify_turn_acceptance(request: &InstallRequest) -> Result<(), BackendError> {
-    let credentials = read_bootstrap_credentials()?;
-    let url = format!(
-        "https://{}/_matrix/client/v3/voip/turnServer",
-        request.domain
-    );
-    let resolve = format!("{}:443:{}", request.domain, request.public_ipv4);
-    let config = Zeroizing::new(format!(
-        "silent\nshow-error\nfail\nmax-time = 15\nresolve = \"{resolve}\"\nheader = \"Authorization: Bearer {}\"\nurl = \"{url}\"\n",
-        *credentials.access_token
-    ));
-    let output = run_program_with_input("/usr/bin/curl", &["--config", "-"], config.as_bytes())?;
-    let response: TurnResponse = serde_json::from_slice(&output.stdout)
+    let mut credentials = read_bootstrap_credentials()?;
+    let (mut status, mut body) = request_turn_credentials(request, &credentials.access_token)?;
+    if status == 401 {
+        bootstrap_portal_session(request, &credentials.password)?;
+        credentials = read_bootstrap_credentials()?;
+        (status, body) = request_turn_credentials(request, &credentials.access_token)?;
+    }
+    if status != 200 {
+        return Err(BackendError::Infrastructure(format!(
+            "Matrix TURN acceptance returned HTTP {status}"
+        )));
+    }
+    let response: TurnResponse = serde_json::from_slice(&body)
         .map_err(|_| BackendError::Infrastructure("Matrix TURN response is invalid".into()))?;
     let expected = BTreeSet::from([
         format!("turn:{}:3478?transport=tcp", request.domain),
@@ -2016,6 +2050,64 @@ fn verify_turn_acceptance(request: &InstallRequest) -> Result<(), BackendError> 
             "Matrix did not accept the credential-backed TURN 3478 contract".into(),
         ));
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn request_turn_credentials(
+    request: &InstallRequest,
+    access_token: &str,
+) -> Result<(u16, Vec<u8>), BackendError> {
+    let url = format!(
+        "https://{}/_matrix/client/v3/voip/turnServer",
+        request.domain
+    );
+    let resolve = format!("{}:443:{}", request.domain, request.public_ipv4);
+    let config = Zeroizing::new(format!(
+        "silent\nshow-error\nmax-time = 15\nresolve = \"{resolve}\"\nheader = \"Authorization: Bearer {access_token}\"\nurl = \"{url}\"\nwrite-out = \"\\n%{{http_code}}\"\n"
+    ));
+    let output = run_program_with_input("/usr/bin/curl", &["--config", "-"], config.as_bytes())?;
+    let split = output
+        .stdout
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .ok_or_else(|| BackendError::Infrastructure("Matrix TURN status is missing".into()))?;
+    let status = std::str::from_utf8(&output.stdout[split + 1..])
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| BackendError::Infrastructure("Matrix TURN status is invalid".into()))?;
+    Ok((status, output.stdout[..split].to_vec()))
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_portal_session(request: &InstallRequest, password: &str) -> Result<(), BackendError> {
+    let url = format!("https://{}/_p2p/command", request.domain);
+    let resolve = format!("{}:443:{}", request.domain, request.public_ipv4);
+    let body = Zeroizing::new(
+        serde_json::to_vec(&serde_json::json!({
+            "action": "portal.bootstrap",
+            "params": {"password": password}
+        }))
+        .map_err(|_| BackendError::Infrastructure("encode portal bootstrap request".into()))?,
+    );
+    run_program_with_input(
+        "/usr/bin/curl",
+        &[
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "15",
+            "--resolve",
+            &resolve,
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            &url,
+        ],
+        &body,
+    )?;
     Ok(())
 }
 
@@ -2903,6 +2995,21 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn agent_retained_worker_state_uses_the_persistent_staging_root() {
+        let (request, _, _, _) = fixture();
+        let request: InstallRequest = parse_canonical_json(&request).unwrap();
+        let config = render_agent_config(&request, Uuid::new_v4());
+        assert!(
+            config.contains(
+                "core_extension_staging_root: /var/lib/dirextalk-agent/extension-staging\n"
+            )
+        );
+        let compose = include_str!("../../../runtime/docker-compose.yml");
+        assert!(compose.contains("agent_core_data:/var/lib/dirextalk-agent/extension-staging"));
+    }
+
+    #[test]
     fn runtime_bundle_roles_have_exact_paths_and_modes() {
         let expected = [
             (BundleRole::ComposeFile, "runtime/docker-compose.yml", 0o644),
@@ -2957,6 +3064,27 @@ mod tests {
     }
 
     #[test]
+    fn updater_config_matches_the_pinned_v1_contract() {
+        let config: serde_json::Value = serde_json::from_slice(UPDATER_CONFIG).unwrap();
+        let keys = config
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "control_token_file",
+                "schema_version",
+                "socket_path",
+                "state_dir",
+                "watchdog_enabled",
+            ])
+        );
+    }
+
+    #[test]
     fn strict_runtime_request_rejects_untrusted_network_fields() {
         let (request, _, _, _) = fixture();
         let mut request: InstallRequest = parse_canonical_json(&request).unwrap();
@@ -2967,6 +3095,9 @@ mod tests {
         assert!(request.validate().is_err());
         request.release_catalog_origin = "https://imadmin.dirextalk.ai".into();
         request.public_recursive_dns_ipv4 = request.authoritative_dns_ipv4;
+        assert!(request.validate().is_err());
+        request.public_recursive_dns_ipv4 = "8.8.8.8".parse().unwrap();
+        request.account_generation = MAX_ACCOUNT_GENERATION + 1;
         assert!(request.validate().is_err());
     }
 
@@ -2982,6 +3113,15 @@ mod tests {
         assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o777, 0o600);
         let second = read_or_create_numeric_secret_at(&path, 8, owner).unwrap();
         assert_eq!(*first, *second);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn postgres_secret_source_is_created_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("postgres_admin_password");
+        create_secret_noclobber_with_mode(&path, b"secret", 0o400).unwrap();
+        assert_eq!(fs::symlink_metadata(path).unwrap().mode() & 0o777, 0o400);
     }
 
     #[test]

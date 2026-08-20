@@ -35,7 +35,8 @@ rm -f "$config_dir/server.crt" "$config_dir/server.key"
 # in a child process environment or argv. The shell builtins below keep the
 # value in this init process and write the final protected config directly.
 test -s "$turn_secret_file" || die 'TURN shared secret is missing or empty'
-IFS= read -r turn_secret <"$turn_secret_file" || die 'TURN shared secret cannot be read'
+IFS= read -r turn_secret <"$turn_secret_file" ||
+  [ -n "$turn_secret" ] || die 'TURN shared secret cannot be read'
 case "$turn_secret" in
   *[!0-9a-f]*) die 'TURN shared secret must be lowercase hexadecimal' ;;
 esac

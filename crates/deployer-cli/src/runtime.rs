@@ -754,23 +754,7 @@ impl DeploymentBackend for LiveControlPlane {
         match (effect.action, receipt) {
             (EffectAction::Delete, EffectReceipt::Deleted) => Ok(()),
             (EffectAction::Create | EffectAction::Update, EffectReceipt::Present(resource)) => {
-                if resource.resource_kind != effect.resource_kind
-                    || resource.name != effect.resource_name
-                    || resource.project_number != identity.project_number
-                    || resource.deployment_uuid != effect.deployment_uuid
-                    || resource.location != effect.location
-                {
-                    return Err(EngineError::Backend(
-                        "effect receipt identity differs from the pending effect".into(),
-                    ));
-                }
-                for (key, expected) in &effect.expected_attributes {
-                    if resource.observed_attributes.get(key) != Some(expected) {
-                        return Err(EngineError::Backend(format!(
-                            "effect postcondition {key} differs from the approved value"
-                        )));
-                    }
-                }
+                validate_effect_receipt_binding(identity, effect, resource)?;
                 self.revalidate_resource(identity, resource).await
             }
             _ => Err(EngineError::Backend(
@@ -887,10 +871,10 @@ impl DeploymentBackend for LiveControlPlane {
             ));
         }
         if output.exit_status != 0 {
-            return Err(EngineError::Backend(format!(
-                "host installer exited with status {}",
-                output.exit_status
-            )));
+            let detail = host_installer_failure(&output.stdout).unwrap_or_else(|| {
+                format!("host installer exited with status {}", output.exit_status)
+            });
+            return Err(EngineError::Backend(detail));
         }
         let signed: SignedReceipt = serde_json::from_slice(&output.stdout)
             .map_err(|_| EngineError::Backend("host receipt is invalid".into()))?;
@@ -1008,6 +992,25 @@ impl DeploymentBackend for LiveControlPlane {
         })
     }
 
+    async fn uninstall_connect(&self, state: &DeploymentState) -> Result<LocalWiringStatus> {
+        let paths = service_paths(state)?;
+        let controller = DaemonController::new(
+            ProcessExecutor,
+            &paths.binary,
+            &paths.config,
+            &state.service_id,
+            Redactor::default(),
+        )
+        .map_err(connect_error)?;
+        let evidence = controller.uninstall().await.map_err(connect_error)?;
+        if evidence.state != DaemonState::NotInstalled {
+            return Err(EngineError::Backend(
+                "local bridge daemon remains installed".into(),
+            ));
+        }
+        Ok(LocalWiringStatus::default())
+    }
+
     async fn verify_product(
         &self,
         config: &DeploymentConfig,
@@ -1043,6 +1046,45 @@ impl DeploymentBackend for LiveControlPlane {
         }
         Ok(())
     }
+}
+
+fn host_installer_failure(output: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut classified = text.lines().map(str::trim).filter(|line| {
+        line.starts_with("contract_failure: ") || line.starts_with("infrastructure_failure: ")
+    });
+    let line = classified.next()?;
+    if line.len() > 1024 || classified.next().is_some() {
+        return None;
+    }
+    Some(line.to_owned())
+}
+
+fn validate_effect_receipt_binding(
+    identity: &ProjectIdentity,
+    effect: &PendingEffect,
+    resource: &ResourceRef,
+) -> Result<()> {
+    if resource.resource_kind != effect.resource_kind
+        || resource.name != effect.resource_name
+        || resource.project_number != identity.project_number
+        || resource.deployment_uuid != effect.deployment_uuid
+        || resource.location != effect.location
+    {
+        return Err(EngineError::Backend(
+            "effect receipt identity differs from the pending effect".into(),
+        ));
+    }
+    if effect.resource_kind == CoreResourceKind::DnsRecord {
+        for (key, expected) in &effect.expected_attributes {
+            if resource.observed_attributes.get(key) != Some(expected) {
+                return Err(EngineError::Backend(format!(
+                    "effect postcondition {key} differs from the approved value"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1728,7 +1770,13 @@ fn ensure_ssh_key(state: &DeploymentState) -> Result<String> {
             "SSH private key is not an unencrypted Ed25519 key".into(),
         ));
     }
-    key.public_key()
+    public_key_without_comment(&key)
+}
+
+fn public_key_without_comment(key: &ssh_key::PrivateKey) -> Result<String> {
+    let mut public_key = key.public_key().clone();
+    public_key.set_comment("");
+    public_key
         .to_openssh()
         .map_err(|_| EngineError::State("SSH public key could not be encoded".into()))
 }
@@ -2824,12 +2872,17 @@ async fn authoritative_server(domain: &str) -> Result<IpAddr> {
     let labels: Vec<_> = domain.split('.').collect();
     for offset in 0..labels.len().saturating_sub(1) {
         let candidate = labels[offset..].join(".");
-        let ns = doh_answers(&client, &candidate, "NS").await?;
-        if let Some(name) = ns.first() {
+        let mut ns = doh_answers(&client, &candidate, "NS").await?;
+        ns.sort();
+        ns.dedup();
+        if let Some(name) = select_authoritative_name(domain, &ns) {
             let addresses = doh_answers(&client, name.trim_end_matches('.'), "A").await?;
             if let Some(address) = addresses
                 .into_iter()
-                .find_map(|value| value.parse::<Ipv4Addr>().ok())
+                .filter_map(|value| value.parse::<Ipv4Addr>().ok())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .next()
             {
                 return Ok(IpAddr::V4(address));
             }
@@ -2838,6 +2891,15 @@ async fn authoritative_server(domain: &str) -> Result<IpAddr> {
     Err(EngineError::Backend(
         "public authoritative DNS server could not be resolved".into(),
     ))
+}
+
+fn select_authoritative_name<'a>(domain: &str, names: &'a [String]) -> Option<&'a str> {
+    if names.is_empty() {
+        return None;
+    }
+    let digest = DigestHex::calculate(domain.as_bytes());
+    let slot = usize::from(u8::from_str_radix(&digest.as_str()[..2], 16).ok()?);
+    names.get(slot % names.len()).map(String::as_str)
 }
 
 async fn doh_answers(client: &reqwest::Client, name: &str, kind: &str) -> Result<Vec<String>> {
@@ -2923,7 +2985,7 @@ fn now_unix_ms() -> Result<u64> {
 fn account_generation(deployment_uuid: uuid::Uuid) -> u64 {
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&deployment_uuid.as_bytes()[..8]);
-    (u64::from_be_bytes(bytes) & i64::MAX as u64).max(1)
+    (u64::from_be_bytes(bytes) & deployer_host::MAX_ACCOUNT_GENERATION).max(1)
 }
 
 fn core_host_key_algorithm(algorithm: HostKeyAlgorithm) -> Result<SshHostKeyAlgorithm> {
@@ -3033,6 +3095,40 @@ fn mcp_error(error: deployer_connect::McpError) -> EngineError {
 mod tests {
     use super::*;
 
+    fn test_release_identity() -> deployer_core::ExactReleaseIdentity {
+        let sha = |character: char| {
+            deployer_core::Sha256Digest::parse(character.to_string().repeat(64)).unwrap()
+        };
+        let revision = |character: char| {
+            deployer_core::SourceRevision::parse(character.to_string().repeat(40)).unwrap()
+        };
+        deployer_core::ExactReleaseIdentity {
+            release_tag: deployer_core::ReleaseTag::parse("v0.1.0").unwrap(),
+            release_manifest_sha256: sha('1'),
+            release_manifest_source_revision: revision('2'),
+            host_installer_linux_amd64_sha256: sha('3'),
+            runtime_bundle_linux_amd64_sha256: sha('4'),
+            signed_runtime_manifest_linux_amd64_sha256: sha('5'),
+            runtime_manifest_signing_key: deployer_core::SigningKeyIdentity::parse("6".repeat(64))
+                .unwrap(),
+            message_server: deployer_core::LinuxAmd64ApplicationIdentity {
+                version: deployer_core::ReleaseTag::parse("v1.0.0").unwrap(),
+                source_revision: revision('7'),
+                image_sha256: sha('8'),
+            },
+            agent: deployer_core::LinuxAmd64ApplicationIdentity {
+                version: deployer_core::ReleaseTag::parse("v1.0.0").unwrap(),
+                source_revision: revision('9'),
+                image_sha256: sha('a'),
+            },
+            updater: deployer_core::LinuxAmd64UpdaterIdentity {
+                version: deployer_core::ReleaseTag::parse("v1.0.0").unwrap(),
+                source_revision: revision('b'),
+                asset_sha256: sha('c'),
+            },
+        }
+    }
+
     fn e2_small_config() -> DeploymentConfig {
         DeploymentConfig::parse(
             r#"
@@ -3101,6 +3197,157 @@ release = "stable"
         assert_eq!(recorded.name, "operation-opaque");
         assert_eq!(recorded.numeric_id, 991);
         assert!(recorded.self_link.as_str().ends_with("/operation-opaque"));
+    }
+
+    #[test]
+    fn instance_public_key_omits_private_key_comment() {
+        let seed = [7_u8; 32];
+        let mut key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&seed));
+        key.set_comment("dirextalk:deployment-id");
+
+        let public = public_key_without_comment(&key).expect("public key");
+
+        assert!(public.starts_with("ssh-ed25519 "));
+        assert_eq!(public.split_whitespace().count(), 2);
+        assert!(!public.contains([':', '\r', '\n']));
+    }
+
+    #[test]
+    fn host_installer_failure_accepts_only_one_classified_line() {
+        assert_eq!(
+            host_installer_failure(
+                b"installation progress\ninfrastructure_failure: docker compose failed\n"
+            )
+            .as_deref(),
+            Some("infrastructure_failure: docker compose failed")
+        );
+        assert!(host_installer_failure(b"arbitrary remote output").is_none());
+        assert!(
+            host_installer_failure(b"contract_failure: first\ninfrastructure_failure: second\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn subnet_receipt_binding_does_not_repeat_gcp_property_validation_by_key_name() {
+        let deployment_uuid = uuid::Uuid::new_v4();
+        let identity = ProjectIdentity {
+            project_id: "dirextalk-prod".into(),
+            project_number: 42,
+            oauth_principal: GoogleSubject::parse("operator.example").unwrap(),
+        };
+        let effect = PendingEffect {
+            effect_id: uuid::Uuid::new_v4(),
+            deployment_uuid,
+            project_number: 42,
+            action: EffectAction::Create,
+            resource_kind: CoreResourceKind::Subnet,
+            resource_name: "dirextalk-subnet".into(),
+            location: "asia-east1".into(),
+            expected_attributes: BTreeMap::from([("cidr".into(), "10.42.0.0/24".into())]),
+            target: None,
+            operation: None,
+        };
+        let resource = ResourceRef {
+            resource_kind: CoreResourceKind::Subnet,
+            name: effect.resource_name.clone(),
+            project_number: 42,
+            location: effect.location.clone(),
+            numeric_id: 123,
+            self_link: "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/regions/asia-east1/subnetworks/dirextalk-subnet".into(),
+            deployment_uuid,
+            observed_attributes: BTreeMap::from([
+                ("ip_cidr_range".into(), "10.42.0.0/24".into()),
+                (
+                    "network".into(),
+                    "projects/dirextalk-prod/global/networks/dirextalk-net".into(),
+                ),
+            ]),
+        };
+
+        validate_effect_receipt_binding(&identity, &effect, &resource)
+            .expect("subnet properties were already validated against their typed GCP spec");
+    }
+
+    #[test]
+    fn realistic_network_receipt_converts_into_valid_applying_state() {
+        let deployment_uuid = uuid::Uuid::new_v4();
+        let effect_id = uuid::Uuid::new_v4();
+        let effect = PendingEffect {
+            effect_id,
+            deployment_uuid,
+            project_number: 42,
+            action: EffectAction::Create,
+            resource_kind: CoreResourceKind::Network,
+            resource_name: "dt-production-0123456789ab-net".into(),
+            location: "global".into(),
+            expected_attributes: BTreeMap::new(),
+            target: None,
+            operation: Some(OperationRef {
+                request_id: effect_id,
+                project_number: 42,
+                location: "global".into(),
+                name: "operation-123".into(),
+                numeric_id: 123,
+                self_link: OperationUri::parse(
+                    "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/operation-123",
+                )
+                .expect("operation URI"),
+            }),
+        };
+        let mut state = DeploymentState {
+            schema_version: 1,
+            deployment_uuid,
+            service_id: "production-0123456789ab".into(),
+            project_identity: ProjectIdentity {
+                project_id: "dirextalk-prod".into(),
+                project_number: 42,
+                oauth_principal: GoogleSubject::parse("operator.example").unwrap(),
+            },
+            phase: deployer_core::DeploymentPhase::Applying,
+            approved_plan_digest: Some(
+                "sha256:43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
+                    .parse()
+                    .unwrap(),
+            ),
+            pending_effect: Some(effect.clone()),
+            active_destroy: None,
+            release_identity: Some(test_release_identity()),
+            gcp_resources: deployer_core::GcpResources::default(),
+            ssh_host_identity: None,
+            host_receipt: None,
+            local_wiring: LocalWiringStatus::default(),
+            integrity_digest: String::new(),
+        };
+        state.validate().expect("journaled Network operation state");
+
+        let receipt = deployer_gcp::ResourceReceipt {
+            identity: ResourceIdentity {
+                kind: GcpResourceKind::Network,
+                name: effect.resource_name.clone(),
+                project_number: "42".into(),
+                location: None,
+                numeric_id: "456".into(),
+                self_link: format!(
+                    "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/networks/{}",
+                    effect.resource_name
+                ),
+                deployment_uuid,
+            },
+            observed_attributes: BTreeMap::from([
+                ("auto_create_subnetworks".into(), json!(false)),
+                ("routing_mode".into(), json!("GLOBAL")),
+            ]),
+        };
+        validate_effect_properties(&state, &effect, None, &receipt)
+            .expect("GCP Network receipt contract");
+        let resource = core_receipt(&effect, receipt).expect("runtime receipt conversion");
+        state.pending_effect = None;
+        state.gcp_resources.network = Some(resource);
+
+        state
+            .validate()
+            .expect("Network receipt persists in applying state");
     }
 
     fn tiered_price(tiers: &[(f64, i64, i32)]) -> deployer_gcp::SkuPrice {
@@ -3402,5 +3649,28 @@ release = "stable"
             }
         );
         assert!(agent_selection("unknown-agent").is_err());
+    }
+
+    #[test]
+    fn account_generation_fits_the_shared_protocol_integer_range() {
+        let deployment_uuid =
+            uuid::Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        let generation = account_generation(deployment_uuid);
+        assert_eq!(generation, deployer_host::MAX_ACCOUNT_GENERATION);
+    }
+
+    #[test]
+    fn authoritative_dns_selection_is_stable_for_an_answer_set() {
+        let ordered = vec![
+            "ns-cloud-b1.googledomains.com.".to_owned(),
+            "ns-cloud-b2.googledomains.com.".to_owned(),
+            "ns-cloud-b3.googledomains.com.".to_owned(),
+            "ns-cloud-b4.googledomains.com.".to_owned(),
+        ];
+        assert_eq!(
+            select_authoritative_name("d1.zhangsan.dev", &ordered),
+            Some("ns-cloud-b3.googledomains.com.")
+        );
+        assert_eq!(select_authoritative_name("d1.zhangsan.dev", &[]), None);
     }
 }

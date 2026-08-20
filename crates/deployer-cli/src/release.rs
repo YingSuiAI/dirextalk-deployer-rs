@@ -19,6 +19,7 @@ use url::Url;
 use crate::engine::{EngineError, Result};
 
 const REPOSITORY: &str = "YingSuiAI/dirextalk-deployer-rs";
+const RELEASE_CATALOG_ORIGIN: &str = "https://imadmin.dirextalk.ai";
 const MAX_MANIFEST: u64 = 1024 * 1024;
 const MAX_SIGNED_MANIFEST: u64 = 4 * 1024 * 1024;
 const MAX_INSTALLER: u64 = 64 * 1024 * 1024;
@@ -220,10 +221,7 @@ impl ReleaseCatalog for GithubReleaseCatalog {
 
         Ok(ResolvedRelease {
             identity: exact_identity(&outer, &outer_bytes, installer_artifact)?,
-            release_catalog_origin: format!(
-                "https://github.com/{REPOSITORY}/releases/download/{}",
-                publication.tag_name
-            ),
+            release_catalog_origin: RELEASE_CATALOG_ORIGIN.into(),
             installer,
             bundle,
             signed_manifest,
@@ -723,5 +721,13 @@ mod tests {
         assert!(decode_hex::<32>(&"a".repeat(64)).is_ok());
         assert!(decode_hex::<32>(&"A".repeat(64)).is_err());
         assert!(decode_hex::<32>(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn host_release_catalog_value_is_an_https_origin() {
+        let origin = Url::parse(RELEASE_CATALOG_ORIGIN).unwrap();
+        assert_eq!(origin.scheme(), "https");
+        assert_eq!(origin.host_str(), Some("imadmin.dirextalk.ai"));
+        assert_eq!(origin.path(), "/");
     }
 }

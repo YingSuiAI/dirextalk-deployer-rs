@@ -4,8 +4,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use deployer_core::{
-    DeploymentConfig, DeploymentPlan, DeploymentState, PlanDigest, ProgressEvent,
-    ProgressOperation, ProgressStatus,
+    BootDiskDisposition, DeploymentConfig, DeploymentPlan, DeploymentState, PlanDigest,
+    ProgressEvent, ProgressOperation, ProgressStatus,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -234,11 +234,7 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                     Ok(CommandEnvelope::success(
                         command_name(cli),
                         "DESTROY_COMPLETE",
-                        if args.purge_disk.is_some() {
-                            "Deployment resources and the exact approved boot disk were removed."
-                        } else {
-                            "Deployment resources were removed; the boot disk was retained."
-                        },
+                        destroy_complete_message(&plan.boot_disk),
                     ))
                 }
             },
@@ -280,6 +276,20 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                     }
                 }
             }
+        }
+    }
+}
+
+const fn destroy_complete_message(disposition: &BootDiskDisposition) -> &'static str {
+    match disposition {
+        BootDiskDisposition::Purge { .. } => {
+            "Deployment resources and the exact approved boot disk were removed."
+        }
+        BootDiskDisposition::Retain { disk: Some(_) } => {
+            "Deployment resources were removed; the boot disk was retained."
+        }
+        BootDiskDisposition::Retain { disk: None } => {
+            "Deployment resources were removed; no boot disk was recorded."
         }
     }
 }
@@ -497,6 +507,14 @@ mod tests {
             !serde_json::to_string(&envelope)
                 .expect("JSON")
                 .contains("secret")
+        );
+    }
+
+    #[test]
+    fn empty_destroy_plan_does_not_claim_a_retained_disk() {
+        assert_eq!(
+            destroy_complete_message(&BootDiskDisposition::Retain { disk: None }),
+            "Deployment resources were removed; no boot disk was recorded."
         );
     }
 

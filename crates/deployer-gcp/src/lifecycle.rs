@@ -519,7 +519,6 @@ impl GcpLifecycle for GoogleRestClient {
                 "name": spec.name,
                 "description": deployment_marker(spec.deployment_uuid),
                 "addressType": "EXTERNAL",
-                "ipVersion": "IPV4",
                 "networkTier": "PREMIUM"
             }),
         )
@@ -852,6 +851,14 @@ impl GoogleRestClient {
     }
 }
 
+fn regional_external_ipv4_address(spec: &AddressSpec) -> google_cloud_compute_v1::model::Address {
+    google_cloud_compute_v1::model::Address::new()
+        .set_name(&spec.name)
+        .set_description(deployment_marker(spec.deployment_uuid))
+        .set_address_type(google_cloud_compute_v1::model::address::AddressType::External)
+        .set_network_tier(google_cloud_compute_v1::model::address::NetworkTier::Premium)
+}
+
 #[async_trait]
 impl GcpLifecycle for GoogleCloudClient {
     async fn start_network(
@@ -972,12 +979,7 @@ impl GcpLifecycle for GoogleCloudClient {
         validate_name(&spec.name)?;
         validate_name(&spec.region)?;
         self.revalidate_project(project_number).await?;
-        let body = google_cloud_compute_v1::model::Address::new()
-            .set_name(&spec.name)
-            .set_description(deployment_marker(spec.deployment_uuid))
-            .set_address_type(google_cloud_compute_v1::model::address::AddressType::External)
-            .set_ip_version(google_cloud_compute_v1::model::address::IpVersion::Ipv4)
-            .set_network_tier(google_cloud_compute_v1::model::address::NetworkTier::Premium);
+        let body = regional_external_ipv4_address(spec);
         let response = self
             .addresses
             .insert()
@@ -1217,17 +1219,7 @@ impl GcpLifecycle for GoogleCloudClient {
                     "Cloud DNS change identity mismatch".into(),
                 ));
             }
-            return match response
-                .status
-                .and_then(|status| status.name().map(str::to_owned))
-                .as_deref()
-            {
-                Some("PENDING") => Ok(OperationState::Pending),
-                Some("DONE") => Ok(OperationState::Succeeded),
-                _ => Err(GcpError::Infrastructure(
-                    "Cloud DNS returned unknown operation state".into(),
-                )),
-            };
+            return dns_operation_state_from_sdk(response.status.as_ref());
         }
         let response = match &operation.scope {
             OperationScope::Global => {
@@ -1372,6 +1364,18 @@ impl GcpLifecycle for GoogleCloudClient {
         }
         .map_err(crate::official::official_error)?;
         operation_from_sdk(response, project_number, scope_for_resource(identity)?).map(Some)
+    }
+}
+
+fn dns_operation_state_from_sdk(
+    status: Option<&google_cloud_dns_v1::model::change::Status>,
+) -> Result<OperationState> {
+    match status {
+        Some(google_cloud_dns_v1::model::change::Status::Pending) => Ok(OperationState::Pending),
+        Some(google_cloud_dns_v1::model::change::Status::Done) => Ok(OperationState::Succeeded),
+        _ => Err(GcpError::Infrastructure(
+            "Cloud DNS returned unknown operation state".into(),
+        )),
     }
 }
 
@@ -2443,6 +2447,25 @@ mod tests {
     use super::*;
     use crate::{HttpTransport, RestResponse};
 
+    #[test]
+    fn regional_external_ipv4_address_omits_ip_version() {
+        let body = regional_external_ipv4_address(&AddressSpec {
+            name: "dirextalk-ip".into(),
+            region: "asia-east1".into(),
+            deployment_uuid: Uuid::new_v4(),
+        });
+
+        assert!(body.ip_version.is_none());
+        assert_eq!(
+            body.address_type,
+            Some(google_cloud_compute_v1::model::address::AddressType::External)
+        );
+        assert_eq!(
+            body.network_tier,
+            Some(google_cloud_compute_v1::model::address::NetworkTier::Premium)
+        );
+    }
+
     #[derive(Default)]
     struct RecordingTransport {
         calls: Mutex<Vec<(Method, Url, Option<Value>)>>,
@@ -2711,6 +2734,21 @@ mod tests {
             })
         );
         assert!(OperationState::from_wire("MYSTERY", None).is_err());
+    }
+
+    #[test]
+    fn cloud_dns_sdk_status_uses_typed_pending_and_done_values() {
+        use google_cloud_dns_v1::model::change::Status;
+
+        assert_eq!(
+            dns_operation_state_from_sdk(Some(&Status::Pending)).unwrap(),
+            OperationState::Pending
+        );
+        assert_eq!(
+            dns_operation_state_from_sdk(Some(&Status::Done)).unwrap(),
+            OperationState::Succeeded
+        );
+        assert!(dns_operation_state_from_sdk(None).is_err());
     }
 
     #[test]

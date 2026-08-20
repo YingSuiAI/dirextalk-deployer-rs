@@ -125,6 +125,36 @@ impl<E: CommandExecutor> DaemonController<E> {
         self.doctor().await
     }
 
+    /// Removes the service and verifies that it is no longer installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns redacted evidence when removal or verification fails.
+    pub async fn uninstall(&self) -> Result<DaemonEvidence, ConnectError> {
+        let status = self.status().await?;
+        if status.state == DaemonState::NotInstalled {
+            return Ok(status);
+        }
+        let uninstall = self
+            .run(vec![
+                "daemon".into(),
+                "uninstall".into(),
+                "--service-name".into(),
+                self.service_id.clone().into(),
+            ])
+            .await?;
+        if uninstall.exit_code != Some(0) {
+            return Err(self.failure("daemon uninstall", &uninstall));
+        }
+        let status = self.status().await?;
+        if status.state != DaemonState::NotInstalled {
+            return Err(ConnectError::Daemon(
+                "daemon remains installed after uninstall".into(),
+            ));
+        }
+        Ok(status)
+    }
+
     /// Runs fixed status argv and classifies its output.
     ///
     /// # Errors
@@ -385,5 +415,38 @@ mod tests {
         let error = controller.install().await.unwrap_err().to_string();
         assert!(error.contains("agent cli missing"));
         assert!(!error.contains("daemon-secret"));
+    }
+
+    #[tokio::test]
+    async fn uninstall_is_idempotent_and_uses_fixed_service_name() {
+        let executor = FakeExecutor {
+            outputs: Mutex::new(VecDeque::from([
+                output(0, "Status:    Running", ""),
+                output(0, "removed", ""),
+                output(0, "Not installed", ""),
+            ])),
+            commands: Mutex::new(Vec::new()),
+        };
+        let controller = DaemonController::new(
+            executor,
+            "/service/dirextalk-connect",
+            "/service/config.toml",
+            "node.example.com",
+            Redactor::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            controller.uninstall().await.unwrap().state,
+            DaemonState::NotInstalled
+        );
+        let commands = controller.executor.commands.lock().unwrap();
+        assert_eq!(
+            commands.as_slice(),
+            [
+                vec!["daemon", "status", "--service-name", "node.example.com"],
+                vec!["daemon", "uninstall", "--service-name", "node.example.com"],
+                vec!["daemon", "status", "--service-name", "node.example.com"],
+            ]
+        );
     }
 }

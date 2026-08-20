@@ -199,8 +199,9 @@ dirextalk-deployer deploy status --config <deployment.toml>
 ```
 
 The normal approved plan removes deployer-owned DNS, VM, firewall, address,
-subnet, and network resources while retaining the boot disk. Purging that disk
-requires its own numeric-id-bound plan and approval:
+subnet, and network resources, then uninstalls the service-scoped local Connect
+daemon, while retaining the boot disk. Purging that disk requires its own
+numeric-id-bound plan and approval:
 
 ```text
 dirextalk-deployer deploy destroy --config <deployment.toml> --purge-disk <numeric-disk-id>
