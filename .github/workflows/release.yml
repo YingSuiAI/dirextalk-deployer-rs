@@ -15,10 +15,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       SOURCE_REVISION: ${{ github.sha }}
-      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256 }}
-      DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
-      DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
-      DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256 }}
       DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX }}
       DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256 }}
       DIREXTALK_UPDATER_VERSION: ${{ vars.DIREXTALK_UPDATER_VERSION }}
@@ -46,15 +42,10 @@ jobs:
           manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
           test "${RELEASE_TAG}" = "v${manifest_version}"
 
-      - name: Require audited OAuth review and release trust root
+      - name: Require release trust root
         shell: bash
         run: |
           set -euo pipefail
-          scope_hash="$(printf '%s\n' \
-            installed-public-client loopback-redirect pkce-s256 openid \
-            https://www.googleapis.com/auth/cloud-platform | sha256sum | awk '{print $1}')"
-          test "${scope_hash}" = "${DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256}"
-          test "${DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED}" = true
           [[ "${DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX}" =~ ^[0-9a-f]{64}$ ]]
           test "${DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX}" != "$(printf '0%.0s' {1..64})"
           key_hash="$(python3 -c 'import hashlib, os; print(hashlib.sha256(bytes.fromhex(os.environ["DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX"])).hexdigest())')"
@@ -158,10 +149,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       SOURCE_REVISION: ${{ github.sha }}
-      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256 }}
-      DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
-      DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
-      DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256 }}
       DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX }}
       DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256 }}
       DIREXTALK_UPDATER_VERSION: ${{ vars.DIREXTALK_UPDATER_VERSION }}

@@ -20,9 +20,6 @@ COTURN_DIGEST = "e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346b
 HEX_40 = re.compile(r"[0-9a-f]{40}")
 HEX_64 = re.compile(r"[0-9a-f]{64}")
 VERSION = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
-GOOGLE_OAUTH_CLIENT_ID = re.compile(
-    rb"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com\n"
-)
 
 
 def fail(message: str) -> None:
@@ -40,17 +37,6 @@ def exact(value: str, pattern: re.Pattern[str], name: str) -> str:
     if not pattern.fullmatch(value) or set(value) == {"0"}:
         fail(f"{name} has an invalid immutable value")
     return value
-
-
-def product_oauth_client_id(repository_root: pathlib.Path) -> bytes:
-    path = repository_root / "crates/deployer-gcp/google-oauth-client-id.txt"
-    try:
-        source = path.read_bytes()
-    except OSError as error:
-        fail(f"source-owned Google OAuth client id could not be read: {error}")
-    if not GOOGLE_OAUTH_CLIENT_ID.fullmatch(source):
-        fail("source-owned Google OAuth client id has a non-canonical product identity")
-    return source[:-1]
 
 
 def updater_release_url(value: str, version: str) -> str:
@@ -111,27 +97,9 @@ def write_json(path: pathlib.Path, value: object, mode: int = 0o644) -> None:
     temporary_path.replace(path)
 
 
-def inputs(repository_root: pathlib.Path) -> dict[str, object]:
+def inputs() -> dict[str, object]:
     release = exact(required("RELEASE_TAG"), VERSION, "RELEASE_TAG")
     source_revision = exact(required("SOURCE_REVISION"), HEX_40, "SOURCE_REVISION")
-    audited_oauth_hash = exact(
-        required("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256"),
-        HEX_64,
-        "DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256",
-    )
-    oauth_hash = hashlib.sha256(product_oauth_client_id(repository_root)).hexdigest()
-    if oauth_hash != audited_oauth_hash:
-        fail("source-owned Google OAuth client id does not match its audited SHA-256")
-    oauth_audit_revision = exact(
-        required("DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION"),
-        HEX_40,
-        "DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION",
-    )
-    oauth_scope_hash = exact(
-        required("DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256"),
-        HEX_64,
-        "DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256",
-    )
     release_public_key = exact(
         required("DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX"),
         HEX_64,
@@ -147,8 +115,6 @@ def inputs(repository_root: pathlib.Path) -> dict[str, object]:
         != release_public_key_audit_hash
     ):
         fail("release Ed25519 public key does not match its audited SHA-256")
-    if required("DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED") != "true":
-        fail("DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED must be exactly true")
     updater_version = exact(
         required("DIREXTALK_UPDATER_VERSION"), VERSION, "DIREXTALK_UPDATER_VERSION"
     )
@@ -193,9 +159,6 @@ def inputs(repository_root: pathlib.Path) -> dict[str, object]:
     )
     return {
         "release": release,
-        "oauth_client_id_sha256": oauth_hash,
-        "oauth_consent_audit_revision": oauth_audit_revision,
-        "oauth_scope_review_sha256": oauth_scope_hash,
         "release_signing_public_key": release_public_key,
         "release_signing_public_key_audited_sha256": release_public_key_audit_hash,
         "source_revision": source_revision,
@@ -275,7 +238,7 @@ def main() -> None:
     parser.add_argument("--validate-only", action="store_true")
     arguments = parser.parse_args()
     repository_root = pathlib.Path(__file__).resolve().parent.parent
-    values = inputs(repository_root)
+    values = inputs()
     compose_path = repository_root / "runtime/docker-compose.yml"
     updater_unit_path = repository_root / "packaging/dirextalk-updater.service"
     helper_paths = {

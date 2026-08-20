@@ -31,10 +31,6 @@ allowlisted tag-and-digest image references.
 The tag workflow fails closed until release maintainers configure all of these
 GitHub variables with audited immutable values:
 
-- `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256`
-- `DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION`
-- `DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED` (exactly `true`)
-- `DIREXTALK_GOOGLE_OAUTH_SCOPE_REVIEWED_SHA256`
 - `DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX` and
   `DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_AUDITED_SHA256`
 - `DIREXTALK_UPDATER_VERSION`, `DIREXTALK_UPDATER_SOURCE_REVISION`,
@@ -42,28 +38,10 @@ GitHub variables with audited immutable values:
 - Message Server and Agent `VERSION`, `DIGEST`, and `SOURCE_REVISION` variables
   named in `.github/workflows/release.yml`
 
-The public Desktop OAuth client ID is not a variable or secret. Its only
-authoritative value is the source-controlled
-`crates/deployer-gcp/google-oauth-client-id.txt`, which is included directly in
-every CLI build. The release gate hashes that canonical source value, requires
-it to equal `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256`, and writes the
-derived hash into runtime provenance. Change the source artifact and its
-independently reviewed audit hash together; never accept an end-user, runtime,
-or build-environment override.
-
-The reviewed OAuth scope hash is SHA-256 over these newline-terminated lines in
-this exact order:
-
-```text
-installed-public-client
-loopback-redirect
-pkce-s256
-openid
-https://www.googleapis.com/auth/cloud-platform
-```
-
-This exact scope-review input hashes to
-`fa675cfc945cff1bba0f69617589fe3d867947d7af61e065926b320252d8e50e`.
+Local gcloud authentication state is intentionally excluded from release
+artifacts and provenance. Release provenance covers the signing trust root and
+immutable runtime/application inputs, not operator credentials or the isolated
+Dirextalk `CLOUDSDK_CONFIG`.
 
 The only release secret is
 `DIREXTALK_RELEASE_ED25519_SEED_HEX`: one raw 32-byte Ed25519 seed encoded as

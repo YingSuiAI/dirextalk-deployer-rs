@@ -4,6 +4,14 @@ All cloud mutation commands are dry unless an approval created by the current
 plan is supplied. Examples use portable paths and never place credentials in
 arguments.
 
+The official Google Cloud CLI is a prerequisite and the sole authentication
+broker. On Linux and WSL, install it from
+<https://cloud.google.com/sdk/docs/install-sdk#linux> and run `gcloud version`
+before using the deployer. The `auth` commands below run gcloud only
+against a private, isolated Dirextalk `CLOUDSDK_CONFIG`; they never reuse the
+operator's default configuration. Project inspection and resource lifecycle
+remain in-process API calls, not gcloud resource commands.
+
 ```text
 dirextalk-deployer auth login
 dirextalk-deployer auth status

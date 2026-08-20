@@ -117,9 +117,6 @@ def main() -> None:
     expected_provenance_fields = {
         "schema_version",
         "release",
-        "oauth_client_id_sha256",
-        "oauth_consent_audit_revision",
-        "oauth_scope_review_sha256",
         "release_signing_public_key",
         "release_signing_public_key_audited_sha256",
         "source_revision",

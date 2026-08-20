@@ -1,8 +1,10 @@
 # Dirextalk GCP Deployer
 
 `dirextalk-deployer` creates one fresh production Dirextalk node in an existing
-Google Cloud project. It uses built-in browser OAuth and in-process Google APIs;
-`gcloud`, AWS credentials, and the legacy Bash deployer are not used.
+Google Cloud project. The official installed `gcloud` CLI is its sole
+authentication broker. Cloud discovery, pricing, and resource lifecycle use
+in-process Google APIs; AWS credentials and the legacy Bash deployer are not
+used.
 
 The v0.1 contract is intentionally narrow: one Ubuntu 24.04 amd64 VM, one
 long-lived domain, and no migration or adoption of an existing node.
@@ -12,6 +14,9 @@ long-lived domain, and no migration or adoption of an existing node.
 You need:
 
 - a Google account with access to an existing, billing-enabled GCP project;
+- the official Google Cloud CLI, installed on Linux or WSL from the
+  [Google Cloud instructions](https://cloud.google.com/sdk/docs/install-sdk#linux)
+  and confirmed with `gcloud version`;
 - the required GCP APIs already enabled, plus permission to create the
   resources shown by the plan;
 - an existing long-lived domain and control of its DNS; and
@@ -34,8 +39,8 @@ before placing `dirextalk-deployer` on `PATH`.
 Each release also contains the bare Linux amd64 host installer, deterministic
 runtime bundle, and canonical Ed25519-signed runtime manifest. The outer release
 manifest binds their SHA-256 values, signing public key, application/updater
-source revisions, and audited OAuth configuration hash. Do not use a release
-with a missing or mismatched trust-chain field.
+source revisions, and immutable runtime inputs. Do not use a release with a
+missing or mismatched trust-chain field.
 
 The audited runtime-signing public key is compiled into each CLI. A key rotation
 therefore requires a new CLI release with an explicitly reviewed key identity;
@@ -49,9 +54,9 @@ are documented in [`packaging/README.md`](packaging/README.md).
 
 Copy [`examples/deployment.toml`](examples/deployment.toml) outside the source
 tree and replace every example value. Configuration version 1 rejects unknown
-fields. It contains identifiers and preferences only—never put OAuth tokens,
-Matrix or agent tokens, SSH private keys, the App initialization code, or other
-secrets in this file.
+fields. It contains identifiers and preferences only—never put gcloud
+credentials or access tokens, Matrix or agent tokens, SSH private keys, the App
+initialization code, or other secrets in this file.
 
 `release = "stable"` resolves to an exact stable release during planning. Use
 an exact supported release identifier when reproducibility requires a specific
@@ -73,19 +78,19 @@ dirextalk-deployer auth status
 dirextalk-deployer project inspect --project <project-id>
 ```
 
-`auth login` prints a clickable Google authorization URL and then tries to open
-it in the default browser. If the browser does not appear, open the printed URL
-manually while the CLI is still waiting. Complete Google authentication only in
-that browser. Do not paste authorization codes or tokens into chat,
-configuration, shell arguments, or issue reports. Tokens are kept in the
-operating-system credential facility, not deployment state.
-The product-owned OAuth client ID is compiled into the release; end users
-supply neither an OAuth client ID nor a client secret, and source builds do not
-read an OAuth client ID from the environment. Authorization requests only
-`openid` and Google Cloud access—never email, name, or profile scopes. The
-opaque Google subject is retained only for account continuity and is not
-emitted by CLI output.
-Use `dirextalk-deployer auth logout` to remove the local OAuth session.
+The `auth login`, `auth status`, and `auth logout` commands broker
+authentication through the official installed `gcloud` CLI. They always set a
+private, isolated Dirextalk `CLOUDSDK_CONFIG`; they neither read nor change the
+operator's default gcloud configuration. Complete any interactive Google sign-in
+only in the browser opened or named by gcloud, and never paste authorization
+codes or tokens into chat, configuration, shell arguments, or issue reports.
+Credentials remain in that restricted isolated gcloud configuration and are
+never copied into deployment state. `auth logout` removes the session from the
+isolated configuration only.
+
+Only authentication and broker identity cross the gcloud process boundary.
+Project discovery, pricing, planning, and resource lifecycle calls remain
+in-process API operations; the deployer does not run gcloud resource commands.
 
 ## Plan and apply
 

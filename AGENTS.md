@@ -7,12 +7,15 @@ cloud effects, host installation, local wiring, or destroy behavior.
 ## Product boundary
 
 - The only cloud is GCP. Do not add AWS dependencies, AWS state readers,
-  migrations, provider abstractions, compatibility shims, or `gcloud`
-  subprocesses.
-- Local cloud calls use built-in browser OAuth and in-process APIs. The target
-  host is Ubuntu 24.04 `linux/amd64` and receives a fixed one-shot Rust
-  installer; no runtime shell state machine or arbitrary remote command surface
-  is allowed.
+  migrations, provider abstractions, or compatibility shims.
+- The official installed `gcloud` CLI is the sole authentication broker. Run
+  it only with the deployer's private, isolated Dirextalk `CLOUDSDK_CONFIG`;
+  never inherit or mutate the operator's default gcloud configuration. GCP
+  discovery, pricing, and resource lifecycle calls remain in-process APIs; do
+  not use gcloud resource commands.
+- The target host is Ubuntu 24.04 `linux/amd64` and receives a fixed one-shot
+  Rust installer; no runtime shell state machine or arbitrary remote command
+  surface is allowed.
 - Existing paid GCP projects and existing long-lived domains are prerequisites.
   v0.1 does not create projects, link billing accounts, create DNS zones, or buy
   domains.
@@ -28,9 +31,10 @@ cloud effects, host installation, local wiring, or destroy behavior.
 - Before every sensitive cloud read/write/delete, SSH connection, retry, or
   postcondition, revalidate project number plus the strongest immutable
   resource identity available.
-- Never log or persist OAuth access/refresh tokens, Matrix tokens, agent tokens,
-  private keys, the App initialization code, or conversation content in state,
-  JSON/JSONL, or reports.
+- Never log or copy gcloud credentials or access tokens, Matrix tokens, agent
+  tokens, private keys, the App initialization code, or conversation content
+  into deployment state, JSON/JSONL, or reports. Restrict the isolated
+  Dirextalk `CLOUDSDK_CONFIG` to its owning user.
 - A dry plan never mutates GCP. Apply and destroy require the exact current
   SHA-256 plan approval.
 - Keep generated files under `~/.dirextalk/nodes/<service_id>/`, use atomic
@@ -50,4 +54,3 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo run --locked -p deployer-cli -- --help
 git diff --check
 ```
-

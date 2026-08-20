@@ -14,9 +14,9 @@ disk.
 ## Public behavior
 
 The CLI command and exit-code contract is frozen in `COMMANDS.md`. A plan binds
-the canonical deployment spec, OAuth principal, project id and number,
-location, observed DNS, exact stable release, cost estimate, resource effects,
-and any explicit DNS overwrite. Apply accepts only that plan digest.
+the canonical deployment spec, gcloud-brokered Google principal, project id and
+number, location, observed DNS, exact stable release, cost estimate, resource
+effects, and any explicit DNS overwrite. Apply accepts only that plan digest.
 
 Configuration schema version 1 contains deployment name, project id, region,
 zone, domain, DNS mode (`auto`, `cloud_dns`, or `external`), machine type,
@@ -27,8 +27,15 @@ State lives under `~/.dirextalk/nodes/<service_id>/state.json`. It is sealed,
 locked, and atomically replaced. It records project identity, phase,
 `PendingEffect`, exact release, GCP resource references, SSH host identity,
 host receipt, redacted local-wiring status, and integrity digest. Secrets live
-only in OS credentials or restrictive credential files and are excluded from
+only in their owning restrictive credential stores and are excluded from
 state, reports, stdout, and JSONL.
+
+The official installed `gcloud` CLI is the sole authentication broker and runs
+with a private, isolated Dirextalk `CLOUDSDK_CONFIG`. The deployer never reads
+or changes the operator's default gcloud configuration. Only authentication
+and broker identity operations cross that process boundary; GCP discovery,
+pricing, and resource lifecycle use in-process APIs. The product has no OAuth
+client, consent-screen, or scope-review configuration of its own.
 
 ## Effects and identity
 
