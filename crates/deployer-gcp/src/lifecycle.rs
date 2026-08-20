@@ -26,7 +26,7 @@ pub enum OperationScope {
     Global,
     Region(String),
     Zone(String),
-    DnsZone(String),
+    DnsZone(DnsZoneIdentity),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,8 +259,35 @@ pub struct DnsRecordSet {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct DnsZoneIdentity {
+    pub project_id: String,
+    pub name: String,
+    pub numeric_id: String,
+}
+
+pub fn validate_dns_zone_identity(
+    expected: &DnsZoneIdentity,
+    observed: &DnsZoneIdentity,
+) -> Result<()> {
+    validate_dns_zone_reference(expected, &expected.project_id)?;
+    if expected != observed {
+        return Err(GcpError::Contract(format!(
+            "Cloud DNS managed zone identity changed: expected {}/{}, numeric id {}; observed {}/{}, numeric id {}",
+            expected.project_id,
+            expected.name,
+            expected.numeric_id,
+            observed.project_id,
+            observed.name,
+            observed.numeric_id
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DnsChange {
-    pub managed_zone: String,
+    pub managed_zone: DnsZoneIdentity,
     pub expected_current: Option<DnsRecordSet>,
     pub additions: Vec<DnsRecordSet>,
     pub deletions: Vec<DnsRecordSet>,
@@ -304,6 +331,13 @@ pub trait GcpLifecycle: Send + Sync {
         request_id: Uuid,
         spec: &InstanceSpec,
     ) -> Result<Operation>;
+    async fn get_dns_record_set(
+        &self,
+        project_number: &str,
+        zone: &DnsZoneIdentity,
+        name: &str,
+        record_type: &str,
+    ) -> Result<Option<DnsRecordSet>>;
     async fn start_dns_change(
         &self,
         project_number: &str,
@@ -578,17 +612,16 @@ impl GcpLifecycle for GoogleRestClient {
         request_id: Uuid,
         change: &DnsChange,
     ) -> Result<Option<Operation>> {
-        validate_name(&change.managed_zone)?;
+        validate_dns_zone_reference(&change.managed_zone, &self.project_id)?;
         validate_dns_change(change)?;
-        self.revalidate_project(project_number).await?;
         let record = change
             .additions
             .first()
             .or_else(|| change.deletions.first())
             .expect("validated DNS change has one record");
-        let current = crate::GcpDiscovery::dns_record_set(
+        let current = GcpLifecycle::get_dns_record_set(
             self,
-            &self.project_id,
+            project_number,
             &change.managed_zone,
             &record.name,
             "A",
@@ -598,9 +631,10 @@ impl GcpLifecycle for GoogleRestClient {
             return Ok(None);
         }
         self.revalidate_project(project_number).await?;
+        self.revalidate_dns_zone(&change.managed_zone).await?;
         let base_url = Url::parse(&format!(
             "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes",
-            self.project_id, change.managed_zone
+            self.project_id, change.managed_zone.name
         ))?;
         let mut url = base_url.clone();
         url.query_pairs_mut()
@@ -634,6 +668,20 @@ impl GcpLifecycle for GoogleRestClient {
         }
     }
 
+    async fn get_dns_record_set(
+        &self,
+        project_number: &str,
+        zone: &DnsZoneIdentity,
+        name: &str,
+        record_type: &str,
+    ) -> Result<Option<DnsRecordSet>> {
+        validate_dns_zone_reference(zone, &self.project_id)?;
+        self.revalidate_project(project_number).await?;
+        self.revalidate_dns_zone(zone).await?;
+        crate::GcpDiscovery::dns_record_set(self, &zone.project_id, &zone.name, name, record_type)
+            .await
+    }
+
     async fn poll_operation(
         &self,
         project_number: &str,
@@ -642,7 +690,8 @@ impl GcpLifecycle for GoogleRestClient {
         self.assert_operation_identity(project_number, operation)?;
         let operation_url = validate_operation_self_link(operation, &self.project_id)?;
         self.revalidate_project(project_number).await?;
-        if matches!(operation.scope, OperationScope::DnsZone(_)) {
+        if let OperationScope::DnsZone(zone) = &operation.scope {
+            self.revalidate_dns_zone(zone).await?;
             let change: DnsChangeWire = self.get(operation_url).await?;
             if change.id != operation.name {
                 return Err(GcpError::Contract(
@@ -756,6 +805,29 @@ impl GcpLifecycle for GoogleRestClient {
 }
 
 impl GoogleRestClient {
+    async fn revalidate_dns_zone(&self, expected: &DnsZoneIdentity) -> Result<()> {
+        #[derive(Deserialize)]
+        struct ManagedZone {
+            name: String,
+            id: String,
+        }
+
+        validate_dns_zone_reference(expected, &self.project_id)?;
+        let url = Url::parse(&format!(
+            "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}",
+            expected.project_id, expected.name
+        ))?;
+        let zone: ManagedZone = self.get(url).await?;
+        validate_dns_zone_identity(
+            expected,
+            &DnsZoneIdentity {
+                project_id: expected.project_id.clone(),
+                name: zone.name,
+                numeric_id: zone.id,
+            },
+        )
+    }
+
     async fn start_compute(
         &self,
         project_number: &str,
@@ -1053,17 +1125,16 @@ impl GcpLifecycle for GoogleCloudClient {
         request_id: Uuid,
         change: &DnsChange,
     ) -> Result<Option<Operation>> {
-        validate_name(&change.managed_zone)?;
+        validate_dns_zone_reference(&change.managed_zone, &self.project_id)?;
         validate_dns_change(change)?;
-        self.revalidate_project(project_number).await?;
         let record = change
             .additions
             .first()
             .or_else(|| change.deletions.first())
             .expect("validated DNS record");
-        let current = crate::GcpDiscovery::dns_record_set(
+        let current = GcpLifecycle::get_dns_record_set(
             self,
-            &self.project_id,
+            project_number,
             &change.managed_zone,
             &record.name,
             "A",
@@ -1073,6 +1144,7 @@ impl GcpLifecycle for GoogleCloudClient {
             return Ok(None);
         }
         self.revalidate_project(project_number).await?;
+        self.revalidate_dns_zone(&change.managed_zone).await?;
         let convert = |record: &DnsRecordSet| {
             let mut value = google_cloud_dns_v1::model::ResourceRecordSet::new()
                 .set_name(&record.name)
@@ -1088,7 +1160,7 @@ impl GcpLifecycle for GoogleCloudClient {
             .dns_changes
             .create()
             .set_project(&self.project_id)
-            .set_managed_zone(&change.managed_zone)
+            .set_managed_zone(&change.managed_zone.name)
             .set_client_operation_id(request_id.to_string())
             .set_body(body)
             .send()
@@ -1101,11 +1173,25 @@ impl GcpLifecycle for GoogleCloudClient {
             name: id.clone(),
             self_link: format!(
                 "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes/{id}",
-                self.project_id, change.managed_zone
+                self.project_id, change.managed_zone.name
             ),
             project_number: project_number.into(),
             scope: OperationScope::DnsZone(change.managed_zone.clone()),
         }))
+    }
+
+    async fn get_dns_record_set(
+        &self,
+        project_number: &str,
+        zone: &DnsZoneIdentity,
+        name: &str,
+        record_type: &str,
+    ) -> Result<Option<DnsRecordSet>> {
+        validate_dns_zone_reference(zone, &self.project_id)?;
+        self.revalidate_project(project_number).await?;
+        self.revalidate_dns_zone(zone).await?;
+        crate::GcpDiscovery::dns_record_set(self, &zone.project_id, &zone.name, name, record_type)
+            .await
     }
 
     async fn poll_operation(
@@ -1117,11 +1203,12 @@ impl GcpLifecycle for GoogleCloudClient {
         validate_operation_self_link(operation, &self.project_id)?;
         self.revalidate_project(project_number).await?;
         if let OperationScope::DnsZone(zone) = &operation.scope {
+            self.revalidate_dns_zone(zone).await?;
             let response = self
                 .dns_changes
                 .get()
                 .set_project(&self.project_id)
-                .set_managed_zone(zone)
+                .set_managed_zone(&zone.name)
                 .set_change_id(&operation.name)
                 .send()
                 .await
@@ -1290,6 +1377,31 @@ impl GcpLifecycle for GoogleCloudClient {
 }
 
 impl GoogleCloudClient {
+    async fn revalidate_dns_zone(&self, expected: &DnsZoneIdentity) -> Result<()> {
+        validate_dns_zone_reference(expected, &self.project_id)?;
+        let zone = self
+            .dns_zones
+            .get()
+            .set_project(&expected.project_id)
+            .set_managed_zone(&expected.name)
+            .send()
+            .await
+            .map_err(crate::official::official_error)?;
+        let observed = DnsZoneIdentity {
+            project_id: expected.project_id.clone(),
+            name: zone.name.ok_or_else(|| {
+                GcpError::Infrastructure("Cloud DNS managed zone omitted name".into())
+            })?,
+            numeric_id: zone
+                .id
+                .ok_or_else(|| {
+                    GcpError::Infrastructure("Cloud DNS managed zone omitted numeric id".into())
+                })?
+                .to_string(),
+        };
+        validate_dns_zone_identity(expected, &observed)
+    }
+
     async fn revalidate_project(&self, expected_project_number: &str) -> Result<()> {
         if expected_project_number != self.project_number {
             return Err(GcpError::Contract(
@@ -1887,8 +1999,8 @@ fn validate_operation_self_link(operation: &Operation, project_id: &str) -> Resu
             operation.name
         ),
         OperationScope::DnsZone(zone) => format!(
-            "/projects/{project_id}/managedZones/{zone}/changes/{}",
-            operation.name
+            "/projects/{project_id}/managedZones/{}/changes/{}",
+            zone.name, operation.name
         ),
     };
     let observed = match &operation.scope {
@@ -2002,6 +2114,23 @@ fn validate_name(value: &str) -> Result<()> {
             "invalid GCP resource name {value:?}"
         )))
     }
+}
+
+fn validate_dns_zone_reference(zone: &DnsZoneIdentity, project_id: &str) -> Result<()> {
+    validate_name(&zone.name)?;
+    if zone.project_id != project_id
+        || zone
+            .numeric_id
+            .parse::<u64>()
+            .ok()
+            .is_none_or(|numeric_id| numeric_id == 0)
+    {
+        return Err(GcpError::Contract(
+            "Cloud DNS managed zone must bind the exact project, name, and nonzero numeric id"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ssh(username: &str, public_key: &str) -> Result<()> {
@@ -2295,6 +2424,26 @@ mod tests {
         delete_calls: Mutex<usize>,
     }
 
+    struct DnsReplacementTransport {
+        zone_id: Mutex<u64>,
+        replace_after_record_read: bool,
+        record_calls: Mutex<usize>,
+        change_calls: Mutex<usize>,
+        poll_calls: Mutex<usize>,
+    }
+
+    impl DnsReplacementTransport {
+        fn new(zone_id: u64, replace_after_record_read: bool) -> Self {
+            Self {
+                zone_id: Mutex::new(zone_id),
+                replace_after_record_read,
+                record_calls: Mutex::new(0),
+                change_calls: Mutex::new(0),
+                poll_calls: Mutex::new(0),
+            }
+        }
+    }
+
     #[async_trait]
     impl HttpTransport for DeleteTransport {
         async fn request(
@@ -2348,6 +2497,72 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl HttpTransport for DnsReplacementTransport {
+        async fn request(
+            &self,
+            method: Method,
+            url: Url,
+            _bearer_token: &SecretString,
+            _body: Option<Value>,
+        ) -> Result<RestResponse> {
+            if url.host_str() == Some("cloudresourcemanager.googleapis.com") {
+                return Ok(RestResponse {
+                    status: 200,
+                    body: serde_json::to_vec(
+                        &json!({ "projectNumber": "123", "lifecycleState": "ACTIVE" }),
+                    )
+                    .expect("project JSON"),
+                });
+            }
+            if url.path().ends_with("/managedZones/example") {
+                let id = *self.zone_id.lock().expect("zone id lock");
+                return Ok(RestResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({ "name": "example", "id": id.to_string() }))
+                        .expect("zone JSON"),
+                });
+            }
+            if method == Method::GET && url.path().ends_with("/rrsets") {
+                *self.record_calls.lock().expect("record calls lock") += 1;
+                if self.replace_after_record_read {
+                    *self.zone_id.lock().expect("zone id lock") = 101;
+                }
+                return Ok(RestResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({
+                        "rrsets": [{
+                            "name": "node.example.com.",
+                            "type": "A",
+                            "ttl": 300,
+                            "rrdatas": ["203.0.113.10"]
+                        }]
+                    }))
+                    .expect("record JSON"),
+                });
+            }
+            if method == Method::POST && url.path().ends_with("/changes") {
+                *self.change_calls.lock().expect("change calls lock") += 1;
+                return Ok(RestResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({ "id": "7", "status": "pending" }))
+                        .expect("change JSON"),
+                });
+            }
+            if method == Method::GET && url.path().contains("/changes/") {
+                *self.poll_calls.lock().expect("poll calls lock") += 1;
+                return Ok(RestResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({ "id": "7", "status": "done" }))
+                        .expect("poll JSON"),
+                });
+            }
+            Err(GcpError::Infrastructure(format!(
+                "unexpected fake DNS request {method} {url}"
+            )))
+        }
+    }
+
     fn instance_identity(deployment_uuid: Uuid) -> ResourceIdentity {
         ResourceIdentity {
             kind: ResourceKind::Instance,
@@ -2376,6 +2591,23 @@ mod tests {
             transport.clone(),
         );
         (client, transport, instance_identity(deployment_uuid))
+    }
+
+    fn dns_client(
+        zone_id: u64,
+        replace_after_record_read: bool,
+    ) -> (GoogleRestClient, Arc<DnsReplacementTransport>) {
+        let transport = Arc::new(DnsReplacementTransport::new(
+            zone_id,
+            replace_after_record_read,
+        ));
+        let client = GoogleRestClient::with_transport(
+            "test-project",
+            "123",
+            SecretString::from("access-token"),
+            transport.clone(),
+        );
+        (client, transport)
     }
 
     #[async_trait]
@@ -2409,6 +2641,14 @@ mod tests {
 
     fn operation_wire(status: &str, error: Option<OperationErrorWire>) -> OperationState {
         OperationState::from_wire(status, error).expect("known status")
+    }
+
+    fn dns_zone_identity(numeric_id: &str) -> DnsZoneIdentity {
+        DnsZoneIdentity {
+            project_id: "test-project".into(),
+            name: "example".into(),
+            numeric_id: numeric_id.into(),
+        }
     }
 
     #[test]
@@ -2534,7 +2774,7 @@ mod tests {
             rrdatas: vec!["203.0.113.10".into()],
         };
         let change = DnsChange {
-            managed_zone: "example".into(),
+            managed_zone: dns_zone_identity("100"),
             expected_current: Some(owned.clone()),
             additions: vec![],
             deletions: vec![owned.clone()],
@@ -2553,6 +2793,72 @@ mod tests {
                 .expect("owned old value may be changed")
         );
         assert!(dns_change_already_satisfied(&change, None).expect("absence is desired"));
+    }
+
+    #[tokio::test]
+    async fn dns_record_read_rejects_same_name_zone_replacement() {
+        let (client, transport) = dns_client(101, false);
+
+        let error = GcpLifecycle::get_dns_record_set(
+            &client,
+            "123",
+            &dns_zone_identity("100"),
+            "node.example.com.",
+            "A",
+        )
+        .await
+        .expect_err("replacement must fail before the record read");
+
+        assert!(matches!(error, GcpError::Contract(_)));
+        assert_eq!(*transport.record_calls.lock().expect("record calls"), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_change_revalidates_zone_again_immediately_before_create() {
+        let (client, transport) = dns_client(100, true);
+        let old = DnsRecordSet {
+            name: "node.example.com.".into(),
+            record_type: "A".into(),
+            ttl: 300,
+            rrdatas: vec!["203.0.113.10".into()],
+        };
+        let change = DnsChange {
+            managed_zone: dns_zone_identity("100"),
+            expected_current: Some(old.clone()),
+            additions: vec![DnsRecordSet {
+                rrdatas: vec!["203.0.113.11".into()],
+                ..old.clone()
+            }],
+            deletions: vec![old],
+        };
+
+        let error = client
+            .start_dns_change("123", Uuid::new_v4(), &change)
+            .await
+            .expect_err("replacement must fail before change creation");
+
+        assert!(matches!(error, GcpError::Contract(_)));
+        assert_eq!(*transport.record_calls.lock().expect("record calls"), 1);
+        assert_eq!(*transport.change_calls.lock().expect("change calls"), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_poll_rejects_same_name_zone_replacement() {
+        let (client, transport) = dns_client(101, false);
+        let operation = Operation {
+            name: "7".into(),
+            self_link: "https://dns.googleapis.com/dns/v1/projects/test-project/managedZones/example/changes/7".into(),
+            project_number: "123".into(),
+            scope: OperationScope::DnsZone(dns_zone_identity("100")),
+        };
+
+        let error = client
+            .poll_operation("123", &operation)
+            .await
+            .expect_err("replacement must fail before operation polling");
+
+        assert!(matches!(error, GcpError::Contract(_)));
+        assert_eq!(*transport.poll_calls.lock().expect("poll calls"), 0);
     }
 
     #[tokio::test]
@@ -2714,7 +3020,7 @@ mod tests {
             ..old.clone()
         };
         let change = DnsChange {
-            managed_zone: "example".into(),
+            managed_zone: dns_zone_identity("100"),
             expected_current: Some(old.clone()),
             additions: vec![new.clone()],
             deletions: vec![old.clone()],
