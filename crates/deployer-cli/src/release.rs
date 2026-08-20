@@ -50,21 +50,14 @@ pub trait ReleaseCatalog: Send + Sync {
 
 pub struct GithubReleaseCatalog {
     client: reqwest::Client,
-    audited_public_key: String,
+    audited_public_key: Option<&'static str>,
 }
 
 impl GithubReleaseCatalog {
     pub fn new() -> Result<Self> {
         crate::ensure_tls_provider();
         let audited_public_key = option_env!("DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX")
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                EngineError::Backend("release build omitted the audited Ed25519 public key".into())
-            })?
-            .to_owned();
-        decode_hex::<32>(&audited_public_key).map_err(|()| {
-            EngineError::Backend("embedded release Ed25519 public key is invalid".into())
-        })?;
+            .filter(|value| !value.is_empty());
         let client = reqwest::Client::builder()
             .https_only(true)
             .user_agent(concat!("dirextalk-deployer/", env!("CARGO_PKG_VERSION")))
@@ -74,6 +67,16 @@ impl GithubReleaseCatalog {
             client,
             audited_public_key,
         })
+    }
+
+    fn release_public_key(&self) -> Result<String> {
+        let key = self.audited_public_key.ok_or_else(|| {
+            EngineError::Backend("release build omitted the audited Ed25519 public key".into())
+        })?;
+        decode_hex::<32>(key).map_err(|()| {
+            EngineError::Backend("embedded release Ed25519 public key is invalid".into())
+        })?;
+        Ok(key.to_owned())
     }
 
     async fn publication(&self, selection: &ReleaseSelection) -> Result<GithubRelease> {
@@ -167,13 +170,14 @@ impl GithubReleaseCatalog {
 #[async_trait]
 impl ReleaseCatalog for GithubReleaseCatalog {
     async fn resolve(&self, selection: &ReleaseSelection) -> Result<ResolvedRelease> {
+        let audited_public_key = self.release_public_key()?;
         let publication = self.publication(selection).await?;
         let outer_asset = unique_asset(&publication.assets, "release-manifest.json")?;
         validate_url(outer_asset, &publication.tag_name)?;
         let outer_bytes = self.download(outer_asset, MAX_MANIFEST).await?;
         let outer: ReleaseManifest = serde_json::from_slice(&outer_bytes)
             .map_err(|_| EngineError::Backend("release manifest is invalid".into()))?;
-        validate_outer(&outer, &publication.tag_name, &self.audited_public_key)?;
+        validate_outer(&outer, &publication.tag_name, &audited_public_key)?;
 
         let installer_name = format!(
             "dirextalk-host-installer-{}-linux-amd64",
@@ -211,7 +215,7 @@ impl ReleaseCatalog for GithubReleaseCatalog {
             .download(&signed_manifest.github, MAX_SIGNED_MANIFEST)
             .await?;
         signed_manifest.verify(&signed_bytes)?;
-        let signed = verify_signed(&signed_bytes, &self.audited_public_key, &outer.release)?;
+        let signed = verify_signed(&signed_bytes, &audited_public_key, &outer.release)?;
         validate_signed(&signed.manifest, &outer)?;
 
         Ok(ResolvedRelease {
@@ -224,7 +228,7 @@ impl ReleaseCatalog for GithubReleaseCatalog {
             bundle,
             signed_manifest,
             updater: updater_identity(&outer.runtime_bundle.provenance.updater)?,
-            signing_public_key: self.audited_public_key.clone(),
+            signing_public_key: audited_public_key,
         })
     }
 
