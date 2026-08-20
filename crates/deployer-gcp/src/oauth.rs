@@ -1,4 +1,4 @@
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Write as _};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use url::Url;
 use crate::{GcpError, Result, SecretStore};
 
 const REFRESH_TOKEN_ACCOUNT: &str = "google-oauth-refresh-token";
+const MAX_CALLBACK_HEADER_BYTES: usize = 8192;
 
 #[derive(Debug, Clone)]
 pub struct InstalledAppConfig {
@@ -444,26 +445,75 @@ fn receive_callback(listener: &TcpListener, timeout: Duration) -> Result<String>
     }
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut buffer = [0_u8; 8192];
-    let count = stream.read(&mut buffer)?;
-    let request = std::str::from_utf8(&buffer[..count])
+    let bytes = read_callback_headers(&mut stream)?;
+    let request = std::str::from_utf8(&bytes)
         .map_err(|_| GcpError::OAuthValidation("callback was not valid HTTP".into()))?;
-    let first_line = request.lines().next().unwrap_or_default();
+    let mut lines = request
+        .strip_suffix("\r\n\r\n")
+        .unwrap_or(request)
+        .split("\r\n");
+    let first_line = lines.next().unwrap_or_default();
     let mut parts = first_line.split_whitespace();
-    if parts.next() != Some("GET") {
+    if parts.next() != Some("GET")
+        || parts.next().is_none()
+        || !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+        || parts.next().is_some()
+    {
         return Err(GcpError::OAuthValidation(
-            "callback method was not GET".into(),
+            "callback request line was invalid".into(),
         ));
     }
-    let target = parts
-        .next()
-        .ok_or_else(|| GcpError::OAuthValidation("callback target was missing".into()))?;
+    let target = first_line
+        .split_whitespace()
+        .nth(1)
+        .expect("validated request line has a target");
+    if lines.any(|line| {
+        line.split_once(':')
+            .is_none_or(|(name, _)| name.is_empty() || name.contains([' ', '\t']))
+    }) {
+        return Err(GcpError::OAuthValidation(
+            "callback headers were malformed".into(),
+        ));
+    }
     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: 55\r\n\r\nAuthorization received. You may close this browser window.")?;
     Ok(target.to_owned())
 }
 
+fn read_callback_headers(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let remaining = MAX_CALLBACK_HEADER_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(GcpError::OAuthValidation(
+                "callback headers exceeded the size limit".into(),
+            ));
+        }
+        let read_limit = remaining.min(chunk.len());
+        let count = reader.read(&mut chunk[..read_limit])?;
+        if count == 0 {
+            return Err(GcpError::OAuthValidation(
+                "callback headers were incomplete".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let end = position + 4;
+            if bytes[end..].iter().any(|byte| !byte.is_ascii_whitespace()) {
+                return Err(GcpError::OAuthValidation(
+                    "callback contained unexpected trailing data".into(),
+                ));
+            }
+            bytes.truncate(end);
+            return Ok(bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::io::Read;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -473,7 +523,7 @@ mod tests {
 
     use super::{
         BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, OAuthToken, TokenFlow,
-        TokenResponse, UserInfo, validate_user_info,
+        TokenResponse, UserInfo, read_callback_headers, validate_user_info,
     };
     use crate::{GcpError, Result, SecretStore};
 
@@ -481,6 +531,25 @@ mod tests {
     impl BrowserLauncher for NoBrowser {
         fn open(&self, _url: &Url) -> Result<()> {
             Ok(())
+        }
+    }
+
+    struct FragmentedReader {
+        fragments: VecDeque<Vec<u8>>,
+    }
+
+    impl Read for FragmentedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(mut fragment) = self.fragments.pop_front() else {
+                return Ok(0);
+            };
+            let count = fragment.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&fragment[..count]);
+            if count < fragment.len() {
+                fragment.drain(..count);
+                self.fragments.push_front(fragment);
+            }
+            Ok(count)
         }
     }
     struct NoSecrets;
@@ -608,6 +677,32 @@ mod tests {
         );
         let duplicate = format!("/oauth/callback?state={state}&state={state}&code=one-time-code");
         assert!(GoogleInstalledApp::validate_callback(&duplicate, &request).is_err());
+    }
+
+    #[test]
+    fn callback_headers_may_arrive_fragmented_but_not_pipelined() {
+        let mut fragmented = FragmentedReader {
+            fragments: [
+                b"GET /oauth/call".to_vec(),
+                b"back?state=s&code=c HTTP/1.1\r\nHo".to_vec(),
+                b"st: 127.0.0.1\r\n\r\n".to_vec(),
+            ]
+            .into(),
+        };
+        let headers = read_callback_headers(&mut fragmented).expect("fragmented headers");
+        assert_eq!(
+            headers,
+            b"GET /oauth/callback?state=s&code=c HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        );
+
+        let mut pipelined = FragmentedReader {
+            fragments: [
+                b"GET /oauth/callback HTTP/1.1\r\n\r\nGET /again HTTP/1.1\r\n\r\n".to_vec(),
+            ]
+            .into(),
+        };
+        let error = read_callback_headers(&mut pipelined).expect_err("trailing request must fail");
+        assert!(matches!(error, GcpError::OAuthValidation(_)));
     }
 
     #[test]
