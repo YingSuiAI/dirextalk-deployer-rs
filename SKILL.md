@@ -59,22 +59,28 @@ run apply or an approved destroy.
    must fail closed when local Agent detection is ambiguous or unknown; resolve
    the ambiguity or use one exact supported Agent name instead of guessing.
 2. Run `auth login`, let the operator finish gcloud-brokered authentication only
-   in Google's browser, then use `auth status` and `project inspect` to verify
-   authentication and immutable project identity.
-3. Run `deploy plan --config <deployment.toml>`. Review identity, location,
+   at the URL printed by gcloud or in its browser, then use `auth status` and
+   `project inspect` to verify authentication and immutable project identity.
+3. Run `project prepare --project <project-id>` without approval. Review the
+   complete fixed prerequisite service set, the missing enable effects, and
+   project identity. Only after authorization, rerun it with the exact current
+   `--approve sha256:<plan-id>`. Preserve its project state and use the same
+   command and digest to resume an interruption; never substitute arbitrary
+   services or gcloud resource commands.
+4. Run `deploy plan --config <deployment.toml>`. Review identity, location,
    DNS, exact release, estimate, and effects.
-4. Only after authorization, run `deploy apply` with the unchanged config and
+5. Only after authorization, run `deploy apply` with the unchanged config and
    its exact `sha256:<plan-id>` approval digest.
-5. On interruption, preserve state, inspect `deploy status`, and run
+6. On interruption, preserve state, inspect `deploy status`, and run
    `deploy resume` for the same config. Never retry a mutation by resource name
    or create a same-name replacement.
-6. When external DNS is required, give the operator only the displayed A
+7. When external DNS is required, give the operator only the displayed A
    record, wait for propagation, and resume. A conflicting record requires a
    new plan and approval.
-7. Run `deploy verify`, then `connect install`, `connect status`, and
+8. Run `deploy verify`, then `connect install`, `connect status`, and
    `connect doctor` when `install_connect = true`. Verification must remain
    read-only and must not send normal chat.
-8. To stop the node, run unapproved `deploy destroy` to obtain the destroy
+9. To stop the node, run unapproved `deploy destroy` to obtain the destroy
    plan, explain retained resources, then use its exact digest only after
    authorization. Confirm deletion with status and GCP read-back.
 

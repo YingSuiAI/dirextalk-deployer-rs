@@ -4,6 +4,14 @@ use url::Url;
 
 use crate::{DnsRecordSet, GcpError, GoogleRestClient, Result};
 
+pub const GCP_V01_REQUIRED_SERVICES: [&str; 5] = [
+    "serviceusage.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "cloudbilling.googleapis.com",
+    "compute.googleapis.com",
+    "dns.googleapis.com",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectStatus {
     pub project_id: String,
@@ -33,16 +41,10 @@ pub struct RequiredService {
 impl RequiredService {
     #[must_use]
     pub fn gcp_v01() -> Vec<Self> {
-        [
-            "cloudbilling.googleapis.com",
-            "cloudresourcemanager.googleapis.com",
-            "compute.googleapis.com",
-            "dns.googleapis.com",
-            "serviceusage.googleapis.com",
-        ]
-        .into_iter()
-        .map(|name| Self { name: name.into() })
-        .collect()
+        GCP_V01_REQUIRED_SERVICES
+            .into_iter()
+            .map(|name| Self { name: name.into() })
+            .collect()
     }
 }
 

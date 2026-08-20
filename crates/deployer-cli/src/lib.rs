@@ -8,6 +8,7 @@ mod host_mcp;
 mod live_product;
 pub mod output;
 pub mod product;
+pub mod project_prepare;
 pub mod release;
 pub mod runtime;
 pub mod store;

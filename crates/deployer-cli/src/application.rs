@@ -18,6 +18,7 @@ use crate::engine::{
     Result as EngineResult, build_plan,
 };
 use crate::output::CommandEnvelope;
+use crate::project_prepare::ProjectPreparationOutcome;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SafeResult {
@@ -43,6 +44,11 @@ pub trait ControlPlane: DeploymentBackend {
     async fn auth_logout(&self) -> EngineResult<SafeResult>;
     async fn project_list(&self) -> EngineResult<SafeResult>;
     async fn project_inspect(&self, project_id: &str) -> EngineResult<SafeResult>;
+    async fn project_prepare(
+        &self,
+        project_id: &str,
+        approval: Option<&PlanDigest>,
+    ) -> EngineResult<ProjectPreparationOutcome>;
     async fn connect_status(
         &self,
         config: &DeploymentConfig,
@@ -100,15 +106,28 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                 };
                 success(command_name(cli), result)
             }
-            TopLevelCommand::Project(project) => {
-                let result = match &project.command {
-                    ProjectCommand::List => self.control.project_list().await?,
-                    ProjectCommand::Inspect(args) => {
-                        self.control.project_inspect(&args.project).await?
-                    }
-                };
-                success(command_name(cli), result)
-            }
+            TopLevelCommand::Project(project) => match &project.command {
+                ProjectCommand::List => {
+                    success(command_name(cli), self.control.project_list().await?)
+                }
+                ProjectCommand::Inspect(args) => success(
+                    command_name(cli),
+                    self.control.project_inspect(&args.project).await?,
+                ),
+                ProjectCommand::Prepare(args) => {
+                    let approval = args
+                        .approve
+                        .as_deref()
+                        .map(str::parse::<PlanDigest>)
+                        .transpose()?;
+                    project_prepare_envelope(
+                        command_name(cli),
+                        self.control
+                            .project_prepare(&args.project, approval.as_ref())
+                            .await?,
+                    )
+                }
+            },
             TopLevelCommand::Deploy(deploy) => match &deploy.command {
                 DeployCommand::Plan(args) => {
                     let config = load_config(&args.config)?;
@@ -299,6 +318,50 @@ fn success(command: &str, result: SafeResult) -> EngineResult<CommandEnvelope> {
         .map_err(|_| EngineError::Backend("command output could not be encoded".into()))
 }
 
+fn project_prepare_envelope(
+    command: &str,
+    outcome: ProjectPreparationOutcome,
+) -> EngineResult<CommandEnvelope> {
+    match outcome {
+        ProjectPreparationOutcome::ApprovalRequired {
+            plan_id,
+            project_id,
+            project_number,
+            required_services,
+            enable_services,
+        } => CommandEnvelope::waiting(
+            command,
+            "PROJECT_PREPARE_APPROVAL_REQUIRED",
+            "Review the exact missing-service plan and approve its SHA-256 digest.",
+        )
+        .with_data(json!({
+            "plan_id": plan_id,
+            "plan": {
+                "project_id": project_id,
+                "project_number": project_number,
+                "required_services": required_services,
+                "enable_services": enable_services,
+            }
+        }))
+        .map_err(|_| EngineError::Backend("project plan output could not be encoded".into())),
+        ProjectPreparationOutcome::Complete {
+            project_id,
+            project_number,
+            enabled_services,
+        } => CommandEnvelope::success(
+            command,
+            "PROJECT_PREPARED",
+            "The fixed Dirextalk GCP service set is enabled and identity-verified.",
+        )
+        .with_data(json!({
+            "project_id": project_id,
+            "project_number": project_number,
+            "enabled_services": enabled_services,
+        }))
+        .map_err(|_| EngineError::Backend("project result could not be encoded".into())),
+    }
+}
+
 fn privacy_minimized_output(value: &impl Serialize) -> EngineResult<Value> {
     let mut value = serde_json::to_value(value)
         .map_err(|_| EngineError::Backend("command output could not be encoded".into()))?;
@@ -386,6 +449,7 @@ pub fn command_name(cli: &Cli) -> &'static str {
         TopLevelCommand::Project(project) => match project.command {
             ProjectCommand::List => "project.list",
             ProjectCommand::Inspect(_) => "project.inspect",
+            ProjectCommand::Prepare(_) => "project.prepare",
         },
         TopLevelCommand::Deploy(deploy) => match deploy.command {
             DeployCommand::Plan(_) => "deploy.plan",
@@ -443,5 +507,48 @@ mod tests {
         assert!(!encoded.contains("oauth_principal"));
         assert!(!encoded.contains("opaque-subject"));
         assert!(!encoded.contains("other-subject"));
+    }
+
+    #[test]
+    fn project_prepare_plan_is_waiting_and_privacy_minimized() {
+        let plan_id =
+            deployer_core::canonical_plan_digest(&json!({"plan": "prepare"})).expect("digest");
+        let envelope = project_prepare_envelope(
+            "project.prepare",
+            ProjectPreparationOutcome::ApprovalRequired {
+                plan_id,
+                project_id: "dirextalk-prod".into(),
+                project_number: 42,
+                required_services: vec![
+                    "serviceusage.googleapis.com".into(),
+                    "cloudresourcemanager.googleapis.com".into(),
+                    "cloudbilling.googleapis.com".into(),
+                    "compute.googleapis.com".into(),
+                    "dns.googleapis.com".into(),
+                ],
+                enable_services: vec!["compute.googleapis.com".into()],
+            },
+        )
+        .expect("envelope");
+        assert_eq!(envelope.status, OutcomeStatus::WaitingUser);
+        assert_eq!(
+            envelope.data["plan"]["required_services"],
+            json!([
+                "serviceusage.googleapis.com",
+                "cloudresourcemanager.googleapis.com",
+                "cloudbilling.googleapis.com",
+                "compute.googleapis.com",
+                "dns.googleapis.com",
+            ])
+        );
+        assert_eq!(
+            envelope.data["plan"]["enable_services"],
+            json!(["compute.googleapis.com"])
+        );
+        let encoded = serde_json::to_string(&envelope).expect("JSON");
+        assert!(encoded.contains("compute.googleapis.com"));
+        assert!(encoded.contains("serviceusage.googleapis.com"));
+        assert_eq!(encoded.matches("serviceusage.googleapis.com").count(), 1);
+        assert!(!encoded.contains("oauth_principal"));
     }
 }

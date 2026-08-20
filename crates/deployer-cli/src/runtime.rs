@@ -55,6 +55,7 @@ use crate::live_product::{
     HttpProductApi, StoredProductSecrets, read_restrictive, restrictive_replace,
 };
 use crate::product::{ProductBootstrap, initialize_product};
+use crate::project_prepare::{ProjectPreparationOutcome, prepare_project_services};
 use crate::release::{GithubReleaseCatalog, ReleaseCatalog};
 
 #[derive(Deserialize)]
@@ -67,6 +68,7 @@ struct TurnCredentials {
 
 pub struct LiveControlPlane {
     auth: GcloudAuthBroker,
+    home: PathBuf,
     releases: Arc<dyn ReleaseCatalog>,
 }
 
@@ -75,8 +77,10 @@ impl LiveControlPlane {
         crate::ensure_tls_provider();
         let base = BaseDirs::new()
             .ok_or_else(|| EngineError::State("current user home is unavailable".into()))?;
+        let home = base.home_dir().to_path_buf();
         Ok(Self {
-            auth: GcloudAuthBroker::for_home(base.home_dir()).map_err(auth_error)?,
+            auth: GcloudAuthBroker::for_home(&home).map_err(auth_error)?,
+            home,
             releases: Arc::new(GithubReleaseCatalog::new()?),
         })
     }
@@ -332,6 +336,40 @@ impl ControlPlane for LiveControlPlane {
                 "billing_enabled": billing.billing_enabled,
             }),
         ))
+    }
+
+    async fn project_prepare(
+        &self,
+        project_id: &str,
+        approval: Option<&deployer_core::PlanDigest>,
+    ) -> Result<ProjectPreparationOutcome> {
+        let token = self.token().await?;
+        let discovery = GoogleCloudClient::new("unbound", "0", token.access_token.clone())
+            .await
+            .map_err(gcp_error)?;
+        let project = discovery.project(project_id).await.map_err(gcp_error)?;
+        if project.project_id != project_id || !project.is_active() {
+            return Err(EngineError::Backend(
+                "GCP project identity is inactive or changed".into(),
+            ));
+        }
+        let project_number = project
+            .project_number
+            .parse::<u64>()
+            .map_err(|_| EngineError::Backend("GCP project number is invalid".into()))?;
+        let identity = ProjectIdentity {
+            project_id: project.project_id,
+            project_number,
+            oauth_principal: GoogleSubject::parse(token.principal)?,
+        };
+        let client = GoogleCloudClient::new(
+            &identity.project_id,
+            identity.project_number.to_string(),
+            token.access_token,
+        )
+        .await
+        .map_err(gcp_error)?;
+        prepare_project_services(&self.home, &client, &identity, approval).await
     }
 
     async fn connect_status(

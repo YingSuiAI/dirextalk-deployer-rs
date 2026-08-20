@@ -30,6 +30,15 @@ host receipt, redacted local-wiring status, and integrity digest. Secrets live
 only in their owning restrictive credential stores and are excluded from
 state, reports, stdout, and JSONL.
 
+`project prepare --project <id>` is a distinct dry-first workflow for exactly
+`serviceusage.googleapis.com`, `cloudresourcemanager.googleapis.com`,
+`cloudbilling.googleapis.com`, `compute.googleapis.com`, and
+`dns.googleapis.com`. Its digest binds the OAuth subject, immutable project id
+and number, and missing-service effects. An approved invocation persists a
+pending effect before each idempotent enable request, records and resumes the
+returned Service Usage operation, and revalidates project and service identity
+before calls, retries, and postconditions. It never creates paid resources.
+
 The official installed `gcloud` CLI is the sole authentication broker and runs
 with a private, isolated Dirextalk `CLOUDSDK_CONFIG`. The deployer never reads
 or changes the operator's default gcloud configuration. Only authentication

@@ -19,6 +19,8 @@ dirextalk-deployer auth logout
 
 dirextalk-deployer project list
 dirextalk-deployer project inspect --project <project-id>
+dirextalk-deployer project prepare --project <project-id>
+dirextalk-deployer project prepare --project <project-id> --approve sha256:<plan-id>
 
 dirextalk-deployer deploy plan --config <deployment.toml>
 dirextalk-deployer deploy apply --config <deployment.toml> --approve sha256:<plan-id>

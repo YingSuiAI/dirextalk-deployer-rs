@@ -319,8 +319,16 @@ pub(crate) fn restrictive_replace(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn read_restrictive(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| EngineError::State("credential file is unavailable".into()))?;
+    read_restrictive_optional(path)?
+        .ok_or_else(|| EngineError::State("credential file is unavailable".into()))
+}
+
+pub(crate) fn read_restrictive_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(EngineError::State("credential file is unavailable".into())),
+    };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(EngineError::State("credential path is unsafe".into()));
     }
@@ -331,7 +339,9 @@ pub(crate) fn read_restrictive(path: &Path) -> Result<Vec<u8>> {
             return Err(EngineError::State("credential file is not private".into()));
         }
     }
-    fs::read(path).map_err(|_| EngineError::State("credential file could not be read".into()))
+    fs::read(path)
+        .map(Some)
+        .map_err(|_| EngineError::State("credential file could not be read".into()))
 }
 
 #[cfg(unix)]

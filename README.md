@@ -17,8 +17,8 @@ You need:
 - the official Google Cloud CLI, installed on Linux or WSL from the
   [Google Cloud instructions](https://cloud.google.com/sdk/docs/install-sdk#linux)
   and confirmed with `gcloud version`;
-- the required GCP APIs already enabled, plus permission to create the
-  resources shown by the plan;
+- permission to enable the five fixed Dirextalk GCP APIs and create the
+  resources shown by later deployment plans;
 - an existing long-lived domain and control of its DNS; and
 - an operator public IPv4 address expressed as a `/32` SSH CIDR.
 
@@ -76,6 +76,7 @@ installation is intentionally deferred.
 dirextalk-deployer auth login
 dirextalk-deployer auth status
 dirextalk-deployer project inspect --project <project-id>
+dirextalk-deployer project prepare --project <project-id>
 ```
 
 The `auth login`, `auth status`, and `auth logout` commands broker
@@ -93,6 +94,20 @@ isolated configuration only.
 Only authentication and broker identity cross the gcloud process boundary.
 Project discovery, pricing, planning, and resource lifecycle calls remain
 in-process API operations; the deployer does not run gcloud resource commands.
+
+`project prepare` is a separate approval-bound workflow. Its first invocation
+is read-only in GCP and reports the complete fixed prerequisite set plus the
+currently missing subset: Service Usage, Resource Manager, Cloud Billing,
+Compute Engine, and Cloud DNS. Review the project id and number and approve
+only that current digest:
+
+```text
+dirextalk-deployer project prepare --project <project-id> --approve sha256:<plan-id>
+```
+
+The approved run enables only the missing services, recording and resuming
+each Service Usage operation before moving to the next. It does not create a
+project, link billing, or create paid resources.
 
 ## Plan and apply
 

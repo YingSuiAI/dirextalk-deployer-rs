@@ -11,6 +11,7 @@ mod oauth;
 mod official;
 mod preflight;
 mod rest;
+mod service_usage;
 
 pub use error::{GcpError, Result};
 pub use lifecycle::{
@@ -23,11 +24,14 @@ pub use lifecycle::{
 pub use oauth::{GcloudAuthBroker, OAuthToken, require_oauth_principal};
 pub use official::{GcpImageDiscovery, GoogleCloudClient, ImageIdentity, validate_image_identity};
 pub use preflight::{
-    BillingStatus, DnsPreflightMode, DnsPreflightStatus, DnsZone, GcpDiscovery, Preflight,
-    PreflightReport, PriceTier, ProjectStatus, Quota, QuotaAssessment, RequiredQuota,
-    RequiredService, ServiceStatus, SkuPrice, longest_matching_zone,
+    BillingStatus, DnsPreflightMode, DnsPreflightStatus, DnsZone, GCP_V01_REQUIRED_SERVICES,
+    GcpDiscovery, Preflight, PreflightReport, PriceTier, ProjectStatus, Quota, QuotaAssessment,
+    RequiredQuota, RequiredService, ServiceStatus, SkuPrice, longest_matching_zone,
 };
 pub use rest::{GoogleRestClient, HttpTransport, ReqwestTransport, RestResponse};
+pub use service_usage::{
+    GcpProjectIdentity, GcpServiceUsage, ServiceUsageOperation, ServiceUsageOperationState,
+};
 pub(crate) fn ensure_tls_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();

@@ -30,7 +30,7 @@ pub enum OutputFormat {
 pub enum TopLevelCommand {
     /// Manage the isolated gcloud authentication session.
     Auth(AuthArgs),
-    /// Inspect accessible GCP projects without mutating them.
+    /// Inspect GCP projects or prepare the fixed required APIs.
     Project(ProjectArgs),
     /// Plan, apply, resume, verify, or destroy a deployment.
     Deploy(DeployArgs),
@@ -61,12 +61,22 @@ pub struct ProjectArgs {
 pub enum ProjectCommand {
     List,
     Inspect(ProjectInspectArgs),
+    /// Plan or apply enablement of the fixed Dirextalk GCP APIs.
+    Prepare(ProjectPrepareArgs),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct ProjectInspectArgs {
     #[arg(long)]
     pub project: String,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct ProjectPrepareArgs {
+    #[arg(long)]
+    pub project: String,
+    #[arg(long, value_name = "sha256:PLAN_ID")]
+    pub approve: Option<String>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -127,7 +137,7 @@ pub enum ConnectCommand {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{AuthCommand, Cli, DeployCommand, OutputFormat, TopLevelCommand};
+    use super::{AuthCommand, Cli, DeployCommand, OutputFormat, ProjectCommand, TopLevelCommand};
 
     #[test]
     fn command_tree_is_internally_consistent() {
@@ -168,5 +178,27 @@ mod tests {
             panic!("expected auth command");
         };
         assert_eq!(auth.command, AuthCommand::Status);
+    }
+
+    #[test]
+    fn project_prepare_approval_is_optional_and_digest_shaped() {
+        let cli = Cli::try_parse_from([
+            "dirextalk-deployer",
+            "project",
+            "prepare",
+            "--project",
+            "dirextalk-prod",
+            "--approve",
+            "sha256:abcd",
+        ])
+        .expect("valid command");
+        let TopLevelCommand::Project(project) = cli.command else {
+            panic!("expected project command");
+        };
+        let ProjectCommand::Prepare(args) = project.command else {
+            panic!("expected prepare command");
+        };
+        assert_eq!(args.project, "dirextalk-prod");
+        assert_eq!(args.approve.as_deref(), Some("sha256:abcd"));
     }
 }
