@@ -421,7 +421,6 @@ fn safe_attribute_value(key: &str, value: &str) -> bool {
         "size_gib" | "zone_numeric_id" | "ttl" => {
             value.parse::<u64>().is_ok_and(|number| number > 0)
         }
-        "overwrite_approved" => matches!(value, "true" | "false"),
         "address" | "value" => value.parse::<std::net::Ipv4Addr>().is_ok(),
         "current_values" => serde_json::from_str::<Vec<std::net::Ipv4Addr>>(value).is_ok(),
         "tags" => serde_json::from_str::<Vec<String>>(value)
