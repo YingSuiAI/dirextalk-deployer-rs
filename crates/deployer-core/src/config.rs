@@ -293,6 +293,13 @@ release = "stable"
     }
 
     #[test]
+    fn accepts_the_explicit_e2_small_shared_core_choice() {
+        let configured = format!("{MINIMAL}\nmachine_type = \"e2-small\"\n");
+        let config = DeploymentConfig::parse(&configured).expect("e2-small config");
+        assert_eq!(config.machine_type, "e2-small");
+    }
+
+    #[test]
     fn rejects_unknown_fields_without_echoing_input() {
         let secret = "top-secret-refresh-token";
         let input = format!("{MINIMAL}\nrefresh_token = \"{secret}\"\n");

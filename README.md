@@ -63,6 +63,12 @@ an exact supported release identifier when reproducibility requires a specific
 version. `maximum_monthly_usd` makes planning fail when the estimate exceeds
 the operator's limit; it does not cap the GCP bill.
 
+The default remains `e2-custom-2-4096`. `machine_type = "e2-small"` selects
+the cheaper shared-core alternative with two guest vCPUs and 2 GiB memory. It
+sustains 0.5 vCPU in aggregate, is priced from 365 monthly E2 core-hours plus
+1,460 GiB-hours at the 730-hour planning horizon, and still requires two units
+of regional `CPUS` quota.
+
 `connect_agent = "auto"` detects one supported local Agent runtime. Detection
 fails closed when the result is ambiguous or unknown; it never guesses or
 generates a generic fallback. Resolve the ambiguity or set the exact supported

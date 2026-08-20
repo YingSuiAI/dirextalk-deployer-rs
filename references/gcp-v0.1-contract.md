@@ -9,7 +9,8 @@ linking, GKE, multi-node topology, GUI, or GCP Cloud Worker implementation.
 The supported local releases are Windows amd64, Linux amd64, macOS amd64 and
 macOS arm64. The only server target is Ubuntu 24.04 amd64 with systemd 254 or
 newer. The default VM is `e2-custom-2-4096` with a 50 GiB `pd-balanced` boot
-disk.
+disk. The explicit cheaper alternative is `e2-small`: two shared guest vCPUs,
+2 GiB memory, 0.5 sustained/billable vCPU, and two regional `CPUS` quota units.
 
 ## Public behavior
 
@@ -56,7 +57,8 @@ Every resource reference records project number, location, numeric id,
 self-link, deployment UUID and observed attributes. Every mutation follows:
 
 ```text
-persist PendingEffect -> call API -> persist operation -> poll original
+persist PendingEffect -> call API -> persist opaque operation name, numeric id,
+self-link and scope -> poll original
 operation -> GET resource -> validate immutable identity -> persist receipt ->
 clear PendingEffect
 ```

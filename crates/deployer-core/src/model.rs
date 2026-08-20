@@ -266,6 +266,9 @@ pub struct OperationRef {
     pub request_id: Uuid,
     pub project_number: u64,
     pub location: String,
+    /// Provider operation name used in the scoped polling endpoint. Compute
+    /// names are opaque and are not the numeric operation id.
+    pub name: String,
     pub numeric_id: u64,
     pub self_link: OperationUri,
 }
@@ -637,6 +640,7 @@ fn validate_operation(
     if operation.request_id != effect.effect_id
         || operation.project_number != effect.project_number
         || operation.location != effect.location
+        || !safe_public_name(&operation.name)
         || operation.numeric_id == 0
     {
         return Err(CoreError::InvalidState("operation identity mismatch"));
@@ -647,7 +651,6 @@ fn validate_operation(
         .path_segments()
         .ok_or(CoreError::InvalidState("operation identity mismatch"))?
         .collect();
-    let operation_id = operation.numeric_id.to_string();
     let expected_compute_scope = match effect.resource_kind {
         ResourceKind::Network | ResourceKind::Firewall => Some(("global", "operations")),
         ResourceKind::Subnet | ResourceKind::Address => Some(("regions", effect.location.as_str())),
@@ -663,7 +666,7 @@ fn validate_operation(
                 identity.project_id.as_str(),
                 "global",
                 "operations",
-                operation_id.as_str(),
+                operation.name.as_str(),
             ]
         } else {
             vec![
@@ -674,7 +677,7 @@ fn validate_operation(
                 scope_kind,
                 scope_name,
                 "operations",
-                operation_id.as_str(),
+                operation.name.as_str(),
             ]
         };
         matches!(
@@ -695,8 +698,9 @@ fn validate_operation(
                 "managedZones",
                 zone,
                 "changes",
-                operation_id.as_str(),
+                operation.name.as_str(),
             ]
+            && operation.name == operation.numeric_id.to_string()
             && url.host_str() == Some("dns.googleapis.com")
     };
     if !valid {
@@ -1229,9 +1233,10 @@ mod tests {
                 request_id: effect_id,
                 project_number: 43,
                 location: "global".to_owned(),
+                name: "operation-7".to_owned(),
                 numeric_id: 7,
                 self_link: OperationUri::parse(
-                    "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/7",
+                    "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/operation-7",
                 )
                 .unwrap(),
             }),
@@ -1273,9 +1278,10 @@ mod tests {
             request_id: Uuid::new_v4(),
             project_number: 42,
             location: "global".to_owned(),
+            name: "operation-9".to_owned(),
             numeric_id: 9,
             self_link: OperationUri::parse(
-                "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/9",
+                "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/operation-9",
             )
             .unwrap(),
         });

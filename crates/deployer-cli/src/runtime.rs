@@ -461,26 +461,8 @@ impl DeploymentBackend for LiveControlPlane {
         )
         .await
         .map_err(gcp_error)?;
-        let (cpus, _) = parse_machine_capacity(&config.machine_type)?;
         let report = Preflight::new(&client, RequiredService::gcp_v01(), "6F81-5844-456A")
-            .with_required_quotas(vec![
-                RequiredQuota {
-                    metric: "CPUS".into(),
-                    required: cpus,
-                },
-                RequiredQuota {
-                    metric: "INSTANCES".into(),
-                    required: 1.0,
-                },
-                RequiredQuota {
-                    metric: "IN_USE_ADDRESSES".into(),
-                    required: 1.0,
-                },
-                RequiredQuota {
-                    metric: "SSD_TOTAL_GB".into(),
-                    required: f64::from(config.boot_disk_size_gib),
-                },
-            ])
+            .with_required_quotas(required_quotas(config)?)
             .inspect_with_dns_mode(
                 &config.project_id,
                 &config.region,
@@ -1335,13 +1317,14 @@ fn operation_ref(effect: &PendingEffect, operation: &Operation) -> Result<Operat
         ));
     }
     let numeric_id = operation
-        .name
+        .numeric_id
         .parse()
         .map_err(|_| EngineError::Backend("GCP operation id is not numeric".into()))?;
     Ok(OperationRef {
         request_id: effect.effect_id,
         project_number: effect.project_number,
         location: effect.location.clone(),
+        name: operation.name.clone(),
         numeric_id,
         self_link: OperationUri::parse(operation.self_link.clone())?,
     })
@@ -1367,7 +1350,8 @@ fn gcp_operation(
         }
     };
     Ok(Operation {
-        name: recorded.numeric_id.to_string(),
+        name: recorded.name.clone(),
+        numeric_id: recorded.numeric_id.to_string(),
         self_link: recorded.self_link.to_string(),
         project_number: recorded.project_number.to_string(),
         scope,
@@ -1753,35 +1737,68 @@ fn pricing_quote(
     config: &DeploymentConfig,
     prices: &[deployer_gcp::SkuPrice],
 ) -> Result<PricingQuote> {
-    let (cpus, memory_gib) = parse_machine_capacity(&config.machine_type)?;
-    let quantities = [
-        (
-            select_price(prices, &["e2", "core"], "E2 CPU")?,
-            checked_quantity(cpus, 730)?,
-        ),
-        (
-            select_price_any(prices, &[&["e2", "ram"], &["e2", "memory"]], "E2 memory")?,
-            checked_quantity(memory_gib, 730)?,
-        ),
-        (
-            select_price_any(
-                prices,
-                &[&["balanced", "capacity"], &["balanced", "disk"]],
-                "balanced persistent disk",
-            )?,
-            RationalQuantity {
-                numerator: u64::from(config.boot_disk_size_gib),
-                denominator: 1,
-            },
-        ),
-        (
-            select_price(prices, &["static", "ip"], "regional static IPv4")?,
-            RationalQuantity {
-                numerator: 730,
-                denominator: 1,
-            },
-        ),
-    ];
+    if config.boot_disk_type != "pd-balanced" {
+        return Err(EngineError::Backend(
+            "exact pricing is currently available only for pd-balanced boot disks".into(),
+        ));
+    }
+    let machine = machine_profile(&config.machine_type)?;
+    let mut quantities = match machine.pricing {
+        MachinePricing::Custom => vec![
+            (
+                select_price(prices, &["e2", "core"], "E2 CPU")?,
+                checked_quantity(machine.billable_vcpus, 730)?,
+            ),
+            (
+                select_price_any(prices, &[&["e2", "ram"], &["e2", "memory"]], "E2 memory")?,
+                checked_quantity(machine.memory_gib, 730)?,
+            ),
+        ],
+        MachinePricing::E2Small => vec![
+            (
+                select_exact_price(
+                    prices,
+                    "E2 Instance Core running in APAC",
+                    &["e2", "core"],
+                    "APAC E2 shared-core CPU",
+                )?,
+                checked_quantity(machine.billable_vcpus, 730)?,
+            ),
+            (
+                select_exact_price(
+                    prices,
+                    "E2 Instance Ram running in APAC",
+                    &["e2", "ram"],
+                    "APAC E2 shared-core memory",
+                )?,
+                checked_quantity(machine.memory_gib, 730)?,
+            ),
+        ],
+    };
+    quantities.push((
+        select_exact_price(
+            prices,
+            "Balanced PD Capacity",
+            &["balanced", "capacity"],
+            "zonal pd-balanced capacity",
+        )?,
+        RationalQuantity {
+            numerator: u64::from(config.boot_disk_size_gib),
+            denominator: 1,
+        },
+    ));
+    quantities.push((
+        select_exact_price(
+            prices,
+            "External IP Charge on a Standard VM",
+            &["external", "ip", "standard", "vm"],
+            "attached in-use static IPv4",
+        )?,
+        RationalQuantity {
+            numerator: 730,
+            denominator: 1,
+        },
+    ));
     let mut lines = BTreeSet::new();
     let mut total = 0_u64;
     for (price, usage_quantity) in quantities {
@@ -1846,6 +1863,64 @@ fn select_price_any<'a>(
         .iter()
         .find_map(|needles| select_price(prices, needles, name).ok())
         .ok_or_else(|| EngineError::Backend(format!("{name} price is unavailable")))
+}
+
+fn select_exact_price<'a>(
+    prices: &'a [deployer_gcp::SkuPrice],
+    description: &str,
+    diagnostic_needles: &[&str],
+    name: &str,
+) -> Result<&'a deployer_gcp::SkuPrice> {
+    let matches: Vec<_> = prices
+        .iter()
+        .filter(|price| price.currency_code == "USD" && price.description == description)
+        .collect();
+    match matches.as_slice() {
+        [price] => Ok(price),
+        _ => Err(EngineError::Backend(format!(
+            "{name} exact GCP SKU `{description}` matched {}; public candidates: {}",
+            matches.len(),
+            pricing_candidates(prices, diagnostic_needles)
+        ))),
+    }
+}
+
+fn pricing_candidates(prices: &[deployer_gcp::SkuPrice], needles: &[&str]) -> String {
+    let mut candidates: Vec<_> = prices
+        .iter()
+        .filter(|price| {
+            let description = price.description.to_ascii_lowercase();
+            needles.iter().all(|needle| description.contains(needle))
+        })
+        .map(|price| {
+            format!(
+                "{}|{}",
+                safe_sku_id(&price.sku_id),
+                safe_sku_description(&price.description)
+            )
+        })
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(16);
+    if candidates.is_empty() {
+        "none".into()
+    } else {
+        candidates.join("; ")
+    }
+}
+
+fn safe_sku_description(description: &str) -> &str {
+    if (1..=200).contains(&description.len())
+        && description.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b' ' | b'-' | b'_' | b'.' | b',' | b'(' | b')' | b'/')
+        })
+    {
+        description
+    } else {
+        "<invalid>"
+    }
 }
 
 fn pricing_lines(
@@ -2149,9 +2224,31 @@ const fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
     left
 }
 
-fn parse_machine_capacity(machine_type: &str) -> Result<(f64, f64)> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MachineProfile {
+    guest_vcpus: f64,
+    billable_vcpus: f64,
+    memory_gib: f64,
+    pricing: MachinePricing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MachinePricing {
+    Custom,
+    E2Small,
+}
+
+fn machine_profile(machine_type: &str) -> Result<MachineProfile> {
+    if machine_type == "e2-small" {
+        return Ok(MachineProfile {
+            guest_vcpus: 2.0,
+            billable_vcpus: 0.5,
+            memory_gib: 2.0,
+            pricing: MachinePricing::E2Small,
+        });
+    }
     let custom = machine_type.strip_prefix("e2-custom-").ok_or_else(|| {
-        EngineError::Backend("only e2 custom machine pricing is supported".into())
+        EngineError::Backend("only e2-small or e2 custom machine pricing is supported".into())
     })?;
     let mut parts = custom.split('-');
     let cpus: f64 = parts
@@ -2167,7 +2264,35 @@ fn parse_machine_capacity(machine_type: &str) -> Result<(f64, f64)> {
     if parts.next().is_some() {
         return Err(EngineError::Backend("machine type is invalid".into()));
     }
-    Ok((cpus, memory_mib / 1024.0))
+    let gibibytes = memory_mib / 1024.0;
+    Ok(MachineProfile {
+        guest_vcpus: cpus,
+        billable_vcpus: cpus,
+        memory_gib: gibibytes,
+        pricing: MachinePricing::Custom,
+    })
+}
+
+fn required_quotas(config: &DeploymentConfig) -> Result<Vec<RequiredQuota>> {
+    let machine = machine_profile(&config.machine_type)?;
+    Ok(vec![
+        RequiredQuota {
+            metric: "CPUS".into(),
+            required: machine.guest_vcpus,
+        },
+        RequiredQuota {
+            metric: "INSTANCES".into(),
+            required: 1.0,
+        },
+        RequiredQuota {
+            metric: "IN_USE_ADDRESSES".into(),
+            required: 1.0,
+        },
+        RequiredQuota {
+            metric: "SSD_TOTAL_GB".into(),
+            required: f64::from(config.boot_disk_size_gib),
+        },
+    ])
 }
 
 async fn public_a_records(domain: &str) -> Result<Vec<String>> {
@@ -2908,6 +3033,76 @@ fn mcp_error(error: deployer_connect::McpError) -> EngineError {
 mod tests {
     use super::*;
 
+    fn e2_small_config() -> DeploymentConfig {
+        DeploymentConfig::parse(
+            r#"
+schema_version = 1
+deployment_name = "production"
+project_id = "dirextalk-prod"
+region = "asia-east1"
+zone = "asia-east1-a"
+domain = "talk.example.com"
+machine_type = "e2-small"
+boot_disk_size_gib = 50
+boot_disk_type = "pd-balanced"
+operator_ssh_cidr = "203.0.113.7/32"
+maximum_monthly_usd = 150.0
+release = "stable"
+"#,
+        )
+        .expect("e2-small config")
+    }
+
+    #[test]
+    fn e2_small_capacity_is_shared_core_but_consumes_two_cpu_quota_units() {
+        let profile = machine_profile("e2-small").expect("machine profile");
+        assert!((profile.guest_vcpus - 2.0).abs() < f64::EPSILON);
+        assert!((profile.billable_vcpus - 0.5).abs() < f64::EPSILON);
+        assert!((profile.memory_gib - 2.0).abs() < f64::EPSILON);
+        assert_eq!(profile.pricing, MachinePricing::E2Small);
+
+        let quotas = required_quotas(&e2_small_config()).expect("quotas");
+        assert_eq!(
+            quotas
+                .iter()
+                .map(|quota| (quota.metric.as_str(), quota.required))
+                .collect::<Vec<_>>(),
+            [
+                ("CPUS", 2.0),
+                ("INSTANCES", 1.0),
+                ("IN_USE_ADDRESSES", 1.0),
+                ("SSD_TOTAL_GB", 50.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn operation_ref_preserves_opaque_name_and_numeric_id_separately() {
+        let effect = PendingEffect {
+            effect_id: uuid::Uuid::new_v4(),
+            deployment_uuid: uuid::Uuid::new_v4(),
+            project_number: 42,
+            action: EffectAction::Create,
+            resource_kind: CoreResourceKind::Instance,
+            resource_name: "dirextalk-node".into(),
+            location: "asia-east1-a".into(),
+            expected_attributes: BTreeMap::new(),
+            target: None,
+            operation: None,
+        };
+        let operation = Operation {
+            name: "operation-opaque".into(),
+            numeric_id: "991".into(),
+            self_link: "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/zones/asia-east1-a/operations/operation-opaque".into(),
+            project_number: "42".into(),
+            scope: OperationScope::Zone("asia-east1-a".into()),
+        };
+        let recorded = operation_ref(&effect, &operation).expect("operation ref");
+        assert_eq!(recorded.name, "operation-opaque");
+        assert_eq!(recorded.numeric_id, 991);
+        assert!(recorded.self_link.as_str().ends_with("/operation-opaque"));
+    }
+
     fn tiered_price(tiers: &[(f64, i64, i32)]) -> deployer_gcp::SkuPrice {
         deployer_gcp::SkuPrice {
             sku_id: "66A2-68EA-56BE".into(),
@@ -2930,6 +3125,103 @@ mod tests {
                 )
                 .collect(),
         }
+    }
+
+    fn described_price(sku_id: &str, description: &str, nanos: i32) -> deployer_gcp::SkuPrice {
+        let mut price = tiered_price(&[(0.0, 0, nanos)]);
+        price.sku_id = sku_id.into();
+        price.description = description.into();
+        price
+    }
+
+    #[test]
+    fn exact_zonal_balanced_disk_selection_never_chooses_regional_by_price() {
+        let prices = [
+            described_price(
+                "REGIONAL-HIGH",
+                "Regional Balanced PD Capacity",
+                900_000_000,
+            ),
+            described_price("ZONAL-EXACT", "Balanced PD Capacity", 100_000_000),
+        ];
+        let selected = select_exact_price(
+            &prices,
+            "Balanced PD Capacity",
+            &["balanced", "capacity"],
+            "zonal pd-balanced capacity",
+        )
+        .expect("exact zonal SKU");
+        assert_eq!(selected.sku_id, "ZONAL-EXACT");
+    }
+
+    #[test]
+    fn exact_attached_ipv4_selection_excludes_spot_and_idle_rates() {
+        let prices = [
+            described_price(
+                "SPOT-HIGH",
+                "External IP Charge on a Spot Preemptible VM",
+                9,
+            ),
+            described_price("IDLE-HIGH", "Static Ip Charge", 8),
+            described_price("ATTACHED-EXACT", "External IP Charge on a Standard VM", 1),
+        ];
+        let selected = select_exact_price(
+            &prices,
+            "External IP Charge on a Standard VM",
+            &["external", "ip", "standard", "vm"],
+            "attached in-use static IPv4",
+        )
+        .expect("exact attached IP SKU");
+        assert_eq!(selected.sku_id, "ATTACHED-EXACT");
+    }
+
+    #[test]
+    fn e2_small_quote_uses_half_cpu_two_gib_and_exact_infrastructure_skus() {
+        let prices = [
+            described_price(
+                "92C8-7C92-6AEF",
+                "E2 Instance Core running in APAC",
+                10_000_000,
+            ),
+            described_price(
+                "FD4D-A383-8DAB",
+                "E2 Instance Ram running in APAC",
+                2_000_000,
+            ),
+            described_price("6AE1-525F-8B80", "Balanced PD Capacity", 100_000_000),
+            described_price(
+                "C054-7F72-A02E",
+                "External IP Charge on a Standard VM",
+                4_000_000,
+            ),
+            described_price(
+                "REGIONAL-WRONG",
+                "Regional Balanced PD Capacity",
+                900_000_000,
+            ),
+            described_price("IDLE-WRONG", "Static Ip Charge", 900_000_000),
+        ];
+
+        let quote = pricing_quote(&e2_small_config(), &prices).expect("e2-small quote");
+        let quantity = |sku_id: &str| {
+            quote
+                .lines
+                .iter()
+                .find(|line| line.sku_id == sku_id)
+                .expect("selected SKU")
+                .usage_quantity
+        };
+        assert_eq!(quantity("92C8-7C92-6AEF"), whole_quantity(365));
+        assert_eq!(quantity("FD4D-A383-8DAB"), whole_quantity(1_460));
+        assert_eq!(quantity("6AE1-525F-8B80"), whole_quantity(50));
+        assert_eq!(quantity("C054-7F72-A02E"), whole_quantity(730));
+        assert_eq!(quote.total_microusd, 14_490_000);
+        assert!(
+            quote
+                .lines
+                .iter()
+                .all(|line| { !matches!(line.sku_id.as_str(), "REGIONAL-WRONG" | "IDLE-WRONG") })
+        );
     }
 
     fn whole_quantity(numerator: u64) -> RationalQuantity {

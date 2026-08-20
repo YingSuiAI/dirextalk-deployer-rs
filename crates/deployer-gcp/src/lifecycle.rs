@@ -33,6 +33,7 @@ pub enum OperationScope {
 #[serde(deny_unknown_fields)]
 pub struct Operation {
     pub name: String,
+    pub numeric_id: String,
     pub self_link: String,
     pub project_number: String,
     pub scope: OperationScope,
@@ -367,6 +368,7 @@ pub trait GcpLifecycle: Send + Sync {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OperationWire {
+    id: String,
     name: String,
     self_link: Option<String>,
     status: String,
@@ -655,7 +657,8 @@ impl GcpLifecycle for GoogleRestClient {
             response.id
         );
         let operation = Operation {
-            name: response.id,
+            name: response.id.clone(),
+            numeric_id: response.id,
             self_link,
             project_number: project_number.into(),
             scope: OperationScope::DnsZone(change.managed_zone.clone()),
@@ -707,13 +710,7 @@ impl GcpLifecycle for GoogleRestClient {
             };
         }
         let response: OperationWire = self.get(operation_url).await?;
-        if response.name != operation.name
-            || response.self_link.as_deref() != Some(operation.self_link.as_str())
-        {
-            return Err(GcpError::Contract(
-                "compute operation identity mismatch".into(),
-            ));
-        }
+        validate_wire_operation_identity(&response, operation)?;
         OperationState::from_wire(&response.status, response.error)
     }
 
@@ -850,6 +847,7 @@ impl GoogleRestClient {
                 "operation project identity mismatch".into(),
             ));
         }
+        validate_operation_numeric_id(operation)?;
         Ok(())
     }
 }
@@ -1171,6 +1169,7 @@ impl GcpLifecycle for GoogleCloudClient {
             .ok_or_else(|| GcpError::Infrastructure("Cloud DNS operation omitted id".into()))?;
         Ok(Some(Operation {
             name: id.clone(),
+            numeric_id: id.clone(),
             self_link: format!(
                 "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes/{id}",
                 self.project_id, change.managed_zone.name
@@ -1820,15 +1819,22 @@ fn operation_from_sdk(
     let name = response
         .name
         .ok_or_else(|| GcpError::Infrastructure("compute operation omitted name".into()))?;
+    let numeric_id = response
+        .id
+        .ok_or_else(|| GcpError::Infrastructure("compute operation omitted numeric id".into()))?
+        .to_string();
     let self_link = response
         .self_link
         .ok_or_else(|| GcpError::Infrastructure("compute operation omitted selfLink".into()))?;
-    Ok(Operation {
+    let operation = Operation {
         name,
+        numeric_id,
         self_link,
         project_number: project_number.into(),
         scope,
-    })
+    };
+    validate_operation_numeric_id(&operation)?;
+    Ok(operation)
 }
 
 fn validate_sdk_operation_identity(
@@ -1836,7 +1842,20 @@ fn validate_sdk_operation_identity(
     expected: &Operation,
 ) -> Result<()> {
     if response.name.as_deref() != Some(&expected.name)
+        || response.id.map(|id| id.to_string()).as_deref() != Some(&expected.numeric_id)
         || response.self_link.as_deref() != Some(&expected.self_link)
+    {
+        return Err(GcpError::Contract(
+            "compute operation identity mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wire_operation_identity(response: &OperationWire, expected: &Operation) -> Result<()> {
+    if response.name != expected.name
+        || response.id != expected.numeric_id
+        || response.self_link.as_deref() != Some(expected.self_link.as_str())
     {
         return Err(GcpError::Contract(
             "compute operation identity mismatch".into(),
@@ -1893,12 +1912,30 @@ fn operation_from_wire(
             "compute operation omitted name".into(),
         ));
     }
-    Ok(Operation {
+    let operation = Operation {
         name: response.name,
+        numeric_id: response.id,
         self_link,
         project_number: project_number.into(),
         scope,
-    })
+    };
+    validate_operation_numeric_id(&operation)?;
+    Ok(operation)
+}
+
+fn validate_operation_numeric_id(operation: &Operation) -> Result<()> {
+    if operation.numeric_id == "0"
+        || operation.numeric_id.is_empty()
+        || !operation
+            .numeric_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(GcpError::Infrastructure(
+            "Google operation omitted valid numeric id".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn resource_url(
@@ -2488,6 +2525,7 @@ mod tests {
             Ok(RestResponse {
                 status: 200,
                 body: serde_json::to_vec(&json!({
+                    "id": "991",
                     "name": "operation-1",
                     "selfLink": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-1",
                     "status": "PENDING"
@@ -2627,6 +2665,7 @@ mod tests {
                 json!({ "projectNumber": "123", "lifecycleState": "ACTIVE" })
             } else {
                 json!({
+                    "id": "991",
                     "name": "operation-1",
                     "selfLink": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-1",
                     "status": "PENDING"
@@ -2714,6 +2753,7 @@ mod tests {
     fn operation_self_link_requires_exact_scope_and_name_path() {
         let valid = Operation {
             name: "operation-1".into(),
+            numeric_id: "17".into(),
             self_link: "https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-1".into(),
             project_number: "123".into(),
             scope: OperationScope::Zone("us-central1-a".into()),
@@ -2730,6 +2770,41 @@ mod tests {
             ..valid
         };
         assert!(validate_operation_self_link(&confused, "test-project").is_err());
+    }
+
+    #[test]
+    fn compute_operation_keeps_opaque_name_and_numeric_id_as_distinct_identity() {
+        let self_link = "https://www.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-opaque";
+        let sdk = google_cloud_compute_v1::model::Operation::new()
+            .set_id(991_u64)
+            .set_name("operation-opaque")
+            .set_self_link(self_link);
+        let operation = operation_from_sdk(
+            sdk.clone(),
+            "123",
+            OperationScope::Zone("us-central1-a".into()),
+        )
+        .expect("SDK operation");
+        assert_eq!(operation.name, "operation-opaque");
+        assert_eq!(operation.numeric_id, "991");
+        validate_sdk_operation_identity(&sdk, &operation).expect("exact SDK identity");
+
+        let replacement = sdk.set_id(992_u64);
+        assert!(validate_sdk_operation_identity(&replacement, &operation).is_err());
+
+        let wire = OperationWire {
+            id: "991".into(),
+            name: "operation-opaque".into(),
+            self_link: Some(self_link.into()),
+            status: "RUNNING".into(),
+            error: None,
+        };
+        validate_wire_operation_identity(&wire, &operation).expect("exact REST identity");
+        let replacement = OperationWire {
+            id: "992".into(),
+            ..wire
+        };
+        assert!(validate_wire_operation_identity(&replacement, &operation).is_err());
     }
 
     #[test]
@@ -2847,6 +2922,7 @@ mod tests {
         let (client, transport) = dns_client(101, false);
         let operation = Operation {
             name: "7".into(),
+            numeric_id: "7".into(),
             self_link: "https://dns.googleapis.com/dns/v1/projects/test-project/managedZones/example/changes/7".into(),
             project_number: "123".into(),
             scope: OperationScope::DnsZone(dns_zone_identity("100")),

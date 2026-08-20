@@ -1155,6 +1155,7 @@ mod tests {
                 request_id: effect.effect_id,
                 project_number: state.project_identity.project_number,
                 location: effect.location.clone(),
+                name: numeric_id.to_string(),
                 numeric_id,
                 self_link: deployer_core::OperationUri::parse(operation_url)?,
             }))
