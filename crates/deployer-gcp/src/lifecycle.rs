@@ -3115,35 +3115,76 @@ mod tests {
     }
 
     #[test]
-    fn observed_property_drift_fails_with_unchanged_numeric_identity() {
-        let spec = NetworkSpec {
+    fn network_and_subnetwork_receipts_keep_cidr_on_subnetwork_only() {
+        let deployment_uuid = Uuid::new_v4();
+        let network = NetworkSpec {
             name: "dirextalk-network".into(),
-            deployment_uuid: Uuid::new_v4(),
+            deployment_uuid,
         };
-        let (_, _, _, _, attributes) =
-            expected_resource_properties(ResourceSpecRef::Network(&spec));
-        let mut receipt = ResourceReceipt {
+        let mut network_receipt = ResourceReceipt {
             identity: ResourceIdentity {
                 kind: ResourceKind::Network,
-                name: spec.name.clone(),
+                name: network.name.clone(),
                 project_number: "123".into(),
                 location: None,
                 numeric_id: "100".into(),
                 self_link: "https://compute.googleapis.com/compute/v1/projects/test-project/global/networks/dirextalk-network".into(),
-                deployment_uuid: spec.deployment_uuid,
+                deployment_uuid,
             },
-            observed_attributes: attributes,
+            observed_attributes: BTreeMap::from([
+                ("auto_create_subnetworks".into(), json!(false)),
+                ("routing_mode".into(), json!("GLOBAL")),
+            ]),
         };
-        validate_resource_properties(ResourceSpecRef::Network(&spec), &receipt)
-            .expect("matching properties");
+        validate_resource_properties(ResourceSpecRef::Network(&network), &network_receipt)
+            .expect("network receipt does not require a CIDR");
+        assert!(!network_receipt.observed_attributes.contains_key("cidr"));
 
-        receipt
+        network_receipt
             .observed_attributes
             .insert("routing_mode".into(), json!("REGIONAL"));
-        let error = validate_resource_properties(ResourceSpecRef::Network(&spec), &receipt)
-            .expect_err("property drift must fail");
+        let error =
+            validate_resource_properties(ResourceSpecRef::Network(&network), &network_receipt)
+                .expect_err("network property drift must fail");
         assert!(matches!(error, GcpError::Contract(_)));
-        assert_eq!(receipt.identity.numeric_id, "100");
+        assert_eq!(network_receipt.identity.numeric_id, "100");
+
+        let network_self_link = network_receipt.identity.self_link.clone();
+        let subnet = SubnetworkSpec {
+            name: "dirextalk-subnet".into(),
+            region: "us-central1".into(),
+            network_self_link,
+            cidr: "10.42.0.0/24".into(),
+            deployment_uuid,
+        };
+        let mut subnet_receipt = ResourceReceipt {
+            identity: ResourceIdentity {
+                kind: ResourceKind::Subnetwork,
+                name: subnet.name.clone(),
+                project_number: "123".into(),
+                location: Some(subnet.region.clone()),
+                numeric_id: "101".into(),
+                self_link: "https://compute.googleapis.com/compute/v1/projects/test-project/regions/us-central1/subnetworks/dirextalk-subnet".into(),
+                deployment_uuid,
+            },
+            observed_attributes: BTreeMap::from([
+                ("ip_cidr_range".into(), json!("10.42.0.0/24")),
+                (
+                    "network".into(),
+                    json!("projects/test-project/global/networks/dirextalk-network"),
+                ),
+            ]),
+        };
+        validate_resource_properties(ResourceSpecRef::Subnetwork(&subnet), &subnet_receipt)
+            .expect("subnetwork receipt has the exact CIDR");
+
+        subnet_receipt
+            .observed_attributes
+            .insert("ip_cidr_range".into(), json!("10.43.0.0/24"));
+        assert!(matches!(
+            validate_resource_properties(ResourceSpecRef::Subnetwork(&subnet), &subnet_receipt),
+            Err(GcpError::Contract(_))
+        ));
     }
 
     #[test]

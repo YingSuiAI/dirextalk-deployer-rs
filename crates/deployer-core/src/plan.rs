@@ -548,7 +548,7 @@ fn validate_initial_effects(plan: &DeploymentPlan) -> Result<()> {
             ResourceKind::Network,
             format!("{base}-net"),
             "global".to_owned(),
-            BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())]),
+            BTreeMap::new(),
         ),
         (
             ResourceKind::Subnet,
@@ -1003,7 +1003,7 @@ release = "stable"
                 ResourceKind::Network,
                 "net",
                 "global",
-                BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())]),
+                BTreeMap::new(),
             ),
             effect(
                 ResourceKind::Subnet,
@@ -1061,6 +1061,18 @@ release = "stable"
             ),
         ];
         plan
+    }
+
+    #[test]
+    fn initial_topology_keeps_cidr_on_subnet_only() {
+        let plan = deployment_plan();
+
+        assert!(plan.effects[0].expected_attributes.is_empty());
+        assert_eq!(
+            plan.effects[1].expected_attributes,
+            BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())])
+        );
+        plan.digest().expect("corrected initial topology");
     }
 
     #[test]

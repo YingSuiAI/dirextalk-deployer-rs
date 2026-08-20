@@ -703,12 +703,7 @@ pub fn build_plan(
     let suffix = &deployment_uuid.simple().to_string()[..12];
     let base = format!("dt-{}-{suffix}", config.deployment_name);
     let initial_effects = vec![
-        effect(
-            ResourceKind::Network,
-            &format!("{base}-net"),
-            "global",
-            [("cidr", "10.42.0.0/24")],
-        ),
+        effect(ResourceKind::Network, &format!("{base}-net"), "global", []),
         effect(
             ResourceKind::Subnet,
             &format!("{base}-subnet"),
