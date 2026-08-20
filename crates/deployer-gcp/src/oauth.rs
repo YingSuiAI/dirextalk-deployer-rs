@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -259,7 +260,7 @@ fn run_gcloud(invocation: &GcloudInvocation) -> Result<GcloudProcessOutput> {
             let mut stdout = child.stdout.take().ok_or_else(|| {
                 GcpError::Infrastructure("gcloud interactive output is unavailable".into())
             })?;
-            let copy_result = std::io::copy(&mut stdout, &mut std::io::stderr().lock());
+            let copy_result = relay_interactive_output(&mut stdout);
             let status = child
                 .wait()
                 .map_err(|error| classify_process_error(&error))?;
@@ -284,6 +285,25 @@ fn run_gcloud(invocation: &GcloudInvocation) -> Result<GcloudProcessOutput> {
                 stdout: Zeroizing::new(output.stdout),
             })
         }
+    }
+}
+
+fn relay_interactive_output(reader: &mut impl Read) -> std::io::Result<()> {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    relay_buffered(reader, &mut stderr)
+}
+
+fn relay_buffered(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            writer.flush()?;
+            return Ok(());
+        }
+        writer.write_all(&buffer[..read])?;
+        writer.flush()?;
     }
 }
 
@@ -484,7 +504,7 @@ mod tests {
 
     use super::{
         GcloudAuthBroker, GcloudInvocation, GcloudProcess, GcloudProcessOutput, OAuthToken,
-        OutputMode, SubjectResolver, require_oauth_principal,
+        OutputMode, SubjectResolver, relay_buffered, require_oauth_principal,
     };
     use crate::{GcpError, Result};
 
@@ -708,6 +728,17 @@ mod tests {
             stdout: zeroize::Zeroizing::new(b"operator@example.test\n".to_vec()),
         };
         assert!(!format!("{output:?}").contains("operator@example.test"));
+    }
+
+    #[test]
+    fn interactive_output_relay_handles_multiple_buffers_without_kernel_copy() {
+        let expected = vec![b'x'; 20_000];
+        let mut reader = std::io::Cursor::new(expected.clone());
+        let mut output = Vec::new();
+
+        relay_buffered(&mut reader, &mut output).expect("buffered relay");
+
+        assert_eq!(output, expected);
     }
 
     #[cfg(unix)]
