@@ -186,6 +186,7 @@ fn run() -> Result<BuildReport, String> {
             updater_binary,
             updater_unit,
             updater_version: request.updater_version,
+            updater_source_revision: request.updater_source_revision,
             updater_source_url: request.updater_source_url,
         },
         &seed,

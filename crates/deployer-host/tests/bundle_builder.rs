@@ -3,6 +3,7 @@ use deployer_host::{
     POSTGRES_UTILITY_DIGEST, canonical_json,
 };
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -79,7 +80,8 @@ fn builder_reads_seed_from_restrictive_file_and_emits_redacted_report() {
         postgres_initializer_path: postgres_initializer,
         updater_binary_path: updater.clone(),
         updater_unit_path: unit,
-        updater_version: "v1.0.0".into(),
+        updater_version: "v1.0.19".into(),
+        updater_source_revision: "1e71b9d53c599e8fb9227050b8c9643ce723acc5".into(),
         updater_source_url: "https://releases.example/dirextalk-updater".into(),
         updater_sha256: DigestHex::calculate(&fs::read(updater).unwrap()),
         output_bundle_path: output_path.clone(),
@@ -106,4 +108,20 @@ fn builder_reads_seed_from_restrictive_file_and_emits_redacted_report() {
         report["release_signing_public_key"].as_str().unwrap().len(),
         64
     );
+    let manifest = manifest_from_bundle(&output_path);
+    assert!(manifest.contains("1e71b9d53c599e8fb9227050b8c9643ce723acc5"));
+}
+
+fn manifest_from_bundle(path: &std::path::Path) -> String {
+    let bundle = fs::read(path).unwrap();
+    let mut archive = tar::Archive::new(bundle.as_slice());
+    let mut manifest = String::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().as_ref() == std::path::Path::new("manifest.json") {
+            entry.read_to_string(&mut manifest).unwrap();
+            break;
+        }
+    }
+    manifest
 }

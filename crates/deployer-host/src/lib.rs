@@ -260,6 +260,7 @@ impl BundleManifest {
 #[serde(deny_unknown_fields)]
 pub struct UpdaterIdentity {
     pub version: String,
+    pub source_revision: String,
     pub source_url: String,
     pub sha256: DigestHex,
 }
@@ -267,6 +268,7 @@ pub struct UpdaterIdentity {
 impl UpdaterIdentity {
     fn validate(&self) -> Result<(), InstallError> {
         if !valid_product_version(&self.version)
+            || !valid_source_revision(&self.source_revision)
             || self.source_url.len() > 2048
             || !self.source_url.starts_with("https://")
             || self.source_url.contains('@')
@@ -977,6 +979,7 @@ pub struct BundleAssets {
     pub updater_binary: Vec<u8>,
     pub updater_unit: Vec<u8>,
     pub updater_version: String,
+    pub updater_source_revision: String,
     pub updater_source_url: String,
 }
 
@@ -1005,6 +1008,7 @@ pub struct BundleBuildRequest {
     pub updater_binary_path: PathBuf,
     pub updater_unit_path: PathBuf,
     pub updater_version: String,
+    pub updater_source_revision: String,
     pub updater_source_url: String,
     pub updater_sha256: DigestHex,
     pub output_bundle_path: PathBuf,
@@ -1073,6 +1077,7 @@ pub fn build_bundle(
         .clone();
     let updater = UpdaterIdentity {
         version: assets.updater_version,
+        source_revision: assets.updater_source_revision,
         source_url: assets.updater_source_url,
         sha256: updater_sha256,
     };
@@ -1488,7 +1493,7 @@ fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
     let agent_password = read_or_create_hex_secret("agent_postgres_password", 24)?;
     let registration = read_or_create_hex_secret("message_registration_shared_secret", 32)?;
     let turn = read_or_create_hex_secret("turn_shared_secret", 32)?;
-    let portal = read_or_create_hex_secret("message_portal_password", 16)?;
+    let portal = read_or_create_numeric_secret("message_portal_password", 8)?;
     let master = read_or_create_raw_secret("core_secret_master_key", 32)?;
     let mcp_path = runtime_secret_path("message_mcp_token");
     if mcp_path.exists() {
@@ -1615,6 +1620,60 @@ fn read_or_create_hex_secret(
     let encoded = Zeroizing::new(hex::encode(&*random).into_bytes());
     create_secret_noclobber(&path, &encoded)?;
     Ok(encoded)
+}
+
+fn read_or_create_numeric_secret(
+    name: &str,
+    digits: usize,
+) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    read_or_create_numeric_secret_at(&runtime_secret_path(name), digits, 0)
+}
+
+fn read_or_create_numeric_secret_at(
+    path: &Path,
+    digits: usize,
+    expected_uid: u32,
+) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    if digits == 0 {
+        return Err(BackendError::Infrastructure(
+            "numeric secret length must be positive".into(),
+        ));
+    }
+    if path.exists() {
+        let bytes = Zeroizing::new(
+            read_stable_regular(path, Some(expected_uid), Some(0o600), digits).map_err(
+                |error| {
+                    BackendError::Infrastructure(format!(
+                        "read protected numeric runtime state: {error}"
+                    ))
+                },
+            )?,
+        );
+        if bytes.len() != digits || !bytes.iter().all(u8::is_ascii_digit) {
+            return Err(BackendError::Infrastructure(
+                "numeric runtime secret has invalid protected state".into(),
+            ));
+        }
+        return Ok(bytes);
+    }
+
+    let mut source = fs::File::open("/dev/urandom")
+        .map_err(|error| BackendError::Infrastructure(format!("open OS RNG: {error}")))?;
+    let mut secret = Zeroizing::new(Vec::with_capacity(digits));
+    let mut random = Zeroizing::new([0_u8; 32]);
+    while secret.len() < digits {
+        source
+            .read_exact(&mut *random)
+            .map_err(|error| BackendError::Infrastructure(format!("read OS RNG: {error}")))?;
+        for byte in random.iter().copied().filter(|byte| *byte < 250) {
+            secret.push(b'0' + byte % 10);
+            if secret.len() == digits {
+                break;
+            }
+        }
+    }
+    create_secret_noclobber(path, &secret)?;
+    Ok(secret)
 }
 
 fn read_or_create_raw_secret(name: &str, size: usize) -> Result<Zeroizing<Vec<u8>>, BackendError> {
@@ -2357,6 +2416,8 @@ pub enum InstallError {
 mod tests {
     use super::*;
 
+    const UPDATER_SOURCE_REVISION: &str = "1e71b9d53c599e8fb9227050b8c9643ce723acc5";
+
     #[derive(Default)]
     struct FakeBackend {
         platform: Option<PlatformInfo>,
@@ -2455,7 +2516,8 @@ mod tests {
                 postgres_initializer: b"#!/bin/sh".to_vec(),
                 updater_binary: b"updater".to_vec(),
                 updater_unit: b"[Service]".to_vec(),
-                updater_version: "v1.0.0".into(),
+                updater_version: "v1.0.19".into(),
+                updater_source_revision: UPDATER_SOURCE_REVISION.into(),
                 updater_source_url: "https://releases.example/updater".into(),
             },
             &[7; 32],
@@ -2479,7 +2541,8 @@ mod tests {
             authoritative_dns_ipv4: "9.9.9.9".parse().unwrap(),
             public_recursive_dns_ipv4: "8.8.8.8".parse().unwrap(),
             updater: UpdaterIdentity {
-                version: "v1.0.0".into(),
+                version: "v1.0.19".into(),
+                source_revision: UPDATER_SOURCE_REVISION.into(),
                 source_url: "https://releases.example/updater".into(),
                 sha256: DigestHex::calculate(b"updater"),
             },
@@ -2623,7 +2686,8 @@ mod tests {
                     postgres_initializer: b"#!/bin/sh".to_vec(),
                     updater_binary: b"updater".to_vec(),
                     updater_unit: b"[Service]".to_vec(),
-                    updater_version: "v1.0.0".into(),
+                    updater_version: "v1.0.19".into(),
+                    updater_source_revision: UPDATER_SOURCE_REVISION.into(),
                     updater_source_url: "https://releases.example/updater".into(),
                 },
                 &[7; 32],
@@ -2683,7 +2747,8 @@ mod tests {
                 postgres_initializer: b"#!/bin/sh".to_vec(),
                 updater_binary: b"updater".to_vec(),
                 updater_unit: b"[Service]".to_vec(),
-                updater_version: "v1.0.0".into(),
+                updater_version: "v1.0.19".into(),
+                updater_source_revision: UPDATER_SOURCE_REVISION.into(),
                 updater_source_url: "https://releases.example/updater".into(),
             },
             &[7; 32],
@@ -2710,7 +2775,8 @@ mod tests {
                     postgres_initializer: b"#!/bin/sh".to_vec(),
                     updater_binary: b"updater".to_vec(),
                     updater_unit: b"[Service]".to_vec(),
-                    updater_version: "v1.0.0".into(),
+                    updater_version: "v1.0.19".into(),
+                    updater_source_revision: UPDATER_SOURCE_REVISION.into(),
                     updater_source_url: "https://releases.example/updater".into(),
                 },
                 &[7; 32],
@@ -2849,5 +2915,69 @@ mod tests {
         request.release_catalog_origin = "https://imadmin.dirextalk.ai".into();
         request.public_recursive_dns_ipv4 = request.authoritative_dns_ipv4;
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn portal_initialization_code_is_retry_safe_exactly_eight_digits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message_portal_password");
+        let owner = fs::symlink_metadata(directory.path()).unwrap().uid();
+        let first = read_or_create_numeric_secret_at(&path, 8, owner).unwrap();
+        assert_eq!(first.len(), 8);
+        assert!(first.iter().all(u8::is_ascii_digit));
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let second = read_or_create_numeric_secret_at(&path, 8, owner).unwrap();
+        assert_eq!(*first, *second);
+    }
+
+    #[test]
+    fn malformed_existing_portal_initialization_code_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message_portal_password");
+        fs::write(&path, b"12ab5678").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        assert!(read_or_create_numeric_secret_at(&path, 8, owner).is_err());
+
+        fs::write(&path, b"1234567").unwrap();
+        assert!(read_or_create_numeric_secret_at(&path, 8, owner).is_err());
+    }
+
+    #[test]
+    fn updater_source_revision_is_required_and_receipt_bound() {
+        let (request, request_digest, bundle, key) = fixture();
+        let mut request_value: InstallRequest = parse_canonical_json(&request).unwrap();
+        request_value.updater.source_revision = "main".into();
+        assert!(request_value.validate().is_err());
+
+        request_value.updater.source_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        let mismatched = canonical_json(&request_value).unwrap();
+        let mut mismatch_installer = Installer::new(FakeBackend::default());
+        assert_eq!(
+            mismatch_installer
+                .install(
+                    &DigestHex::calculate(&mismatched),
+                    &mismatched,
+                    &bundle,
+                    &key,
+                )
+                .exit_code(),
+            1
+        );
+        assert!(mismatch_installer.into_backend().steps.is_empty());
+
+        request_value.updater.source_revision = UPDATER_SOURCE_REVISION.into();
+        let canonical = canonical_json(&request_value).unwrap();
+        let mut installer = Installer::new(FakeBackend::default());
+        let outcome =
+            installer.install(&DigestHex::calculate(&canonical), &canonical, &bundle, &key);
+        let InstallOutcome::Success(receipt) = outcome else {
+            panic!("valid updater source identity was rejected");
+        };
+        assert_eq!(
+            receipt.receipt.updater.source_revision,
+            UPDATER_SOURCE_REVISION
+        );
+        assert_eq!(request_digest, DigestHex::calculate(&canonical));
     }
 }
