@@ -17,7 +17,11 @@ fn default_boot_disk_type() -> String {
     "pd-balanced".to_owned()
 }
 
-const fn default_local_connect_agent() -> bool {
+fn default_connect_agent() -> String {
+    "auto".to_owned()
+}
+
+const fn default_install_connect() -> bool {
     true
 }
 
@@ -91,8 +95,13 @@ pub struct DeploymentConfig {
     pub operator_ssh_cidr: String,
     pub maximum_monthly_usd: f64,
     pub release: ReleaseSelection,
-    #[serde(default = "default_local_connect_agent")]
-    pub local_connect_agent: bool,
+    /// Agent implementation selected by `deployer-connect`; `auto` requests
+    /// its fail-closed capability selection.
+    #[serde(default = "default_connect_agent")]
+    pub connect_agent: String,
+    /// Whether service-scoped local `dirextalk-connect` should be installed.
+    #[serde(default = "default_install_connect")]
+    pub install_connect: bool,
 }
 
 impl DeploymentConfig {
@@ -167,6 +176,12 @@ impl DeploymentConfig {
         {
             return invalid("release", "must be stable or an exact release identifier");
         }
+        if !valid_agent_token(&self.connect_agent) {
+            return invalid(
+                "connect_agent",
+                "must be a lowercase Agent token of at most 63 characters",
+            );
+        }
         Ok(())
     }
 }
@@ -231,6 +246,14 @@ fn valid_exact_release(value: &str) -> bool {
         && value.bytes().any(|byte| byte.is_ascii_digit())
 }
 
+fn valid_agent_token(value: &str) -> bool {
+    (1..=63).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,7 +277,8 @@ release = "stable"
         assert_eq!(config.machine_type, "e2-custom-2-4096");
         assert_eq!(config.boot_disk_size_gib, 50);
         assert_eq!(config.boot_disk_type, "pd-balanced");
-        assert!(config.local_connect_agent);
+        assert_eq!(config.connect_agent, "auto");
+        assert!(config.install_connect);
     }
 
     #[test]
@@ -313,5 +337,32 @@ release = "stable"
     fn exact_release_serializes_back_to_the_public_string_shape() {
         let exact = ReleaseSelection::Exact("v0.1.7".to_owned());
         assert_eq!(serde_json::to_string(&exact).unwrap(), "\"v0.1.7\"");
+    }
+
+    #[test]
+    fn connect_agent_type_and_install_intent_are_independent() {
+        let configured =
+            format!("{MINIMAL}\nconnect_agent = \"codex_local\"\ninstall_connect = false\n");
+        let config = DeploymentConfig::parse(&configured).unwrap();
+        assert_eq!(config.connect_agent, "codex_local");
+        assert!(!config.install_connect);
+
+        let uppercase = format!("{MINIMAL}\nconnect_agent = \"Codex\"\n");
+        assert!(matches!(
+            DeploymentConfig::parse(&uppercase),
+            Err(CoreError::ConfigValidation {
+                field: "connect_agent",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn superseded_boolean_agent_field_is_rejected() {
+        let legacy = format!("{MINIMAL}\nlocal_connect_agent = true\n");
+        assert!(matches!(
+            DeploymentConfig::parse(&legacy),
+            Err(CoreError::ConfigParse)
+        ));
     }
 }
