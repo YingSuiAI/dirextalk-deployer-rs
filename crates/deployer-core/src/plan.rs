@@ -5,9 +5,9 @@ use uuid::Uuid;
 
 use crate::model::{validate_attributes, validate_resource};
 use crate::{
-    CoreError, DeploymentConfig, DeploymentState, DnsMode, EffectAction, PlanDigest,
-    ProjectIdentity, ReleaseSelection, ResourceKind, ResourceRef, Result, SCHEMA_VERSION,
-    canonical_plan_digest,
+    CoreError, DeploymentConfig, DeploymentState, DnsMode, EffectAction, ExactReleaseIdentity,
+    PlanDigest, PricingQuote, ProjectIdentity, ReleaseSelection, ResourceKind, ResourceRef, Result,
+    SCHEMA_VERSION, canonical_plan_digest,
 };
 
 /// Float-free canonical deployment specification bound by a deployment plan.
@@ -192,8 +192,8 @@ pub struct DeploymentPlan {
     pub spec: CanonicalDeploymentSpec,
     pub project_identity: ProjectIdentity,
     pub observed_dns: PlanDnsObservation,
-    pub exact_release: String,
-    pub estimated_monthly_microusd: u64,
+    pub release: ExactReleaseIdentity,
+    pub pricing: PricingQuote,
     pub effects: Vec<PlannedEffect>,
     pub cloud_worker: CloudWorkerDisposition,
 }
@@ -214,14 +214,14 @@ impl DeploymentPlan {
         if self.project_identity.project_id != self.spec.project_id {
             return Err(CoreError::InvalidPlan("plan project identity mismatch"));
         }
-        if !valid_release(&self.exact_release) {
-            return Err(CoreError::InvalidPlan("exact release is invalid"));
-        }
-        if self.estimated_monthly_microusd == 0
-            || self.estimated_monthly_microusd > self.spec.maximum_monthly_microusd
+        if let ReleaseSelection::Exact(configured) = &self.spec.release
+            && configured != self.release.release_tag.as_str()
         {
-            return Err(CoreError::InvalidPlan("cost estimate exceeds the budget"));
+            return Err(CoreError::InvalidPlan(
+                "resolved release differs from exact config selection",
+            ));
         }
+        self.pricing.validate(self.spec.maximum_monthly_microusd)?;
         validate_dns(&self.spec, &self.observed_dns, &self.effects)?;
         validate_plan_stage(self)?;
         if self.effects.is_empty() {
@@ -262,9 +262,10 @@ impl DeploymentPlan {
         state.validate()?;
         if self.deployment_uuid != state.deployment_uuid
             || self.project_identity != state.project_identity
+            || state.release_identity.as_ref() != Some(&self.release)
         {
             return Err(CoreError::InvalidPlan(
-                "continuation state identity mismatch",
+                "continuation state or release identity mismatch",
             ));
         }
         let DeploymentPlanStage::DnsContinuation {
@@ -653,20 +654,17 @@ fn validate_project(identity: &ProjectIdentity) -> Result<()> {
     Ok(())
 }
 
-fn valid_release(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
-        && value.bytes().any(|byte| byte.is_ascii_digit())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
-    use crate::{DeploymentPhase, GcpResources, LocalWiringStatus, ProjectIdentity, service_id};
+    use crate::{
+        DeploymentPhase, GcpResources, LinuxAmd64ApplicationIdentity, LinuxAmd64UpdaterIdentity,
+        LocalWiringStatus, PricingCurrency, PricingLine, PricingQuote, ProjectIdentity,
+        RationalQuantity, ReleaseTag, Sha256Digest, SigningKeyIdentity, SourceRevision,
+        UnpricedExclusion, service_id,
+    };
 
     fn config() -> DeploymentConfig {
         DeploymentConfig::parse(
@@ -690,6 +688,65 @@ release = "stable"
             project_id: "dirextalk-prod".to_owned(),
             project_number: 42,
             oauth_principal: "operator@example.com".to_owned(),
+        }
+    }
+
+    fn sha(character: char) -> Sha256Digest {
+        Sha256Digest::parse(character.to_string().repeat(64)).unwrap()
+    }
+
+    fn revision(character: char) -> SourceRevision {
+        SourceRevision::parse(character.to_string().repeat(40)).unwrap()
+    }
+
+    fn release() -> ExactReleaseIdentity {
+        ExactReleaseIdentity {
+            release_tag: ReleaseTag::parse("v0.1.0").unwrap(),
+            release_manifest_sha256: sha('1'),
+            release_manifest_source_revision: revision('2'),
+            host_installer_linux_amd64_sha256: sha('3'),
+            runtime_bundle_linux_amd64_sha256: sha('4'),
+            signed_runtime_manifest_linux_amd64_sha256: sha('5'),
+            runtime_manifest_signing_key: SigningKeyIdentity::parse("6".repeat(64)).unwrap(),
+            message_server: LinuxAmd64ApplicationIdentity {
+                version: ReleaseTag::parse("v1.2.3").unwrap(),
+                source_revision: revision('7'),
+                image_sha256: sha('8'),
+            },
+            agent: LinuxAmd64ApplicationIdentity {
+                version: ReleaseTag::parse("v2.3.4").unwrap(),
+                source_revision: revision('9'),
+                image_sha256: sha('a'),
+            },
+            updater: LinuxAmd64UpdaterIdentity {
+                version: ReleaseTag::parse("v3.4.5").unwrap(),
+                source_revision: revision('b'),
+                asset_sha256: sha('c'),
+            },
+        }
+    }
+
+    fn pricing() -> PricingQuote {
+        PricingQuote {
+            currency: PricingCurrency::Usd,
+            lines: BTreeSet::from([PricingLine {
+                sku_id: "SKU-VM".to_owned(),
+                tier_start_base_units: 0,
+                usage_unit: "h".to_owned(),
+                base_unit: "s".to_owned(),
+                base_unit_conversion: RationalQuantity {
+                    numerator: 3_600,
+                    denominator: 1,
+                },
+                usage_quantity: RationalQuantity {
+                    numerator: 730,
+                    denominator: 1,
+                },
+                unit_price_nanos: 136_986_301,
+                subtotal_microusd: 100_000_000,
+            }]),
+            unpriced_exclusions: BTreeSet::from([UnpricedExclusion::NetworkEgress]),
+            total_microusd: 100_000_000,
         }
     }
 
@@ -721,8 +778,8 @@ release = "stable"
             observed_dns: PlanDnsObservation::External {
                 current_ipv4: BTreeSet::new(),
             },
-            exact_release: "v0.1.0".to_owned(),
-            estimated_monthly_microusd: 100_000_000,
+            release: release(),
+            pricing: pricing(),
             effects: vec![PlannedEffect {
                 action: EffectAction::Create,
                 resource_kind: ResourceKind::Network,
@@ -786,12 +843,14 @@ release = "stable"
             },
             {
                 let mut plan = base.clone();
-                plan.exact_release = "v0.1.1".to_owned();
+                plan.release.release_tag = ReleaseTag::parse("v0.1.1").unwrap();
                 plan
             },
             {
                 let mut plan = base.clone();
-                plan.estimated_monthly_microusd += 1;
+                let mut line = plan.pricing.lines.pop_first().unwrap();
+                line.unit_price_nanos += 1;
+                plan.pricing.lines.insert(line);
                 plan
             },
             {
@@ -803,6 +862,141 @@ release = "stable"
             },
         ];
         for variant in variants {
+            assert_ne!(variant.digest().unwrap(), digest);
+        }
+    }
+
+    #[test]
+    fn deployment_digest_binds_every_release_artifact_identity() {
+        let base = deployment_plan();
+        let digest = base.digest().unwrap();
+        let variants = [
+            {
+                let mut plan = base.clone();
+                plan.release.release_tag = ReleaseTag::parse("v0.1.1").unwrap();
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.release_manifest_sha256 = sha('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.release_manifest_source_revision = revision('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.host_installer_linux_amd64_sha256 = sha('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.runtime_bundle_linux_amd64_sha256 = sha('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.signed_runtime_manifest_linux_amd64_sha256 = sha('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.runtime_manifest_signing_key =
+                    SigningKeyIdentity::parse("d".repeat(64)).unwrap();
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.message_server.version = ReleaseTag::parse("v1.2.4").unwrap();
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.message_server.source_revision = revision('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.message_server.image_sha256 = sha('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.agent.version = ReleaseTag::parse("v2.3.5").unwrap();
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.agent.source_revision = revision('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.agent.image_sha256 = sha('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.updater.version = ReleaseTag::parse("v3.4.6").unwrap();
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.updater.source_revision = revision('d');
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.release.updater.asset_sha256 = sha('d');
+                plan
+            },
+        ];
+        for variant in variants {
+            assert_ne!(variant.digest().unwrap(), digest);
+        }
+    }
+
+    #[test]
+    fn deployment_digest_binds_pricing_details_even_when_total_is_unchanged() {
+        let base = deployment_plan();
+        let digest = base.digest().unwrap();
+        let mutate_line = |mutation: fn(&mut PricingLine)| {
+            let mut plan = base.clone();
+            let mut line = plan.pricing.lines.pop_first().unwrap();
+            mutation(&mut line);
+            plan.pricing.lines.insert(line);
+            plan
+        };
+        let variants = [
+            mutate_line(|line| line.sku_id = "SKU-VM-OTHER".to_owned()),
+            mutate_line(|line| line.tier_start_base_units = 1),
+            mutate_line(|line| line.usage_unit = "month".to_owned()),
+            mutate_line(|line| line.base_unit = "min".to_owned()),
+            mutate_line(|line| {
+                line.base_unit_conversion = RationalQuantity {
+                    numerator: 60,
+                    denominator: 1,
+                };
+            }),
+            mutate_line(|line| {
+                line.usage_quantity = RationalQuantity {
+                    numerator: 731,
+                    denominator: 1,
+                };
+            }),
+            mutate_line(|line| line.unit_price_nanos += 1),
+            {
+                let mut plan = base.clone();
+                plan.pricing
+                    .unpriced_exclusions
+                    .insert(UnpricedExclusion::Taxes);
+                plan
+            },
+        ];
+        for variant in variants {
+            assert_eq!(variant.pricing.total_microusd, base.pricing.total_microusd);
             assert_ne!(variant.digest().unwrap(), digest);
         }
     }
@@ -843,7 +1037,7 @@ release = "stable"
             .observed_attributes
             .insert("address".to_owned(), "203.0.113.42".to_owned());
         continuation.stage = DeploymentPlanStage::DnsContinuation {
-            previous_plan_digest: previous,
+            previous_plan_digest: previous.clone(),
             address,
         };
         continuation.spec.dns_mode = DnsMode::CloudDns;
@@ -879,6 +1073,40 @@ release = "stable"
             }),
         });
         assert!(continuation.digest().is_ok());
+
+        let mut state = DeploymentState {
+            schema_version: 1,
+            deployment_uuid: continuation.deployment_uuid,
+            service_id: service_id("production", 42).unwrap(),
+            project_identity: identity(),
+            phase: DeploymentPhase::Applying,
+            approved_plan_digest: Some(previous),
+            pending_effect: None,
+            release_identity: Some(continuation.release.clone()),
+            gcp_resources: GcpResources {
+                address: Some(match &continuation.stage {
+                    DeploymentPlanStage::DnsContinuation { address, .. } => address.clone(),
+                    DeploymentPlanStage::Initial => unreachable!(),
+                }),
+                ..GcpResources::default()
+            },
+            ssh_host_identity: None,
+            host_receipt: None,
+            local_wiring: LocalWiringStatus::default(),
+            integrity_digest: String::new(),
+        };
+        assert!(continuation.validate_against_state(&state).is_ok());
+        state
+            .release_identity
+            .as_mut()
+            .unwrap()
+            .runtime_bundle_linux_amd64_sha256 = sha('d');
+        assert!(matches!(
+            continuation.validate_against_state(&state),
+            Err(CoreError::InvalidPlan(
+                "continuation state or release identity mismatch"
+            ))
+        ));
     }
 
     #[test]
@@ -893,7 +1121,7 @@ release = "stable"
             phase: DeploymentPhase::Complete,
             approved_plan_digest: Some(deployment_plan().digest().unwrap()),
             pending_effect: None,
-            exact_release: Some("v0.1.0".to_owned()),
+            release_identity: Some(release()),
             gcp_resources: GcpResources {
                 boot_disk: Some(disk.clone()),
                 network: Some(resource(ResourceKind::Network, uuid, "network", 11)),

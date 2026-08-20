@@ -221,7 +221,7 @@ struct StateForDigest<'a> {
     phase: crate::DeploymentPhase,
     approved_plan_digest: &'a Option<PlanDigest>,
     pending_effect: &'a Option<crate::PendingEffect>,
-    exact_release: &'a Option<String>,
+    release_identity: &'a Option<crate::ExactReleaseIdentity>,
     gcp_resources: &'a crate::GcpResources,
     ssh_host_identity: &'a Option<crate::SshHostIdentity>,
     host_receipt: &'a Option<crate::HostReceipt>,
@@ -237,7 +237,7 @@ fn state_digest_input(state: &DeploymentState) -> Result<Vec<u8>> {
         phase: state.phase,
         approved_plan_digest: &state.approved_plan_digest,
         pending_effect: &state.pending_effect,
-        exact_release: &state.exact_release,
+        release_identity: &state.release_identity,
         gcp_resources: &state.gcp_resources,
         ssh_host_identity: &state.ssh_host_identity,
         host_receipt: &state.host_receipt,
@@ -449,6 +449,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::release::test_release_identity;
     use crate::{DeploymentPhase, GcpResources, LocalWiringStatus, ProjectIdentity};
 
     fn state(service_id: &str) -> DeploymentState {
@@ -468,7 +469,7 @@ mod tests {
                     .unwrap(),
             ),
             pending_effect: None,
-            exact_release: Some("v0.1.0".to_owned()),
+            release_identity: Some(test_release_identity()),
             gcp_resources: GcpResources::default(),
             ssh_host_identity: None,
             host_receipt: None,
@@ -487,6 +488,7 @@ mod tests {
             store.write(&state(service_id)).unwrap();
             let read = store.read().unwrap().unwrap();
             assert!(read.integrity_digest.starts_with("hmac-sha256:"));
+            assert_eq!(read.release_identity, Some(test_release_identity()));
         }
         {
             let store = StateStore::open(temporary.path(), service_id).unwrap();

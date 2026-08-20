@@ -10,6 +10,8 @@ mod error;
 mod model;
 mod paths;
 mod plan;
+mod pricing;
+mod release;
 mod state_store;
 
 pub use config::{DeploymentConfig, DnsMode, ReleaseSelection, SCHEMA_VERSION};
@@ -25,5 +27,12 @@ pub use plan::{
     BootDiskDisposition, CanonicalDeploymentSpec, CloudWorkerDisposition, DeploymentPlan,
     DeploymentPlanStage, DestroyPlan, DestroyTarget, DnsChangeApproval, PlanDnsObservation,
     PlannedEffect,
+};
+pub use pricing::{
+    PricingCurrency, PricingLine, PricingQuote, RationalQuantity, UnpricedExclusion,
+};
+pub use release::{
+    ExactReleaseIdentity, LinuxAmd64ApplicationIdentity, LinuxAmd64UpdaterIdentity, ReleaseTag,
+    Sha256Digest, SigningKeyIdentity, SourceRevision,
 };
 pub use state_store::StateStore;

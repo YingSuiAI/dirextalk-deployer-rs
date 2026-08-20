@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{CoreError, PlanDigest, Result, SCHEMA_VERSION, validate_service_id};
+use crate::{
+    CoreError, ExactReleaseIdentity, PlanDigest, ReleaseTag, Result, SCHEMA_VERSION, Sha256Digest,
+    validate_service_id,
+};
 
 /// Immutable authenticated GCP project and OAuth-principal binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,9 +143,9 @@ pub struct SshHostIdentity {
 #[serde(deny_unknown_fields)]
 pub struct HostReceipt {
     pub deployment_uuid: Uuid,
-    pub exact_release: String,
-    pub installer_sha256: String,
-    pub bundle_sha256: String,
+    pub release_tag: ReleaseTag,
+    pub host_installer_sha256: Sha256Digest,
+    pub runtime_bundle_sha256: Sha256Digest,
     pub installed_at_unix_ms: u64,
     pub receipt_signature: String,
 }
@@ -171,7 +174,7 @@ pub struct DeploymentState {
     /// separate digest derived from the identity-bound resource receipts.
     pub approved_plan_digest: Option<PlanDigest>,
     pub pending_effect: Option<PendingEffect>,
-    pub exact_release: Option<String>,
+    pub release_identity: Option<ExactReleaseIdentity>,
     pub gcp_resources: GcpResources,
     pub ssh_host_identity: Option<SshHostIdentity>,
     pub host_receipt: Option<HostReceipt>,
@@ -216,6 +219,19 @@ impl DeploymentState {
                 "active deployment requires an approved plan digest",
             ));
         }
+        if matches!(
+            self.phase,
+            DeploymentPhase::Applying
+                | DeploymentPhase::WaitingUser
+                | DeploymentPhase::Installed
+                | DeploymentPhase::Complete
+                | DeploymentPhase::Destroying
+        ) && self.release_identity.is_none()
+        {
+            return Err(CoreError::InvalidState(
+                "active deployment requires exact release identity",
+            ));
+        }
         for (expected_kind, resource) in self.gcp_resources.iter() {
             validate_resource(
                 resource,
@@ -235,11 +251,6 @@ impl DeploymentState {
                 self.project_identity.project_number,
                 self.deployment_uuid,
             )?;
-        }
-        if let Some(exact_release) = &self.exact_release
-            && !valid_identifier(exact_release)
-        {
-            return Err(CoreError::InvalidState("exact release is invalid"));
         }
         if let Some(identity) = &self.ssh_host_identity
             && (identity.address.is_empty()
@@ -356,15 +367,19 @@ fn validate_host(state: &DeploymentState) -> Result<()> {
     let Some(receipt) = &state.host_receipt else {
         return Ok(());
     };
+    let Some(release) = &state.release_identity else {
+        return Err(CoreError::InvalidState(
+            "host receipt requires exact release identity",
+        ));
+    };
     if receipt.deployment_uuid != state.deployment_uuid
-        || state.exact_release.as_deref() != Some(receipt.exact_release.as_str())
+        || receipt.release_tag != release.release_tag
+        || receipt.host_installer_sha256 != release.host_installer_linux_amd64_sha256
+        || receipt.runtime_bundle_sha256 != release.runtime_bundle_linux_amd64_sha256
     {
         return Err(CoreError::InvalidState("host receipt identity mismatch"));
     }
-    if !valid_sha256(&receipt.installer_sha256)
-        || !valid_sha256(&receipt.bundle_sha256)
-        || receipt.receipt_signature.is_empty()
-    {
+    if !valid_sha256(&receipt.receipt_signature) {
         return Err(CoreError::InvalidState("host receipt is incomplete"));
     }
     Ok(())
@@ -482,13 +497,6 @@ fn valid_ipv4_cidr(value: &str, require_host: bool) -> bool {
     u32::from(address) & mask == u32::from(address)
 }
 
-fn valid_identifier(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
-}
-
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -533,6 +541,7 @@ pub struct ProgressEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::release::test_release_identity;
 
     fn state() -> DeploymentState {
         DeploymentState {
@@ -551,7 +560,7 @@ mod tests {
                     .unwrap(),
             ),
             pending_effect: None,
-            exact_release: None,
+            release_identity: Some(test_release_identity()),
             gcp_resources: GcpResources::default(),
             ssh_host_identity: None,
             host_receipt: None,
@@ -652,17 +661,42 @@ mod tests {
     }
 
     #[test]
-    fn host_receipt_requires_release_and_pinned_host() {
+    fn host_receipt_requires_exact_release_artifacts_and_pinned_host() {
         let mut state = state();
-        state.host_receipt = Some(HostReceipt {
+        let release = state.release_identity.as_ref().unwrap();
+        let receipt = HostReceipt {
             deployment_uuid: state.deployment_uuid,
-            exact_release: "v0.1.0".to_owned(),
-            installer_sha256: "a".repeat(64),
-            bundle_sha256: "b".repeat(64),
+            release_tag: release.release_tag.clone(),
+            host_installer_sha256: release.host_installer_linux_amd64_sha256.clone(),
+            runtime_bundle_sha256: release.runtime_bundle_linux_amd64_sha256.clone(),
             installed_at_unix_ms: 1,
-            receipt_signature: "signature".to_owned(),
-        });
+            receipt_signature: "d".repeat(64),
+        };
+        state.host_receipt = Some(receipt.clone());
         assert!(state.validate().is_err());
+
+        state.ssh_host_identity = Some(SshHostIdentity {
+            address: "203.0.113.42".to_owned(),
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint_sha256: "SHA256:host-key".to_owned(),
+        });
+        assert!(state.validate().is_ok());
+
+        let mut wrong_installer = receipt.clone();
+        wrong_installer.host_installer_sha256 = Sha256Digest::parse("e".repeat(64)).unwrap();
+        state.host_receipt = Some(wrong_installer);
+        assert!(matches!(
+            state.validate(),
+            Err(CoreError::InvalidState("host receipt identity mismatch"))
+        ));
+
+        let mut wrong_bundle = receipt;
+        wrong_bundle.runtime_bundle_sha256 = Sha256Digest::parse("f".repeat(64)).unwrap();
+        state.host_receipt = Some(wrong_bundle);
+        assert!(matches!(
+            state.validate(),
+            Err(CoreError::InvalidState("host receipt identity mismatch"))
+        ));
     }
 
     #[test]

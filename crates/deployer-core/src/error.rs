@@ -18,6 +18,8 @@ pub enum CoreError {
     InvalidPlanDigest,
     #[error("deployment plan is not valid: {0}")]
     InvalidPlan(&'static str),
+    #[error("release identity is not valid: {0}")]
+    InvalidReleaseIdentity(&'static str),
     #[error("service id is invalid")]
     InvalidServiceId,
     #[error("deployment state is not valid: {0}")]
