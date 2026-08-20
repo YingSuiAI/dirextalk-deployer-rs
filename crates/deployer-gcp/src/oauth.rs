@@ -16,28 +16,29 @@ use crate::{GcpError, Result, SecretStore};
 const REFRESH_TOKEN_ACCOUNT: &str = "google-oauth-refresh-token";
 const MAX_CALLBACK_HEADER_BYTES: usize = 8192;
 const ACCESS_TOKEN_EXPIRY_MARGIN: Duration = Duration::from_mins(1);
+const PRODUCT_GOOGLE_OAUTH_CLIENT_ID_SOURCE: &str = include_str!("../google-oauth-client-id.txt");
 
 #[derive(Debug, Clone)]
 pub struct InstalledAppConfig {
-    pub client_id: String,
-    pub client_secret: Option<SecretString>,
-    pub scopes: Vec<String>,
-    pub authorization_endpoint: Url,
-    pub token_endpoint: Url,
-    pub revocation_endpoint: Url,
-    pub userinfo_endpoint: Url,
-    pub callback_timeout: Duration,
+    client_id: String,
+    client_secret: Option<SecretString>,
+    scopes: Vec<String>,
+    authorization_endpoint: Url,
+    token_endpoint: Url,
+    revocation_endpoint: Url,
+    userinfo_endpoint: Url,
+    callback_timeout: Duration,
 }
 
 impl InstalledAppConfig {
     /// Resolves the product-owned native public client id embedded by the
     /// build. Runtime user input and environment overrides are never accepted.
     pub fn from_build() -> Result<Self> {
-        let client_id = resolve_client_id(option_env!("DIREXTALK_GOOGLE_OAUTH_CLIENT_ID"))?;
+        let client_id = resolve_client_id(PRODUCT_GOOGLE_OAUTH_CLIENT_ID_SOURCE)?;
         Self::google(client_id)
     }
 
-    pub fn google(client_id: impl Into<String>) -> Result<Self> {
+    fn google(client_id: impl Into<String>) -> Result<Self> {
         Ok(Self {
             client_id: client_id.into(),
             client_secret: None,
@@ -54,16 +55,37 @@ impl InstalledAppConfig {
     }
 }
 
-fn resolve_client_id(compiled: Option<&str>) -> Result<String> {
-    match compiled {
-        Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
-        Some(_) => Err(GcpError::Contract(
-            "embedded Google OAuth client id is empty".into(),
-        )),
-        None => Err(GcpError::Contract(
-            "Google OAuth client id is not embedded in this product build".into(),
-        )),
+fn resolve_client_id(source: &str) -> Result<String> {
+    let Some(value) = source.strip_suffix('\n') else {
+        return Err(GcpError::Contract(
+            "embedded Google OAuth client id source is not canonical".into(),
+        ));
+    };
+    let suffix = ".apps.googleusercontent.com";
+    let Some(prefix) = value.strip_suffix(suffix) else {
+        return Err(GcpError::Contract(
+            "embedded Google OAuth client id has an invalid product identity".into(),
+        ));
+    };
+    if prefix.is_empty()
+        || value.trim() != value
+        || value.contains(['\r', '\n'])
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(GcpError::Contract(
+            "embedded Google OAuth client id has an invalid product identity".into(),
+        ));
     }
+    Ok(value.to_owned())
+}
+
+/// Returns the audited identity committed into release provenance without
+/// exposing any runtime or end-user override boundary.
+pub fn product_google_oauth_client_id_sha256() -> Result<String> {
+    let client_id = resolve_client_id(PRODUCT_GOOGLE_OAUTH_CLIENT_ID_SOURCE)?;
+    Ok(hex::encode(Sha256::digest(client_id.as_bytes())))
 }
 
 pub trait BrowserLauncher: Send + Sync {
@@ -591,8 +613,8 @@ mod tests {
 
     use super::{
         BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, OAuthToken, TokenFlow,
-        TokenResponse, UserInfo, read_callback_headers, resolve_client_id, token_is_usable,
-        validate_user_info,
+        TokenResponse, UserInfo, product_google_oauth_client_id_sha256, read_callback_headers,
+        resolve_client_id, token_is_usable, validate_user_info,
     };
     use crate::{GcpError, Result, SecretStore};
 
@@ -724,13 +746,35 @@ mod tests {
     }
 
     #[test]
-    fn client_id_must_be_embedded_by_the_product_build() {
+    fn product_build_uses_the_single_source_owned_public_client() {
+        let config = InstalledAppConfig::from_build().expect("source-owned config");
         assert_eq!(
-            resolve_client_id(Some("audited-compiled-id")).expect("compiled id"),
-            "audited-compiled-id"
+            config.client_id,
+            "211802699132-blfhais5rcnd470kapaagpd12hpq9gck.apps.googleusercontent.com"
         );
-        assert!(resolve_client_id(Some("")).is_err());
-        assert!(resolve_client_id(None).is_err());
+        assert!(config.client_secret.is_none());
+        assert_eq!(
+            product_google_oauth_client_id_sha256().expect("client identity"),
+            "eb775d252766588e3b87c8975e1f84226b524155ad6e28d5d5d6921a8dfd64a3"
+        );
+    }
+
+    #[test]
+    fn product_client_source_shape_fails_closed() {
+        for value in [
+            "",
+            "client-id",
+            " client.apps.googleusercontent.com",
+            "client.apps.googleusercontent.com ",
+            "client.apps.googleusercontent.com\nextra",
+            "client.apps.googleusercontent.com",
+        ] {
+            assert!(resolve_client_id(value).is_err(), "{value:?}");
+        }
+        assert_eq!(
+            resolve_client_id("client.apps.googleusercontent.com\n").expect("client id"),
+            "client.apps.googleusercontent.com"
+        );
     }
 
     #[test]

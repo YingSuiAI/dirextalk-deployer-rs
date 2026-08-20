@@ -15,7 +15,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       SOURCE_REVISION: ${{ github.sha }}
-      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID }}
       DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256 }}
       DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION }}
       DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED }}
@@ -47,13 +46,10 @@ jobs:
           manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
           test "${RELEASE_TAG}" = "v${manifest_version}"
 
-      - name: Require audited OAuth and release trust root
+      - name: Require audited OAuth review and release trust root
         shell: bash
         run: |
           set -euo pipefail
-          [[ "${DIREXTALK_GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]
-          client_hash="$(printf '%s' "${DIREXTALK_GOOGLE_OAUTH_CLIENT_ID}" | sha256sum | awk '{print $1}')"
-          test "${client_hash}" = "${DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256}"
           scope_hash="$(printf '%s\n' \
             installed-public-client loopback-redirect pkce-s256 openid \
             https://www.googleapis.com/auth/cloud-platform | sha256sum | awk '{print $1}')"
@@ -92,7 +88,6 @@ jobs:
             archive: tar
     runs-on: ${{ matrix.os }}
     env:
-      DIREXTALK_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.DIREXTALK_GOOGLE_OAUTH_CLIENT_ID }}
       DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX: ${{ vars.DIREXTALK_RELEASE_ED25519_PUBLIC_KEY_HEX }}
     steps:
       - name: Check out release tag
@@ -113,7 +108,7 @@ jobs:
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
 
-      - name: Build OAuth-configured CLI
+      - name: Build source-configured CLI
         run: cargo build --locked --release -p deployer-cli --target ${{ matrix.target }}
 
       - name: Build Linux host installer

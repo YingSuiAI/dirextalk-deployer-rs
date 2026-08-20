@@ -23,7 +23,7 @@ pub use lifecycle::{
 };
 pub use oauth::{
     BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, LoginRequest, OAuthToken,
-    SystemBrowser,
+    SystemBrowser, product_google_oauth_client_id_sha256,
 };
 pub use official::{GcpImageDiscovery, GoogleCloudClient, ImageIdentity, validate_image_identity};
 pub use preflight::{

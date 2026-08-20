@@ -80,8 +80,9 @@ that browser. Do not paste authorization codes or tokens into chat,
 configuration, shell arguments, or issue reports. Tokens are kept in the
 operating-system credential facility, not deployment state.
 The product-owned OAuth client ID is compiled into the release; end users
-supply neither an OAuth client ID nor a client secret. Authorization requests
-only `openid` and Google Cloud access—never email, name, or profile scopes. The
+supply neither an OAuth client ID nor a client secret, and source builds do not
+read an OAuth client ID from the environment. Authorization requests only
+`openid` and Google Cloud access—never email, name, or profile scopes. The
 opaque Google subject is retained only for account continuity and is not
 emitted by CLI output.
 Use `dirextalk-deployer auth logout` to remove the local OAuth session.

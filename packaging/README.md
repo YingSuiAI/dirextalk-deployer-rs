@@ -31,7 +31,6 @@ allowlisted tag-and-digest image references.
 The tag workflow fails closed until release maintainers configure all of these
 GitHub variables with audited immutable values:
 
-- `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID`
 - `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256`
 - `DIREXTALK_GOOGLE_OAUTH_CONSENT_AUDIT_REVISION`
 - `DIREXTALK_GOOGLE_OAUTH_CONSENT_REVIEWED` (exactly `true`)
@@ -42,6 +41,15 @@ GitHub variables with audited immutable values:
   `DIREXTALK_UPDATER_BINARY_URL`, and `DIREXTALK_UPDATER_BINARY_SHA256`
 - Message Server and Agent `VERSION`, `DIGEST`, and `SOURCE_REVISION` variables
   named in `.github/workflows/release.yml`
+
+The public Desktop OAuth client ID is not a variable or secret. Its only
+authoritative value is the source-controlled
+`crates/deployer-gcp/google-oauth-client-id.txt`, which is included directly in
+every CLI build. The release gate hashes that canonical source value, requires
+it to equal `DIREXTALK_GOOGLE_OAUTH_CLIENT_ID_AUDITED_SHA256`, and writes the
+derived hash into runtime provenance. Change the source artifact and its
+independently reviewed audit hash together; never accept an end-user, runtime,
+or build-environment override.
 
 The reviewed OAuth scope hash is SHA-256 over these newline-terminated lines in
 this exact order:

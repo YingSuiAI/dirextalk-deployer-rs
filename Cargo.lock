@@ -846,6 +846,7 @@ dependencies = [
  "google-cloud-dns-v1",
  "google-cloud-gax",
  "google-cloud-resourcemanager-v3",
+ "hex",
  "http",
  "keyring",
  "open",

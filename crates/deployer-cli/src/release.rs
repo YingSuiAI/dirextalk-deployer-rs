@@ -415,7 +415,7 @@ fn validate_outer(manifest: &ReleaseManifest, tag: &str, key: &str) -> Result<()
     Sha256Digest::parse(&manifest.runtime_bundle.bundle_sha256)?;
     Sha256Digest::parse(&manifest.runtime_bundle.manifest_sha256)?;
     SigningKeyIdentity::parse(key)?;
-    Sha256Digest::parse(&provenance.oauth_client_id_sha256)?;
+    validate_product_oauth_client_identity(&provenance.oauth_client_id_sha256)?;
     SourceRevision::parse(&provenance.oauth_consent_audit_revision)?;
     Sha256Digest::parse(&provenance.oauth_scope_review_sha256)?;
     let decoded_key = decode_hex::<32>(key)
@@ -541,6 +541,19 @@ fn verify_signed(bytes: &[u8], public_key: &str, release: &str) -> Result<Signed
     )
     .map_err(|_| EngineError::Backend("runtime signature verification failed".into()))?;
     Ok(signed)
+}
+
+fn validate_product_oauth_client_identity(value: &str) -> Result<()> {
+    Sha256Digest::parse(value)?;
+    let embedded = deployer_gcp::product_google_oauth_client_id_sha256().map_err(|_| {
+        EngineError::Backend("embedded Google OAuth client identity is invalid".into())
+    })?;
+    if value != embedded {
+        return Err(EngineError::Backend(
+            "release OAuth client identity differs from this product build".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_signed(manifest: &BundleManifest, outer: &ReleaseManifest) -> Result<()> {
@@ -725,5 +738,16 @@ mod tests {
         assert!(decode_hex::<32>(&"a".repeat(64)).is_ok());
         assert!(decode_hex::<32>(&"A".repeat(64)).is_err());
         assert!(decode_hex::<32>(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn release_provenance_is_bound_to_the_source_owned_oauth_client() {
+        assert!(
+            validate_product_oauth_client_identity(
+                "eb775d252766588e3b87c8975e1f84226b524155ad6e28d5d5d6921a8dfd64a3"
+            )
+            .is_ok()
+        );
+        assert!(validate_product_oauth_client_identity(&"0".repeat(64)).is_err());
     }
 }
