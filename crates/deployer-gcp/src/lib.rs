@@ -17,7 +17,9 @@ pub use error::{GcpError, Result};
 pub use lifecycle::{
     AddressSpec, DiskSpec, DnsChange, DnsRecordSet, FirewallAllowance, FirewallSpec, GcpLifecycle,
     InstanceSpec, NetworkSpec, Operation, OperationFailure, OperationScope, OperationState,
-    ResourceIdentity, ResourceKind, ResourceReceipt, SubnetworkSpec, validate_resource_identity,
+    ResourceIdentity, ResourceKind, ResourceReceipt, ResourceSpecRef, SubnetworkSpec,
+    require_dns_change_applied, require_resource_absent, validate_resource_identity,
+    validate_resource_properties,
 };
 pub use oauth::{
     BrowserLauncher, GoogleInstalledApp, InstalledAppConfig, LoginRequest, OAuthToken,

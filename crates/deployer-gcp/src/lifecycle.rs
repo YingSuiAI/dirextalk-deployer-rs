@@ -118,6 +118,20 @@ pub fn validate_resource_identity(
     Ok(())
 }
 
+pub fn require_resource_absent(
+    expected: &ResourceIdentity,
+    observed: Option<&ResourceReceipt>,
+) -> Result<()> {
+    let Some(observed) = observed else {
+        return Ok(());
+    };
+    validate_resource_identity(expected, observed)?;
+    Err(GcpError::Infrastructure(format!(
+        "GCP {:?} delete completed but the exact resource still exists",
+        expected.kind
+    )))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSpec {
@@ -187,6 +201,52 @@ pub struct InstanceSpec {
     pub deployment_uuid: Uuid,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ResourceSpecRef<'a> {
+    Network(&'a NetworkSpec),
+    Subnetwork(&'a SubnetworkSpec),
+    Firewall(&'a FirewallSpec),
+    Address(&'a AddressSpec),
+    Disk(&'a DiskSpec),
+    Instance(&'a InstanceSpec),
+}
+
+pub fn validate_resource_properties(
+    spec: ResourceSpecRef<'_>,
+    receipt: &ResourceReceipt,
+) -> Result<()> {
+    let (kind, name, location, deployment_uuid, expected) = expected_resource_properties(spec);
+    if receipt.identity.kind != kind
+        || receipt.identity.name != name
+        || receipt.identity.location.as_deref() != location
+        || receipt.identity.deployment_uuid != deployment_uuid
+    {
+        return Err(GcpError::Contract(
+            "observed resource does not match the planned resource identity".into(),
+        ));
+    }
+    if kind == ResourceKind::Address {
+        let valid_address = receipt
+            .observed_attributes
+            .get("address")
+            .and_then(Value::as_str)
+            .is_some_and(|address| address.parse::<std::net::Ipv4Addr>().is_ok());
+        if !valid_address {
+            return Err(GcpError::Contract(
+                "observed Address property address does not satisfy the plan".into(),
+            ));
+        }
+    }
+    for (key, expected_value) in expected {
+        if receipt.observed_attributes.get(&key) != Some(&expected_value) {
+            return Err(GcpError::Contract(format!(
+                "observed {kind:?} property {key} does not satisfy the plan"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DnsRecordSet {
@@ -248,7 +308,7 @@ pub trait GcpLifecycle: Send + Sync {
         project_number: &str,
         request_id: Uuid,
         change: &DnsChange,
-    ) -> Result<Operation>;
+    ) -> Result<Option<Operation>>;
     async fn poll_operation(
         &self,
         project_number: &str,
@@ -260,13 +320,13 @@ pub trait GcpLifecycle: Send + Sync {
         kind: ResourceKind,
         name: &str,
         location: Option<&str>,
-    ) -> Result<ResourceReceipt>;
+    ) -> Result<Option<ResourceReceipt>>;
     async fn start_delete(
         &self,
         project_number: &str,
         request_id: Uuid,
         identity: &ResourceIdentity,
-    ) -> Result<Operation>;
+    ) -> Result<Option<Operation>>;
 }
 
 #[derive(Deserialize)]
@@ -516,7 +576,7 @@ impl GcpLifecycle for GoogleRestClient {
         project_number: &str,
         request_id: Uuid,
         change: &DnsChange,
-    ) -> Result<Operation> {
+    ) -> Result<Option<Operation>> {
         validate_name(&change.managed_zone)?;
         validate_dns_change(change)?;
         self.revalidate_project(project_number).await?;
@@ -533,10 +593,8 @@ impl GcpLifecycle for GoogleRestClient {
             "A",
         )
         .await?;
-        if !dns_current_allows_resume(change, current.as_ref()) {
-            return Err(GcpError::Contract(
-                "Cloud DNS A record changed after planning; a new explicit plan is required".into(),
-            ));
+        if dns_change_already_satisfied(change, current.as_ref())? {
+            return Ok(None);
         }
         self.revalidate_project(project_number).await?;
         let base_url = Url::parse(&format!(
@@ -568,7 +626,7 @@ impl GcpLifecycle for GoogleRestClient {
             scope: OperationScope::DnsZone(change.managed_zone.clone()),
         };
         match response.status.as_str() {
-            "pending" | "done" => Ok(operation),
+            "pending" | "done" => Ok(Some(operation)),
             other => Err(GcpError::Infrastructure(format!(
                 "Cloud DNS change returned unknown status {other}"
             ))),
@@ -617,11 +675,15 @@ impl GcpLifecycle for GoogleRestClient {
         kind: ResourceKind,
         name: &str,
         location: Option<&str>,
-    ) -> Result<ResourceReceipt> {
+    ) -> Result<Option<ResourceReceipt>> {
         validate_name(name)?;
         self.revalidate_project(project_number).await?;
         let (url, expected_location) = resource_url(&self.project_id, kind, name, location)?;
-        let resource: ResourceWire = self.get(url).await?;
+        let resource: ResourceWire = match self.get(url).await {
+            Ok(resource) => resource,
+            Err(GcpError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         require_self_link(
             &resource.self_link,
             &self.project_id,
@@ -639,7 +701,7 @@ impl GcpLifecycle for GoogleRestClient {
                 "resource name or location changed".into(),
             ));
         }
-        Ok(ResourceReceipt {
+        Ok(Some(ResourceReceipt {
             identity: ResourceIdentity {
                 kind,
                 name: resource.name,
@@ -650,7 +712,7 @@ impl GcpLifecycle for GoogleRestClient {
                 deployment_uuid,
             },
             observed_attributes: resource.attributes,
-        })
+        }))
     }
 
     async fn start_delete(
@@ -658,20 +720,23 @@ impl GcpLifecycle for GoogleRestClient {
         project_number: &str,
         request_id: Uuid,
         identity: &ResourceIdentity,
-    ) -> Result<Operation> {
+    ) -> Result<Option<Operation>> {
         if identity.project_number != project_number {
             return Err(GcpError::Contract(
                 "delete project identity mismatch".into(),
             ));
         }
-        let observed = self
+        let Some(observed) = self
             .get_resource(
                 project_number,
                 identity.kind,
                 &identity.name,
                 identity.location.as_deref(),
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         validate_resource_identity(identity, &observed)?;
         let mut url = Url::parse(&identity.self_link)?;
         require_self_link(
@@ -683,7 +748,7 @@ impl GcpLifecycle for GoogleRestClient {
         url.query_pairs_mut()
             .append_pair("requestId", &request_id.to_string());
         let response: OperationWire = self.mutate(Method::DELETE, url, None).await?;
-        operation_from_wire(response, project_number, scope_for_resource(identity)?)
+        operation_from_wire(response, project_number, scope_for_resource(identity)?).map(Some)
     }
 }
 
@@ -984,7 +1049,7 @@ impl GcpLifecycle for GoogleCloudClient {
         project_number: &str,
         request_id: Uuid,
         change: &DnsChange,
-    ) -> Result<Operation> {
+    ) -> Result<Option<Operation>> {
         validate_name(&change.managed_zone)?;
         validate_dns_change(change)?;
         self.revalidate_project(project_number).await?;
@@ -1001,10 +1066,8 @@ impl GcpLifecycle for GoogleCloudClient {
             "A",
         )
         .await?;
-        if !dns_current_allows_resume(change, current.as_ref()) {
-            return Err(GcpError::Contract(
-                "Cloud DNS A record changed after planning; a new explicit plan is required".into(),
-            ));
+        if dns_change_already_satisfied(change, current.as_ref())? {
+            return Ok(None);
         }
         self.revalidate_project(project_number).await?;
         let convert = |record: &DnsRecordSet| {
@@ -1031,7 +1094,7 @@ impl GcpLifecycle for GoogleCloudClient {
         let id = response
             .id
             .ok_or_else(|| GcpError::Infrastructure("Cloud DNS operation omitted id".into()))?;
-        Ok(Operation {
+        Ok(Some(Operation {
             name: id.clone(),
             self_link: format!(
                 "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes/{id}",
@@ -1039,7 +1102,7 @@ impl GcpLifecycle for GoogleCloudClient {
             ),
             project_number: project_number.into(),
             scope: OperationScope::DnsZone(change.managed_zone.clone()),
-        })
+        }))
     }
 
     async fn poll_operation(
@@ -1116,7 +1179,7 @@ impl GcpLifecycle for GoogleCloudClient {
         kind: ResourceKind,
         name: &str,
         location: Option<&str>,
-    ) -> Result<ResourceReceipt> {
+    ) -> Result<Option<ResourceReceipt>> {
         self.get_resource_sdk(project_number, kind, name, location)
             .await
     }
@@ -1126,20 +1189,23 @@ impl GcpLifecycle for GoogleCloudClient {
         project_number: &str,
         request_id: Uuid,
         identity: &ResourceIdentity,
-    ) -> Result<Operation> {
+    ) -> Result<Option<Operation>> {
         if identity.project_number != project_number {
             return Err(GcpError::Contract(
                 "delete project identity mismatch".into(),
             ));
         }
-        let observed = self
+        let Some(observed) = self
             .get_resource_sdk(
                 project_number,
                 identity.kind,
                 &identity.name,
                 identity.location.as_deref(),
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         validate_resource_identity(identity, &observed)?;
         self.revalidate_project(project_number).await?;
         let response = match identity.kind {
@@ -1215,7 +1281,7 @@ impl GcpLifecycle for GoogleCloudClient {
             }
         }
         .map_err(crate::official::official_error)?;
-        operation_from_sdk(response, project_number, scope_for_resource(identity)?)
+        operation_from_sdk(response, project_number, scope_for_resource(identity)?).map(Some)
     }
 }
 
@@ -1264,44 +1330,34 @@ impl GoogleCloudClient {
         kind: ResourceKind,
         name: &str,
         location: Option<&str>,
-    ) -> Result<ResourceReceipt> {
+    ) -> Result<Option<ResourceReceipt>> {
         validate_name(name)?;
         self.revalidate_project(project_number).await?;
         match kind {
             ResourceKind::Network => {
-                let value = self
-                    .networks
-                    .get()
-                    .set_project(&self.project_id)
-                    .set_network(name)
-                    .send()
-                    .await
-                    .map_err(crate::official::official_error)?;
-                sdk_receipt(
-                    kind,
-                    name,
-                    &self.project_id,
-                    project_number,
-                    None,
-                    value.id,
-                    value.self_link,
-                    value.description,
-                    None,
-                    BTreeMap::from([(
+                let Some(value) = optional_sdk_response(
+                    self.networks
+                        .get()
+                        .set_project(&self.project_id)
+                        .set_network(name)
+                        .send()
+                        .await,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let routing_mode = value
+                    .routing_config
+                    .as_ref()
+                    .and_then(|config| config.routing_mode.as_ref())
+                    .and_then(|mode| mode.name());
+                let attributes = BTreeMap::from([
+                    (
                         "auto_create_subnetworks".into(),
                         json!(value.auto_create_subnetworks),
-                    )]),
-                )
-            }
-            ResourceKind::Firewall => {
-                let value = self
-                    .firewalls
-                    .get()
-                    .set_project(&self.project_id)
-                    .set_firewall(name)
-                    .send()
-                    .await
-                    .map_err(crate::official::official_error)?;
+                    ),
+                    ("routing_mode".into(), json!(routing_mode)),
+                ]);
                 sdk_receipt(
                     kind,
                     name,
@@ -1312,20 +1368,80 @@ impl GoogleCloudClient {
                     value.self_link,
                     value.description,
                     None,
-                    BTreeMap::from([("network".into(), json!(value.network))]),
+                    attributes,
                 )
+                .map(Some)
+            }
+            ResourceKind::Firewall => {
+                let Some(value) = optional_sdk_response(
+                    self.firewalls
+                        .get()
+                        .set_project(&self.project_id)
+                        .set_firewall(name)
+                        .send()
+                        .await,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let allowed: Vec<_> = value
+                    .allowed
+                    .iter()
+                    .map(|allowed| FirewallAllowance {
+                        protocol: allowed.ip_protocol.clone().unwrap_or_default(),
+                        ports: allowed.ports.clone(),
+                    })
+                    .collect();
+                let attributes = BTreeMap::from([
+                    ("allowed".into(), normalized_firewall_allowances(&allowed)),
+                    (
+                        "network".into(),
+                        json!(value.network.as_deref().map(normalized_resource_reference)),
+                    ),
+                    (
+                        "source_ranges".into(),
+                        json!(sorted_strings(value.source_ranges.clone())),
+                    ),
+                    (
+                        "target_tags".into(),
+                        json!(sorted_strings(value.target_tags.clone())),
+                    ),
+                ]);
+                sdk_receipt(
+                    kind,
+                    name,
+                    &self.project_id,
+                    project_number,
+                    None,
+                    value.id,
+                    value.self_link,
+                    value.description,
+                    None,
+                    attributes,
+                )
+                .map(Some)
             }
             ResourceKind::Subnetwork => {
                 let region = required_location(kind, location)?;
-                let value = self
-                    .subnetworks
-                    .get()
-                    .set_project(&self.project_id)
-                    .set_region(region)
-                    .set_subnetwork(name)
-                    .send()
-                    .await
-                    .map_err(crate::official::official_error)?;
+                let Some(value) = optional_sdk_response(
+                    self.subnetworks
+                        .get()
+                        .set_project(&self.project_id)
+                        .set_region(region)
+                        .set_subnetwork(name)
+                        .send()
+                        .await,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let attributes = BTreeMap::from([
+                    ("ip_cidr_range".into(), json!(value.ip_cidr_range)),
+                    (
+                        "network".into(),
+                        json!(value.network.as_deref().map(normalized_resource_reference)),
+                    ),
+                ]);
                 sdk_receipt(
                     kind,
                     name,
@@ -1336,23 +1452,24 @@ impl GoogleCloudClient {
                     value.self_link,
                     value.description,
                     None,
-                    BTreeMap::from([
-                        ("ip_cidr_range".into(), json!(value.ip_cidr_range)),
-                        ("network".into(), json!(value.network)),
-                    ]),
+                    attributes,
                 )
+                .map(Some)
             }
             ResourceKind::Address => {
                 let region = required_location(kind, location)?;
-                let value = self
-                    .addresses
-                    .get()
-                    .set_project(&self.project_id)
-                    .set_region(region)
-                    .set_address(name)
-                    .send()
-                    .await
-                    .map_err(crate::official::official_error)?;
+                let Some(value) = optional_sdk_response(
+                    self.addresses
+                        .get()
+                        .set_project(&self.project_id)
+                        .set_region(region)
+                        .set_address(name)
+                        .send()
+                        .await,
+                )?
+                else {
+                    return Ok(None);
+                };
                 sdk_receipt(
                     kind,
                     name,
@@ -1365,18 +1482,33 @@ impl GoogleCloudClient {
                     Some(&value.labels),
                     BTreeMap::from([("address".into(), json!(value.address))]),
                 )
+                .map(Some)
             }
             ResourceKind::Disk => {
                 let zone = required_location(kind, location)?;
-                let value = self
-                    .disks
-                    .get()
-                    .set_project(&self.project_id)
-                    .set_zone(zone)
-                    .set_disk(name)
-                    .send()
-                    .await
-                    .map_err(crate::official::official_error)?;
+                let Some(value) = optional_sdk_response(
+                    self.disks
+                        .get()
+                        .set_project(&self.project_id)
+                        .set_zone(zone)
+                        .set_disk(name)
+                        .send()
+                        .await,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let attributes = BTreeMap::from([
+                    ("size_gb".into(), json!(value.size_gb)),
+                    (
+                        "source_image".into(),
+                        json!(value.source_image.as_deref().and_then(last_path_segment)),
+                    ),
+                    (
+                        "type".into(),
+                        json!(value.r#type.as_deref().and_then(last_path_segment)),
+                    ),
+                ]);
                 sdk_receipt(
                     kind,
                     name,
@@ -1387,28 +1519,101 @@ impl GoogleCloudClient {
                     value.self_link,
                     value.description,
                     Some(&value.labels),
-                    BTreeMap::from([
-                        ("size_gb".into(), json!(value.size_gb)),
-                        ("type".into(), json!(value.r#type)),
-                    ]),
+                    attributes,
                 )
+                .map(Some)
             }
             ResourceKind::Instance => {
                 let zone = required_location(kind, location)?;
-                let value = self
-                    .instances
-                    .get()
-                    .set_project(&self.project_id)
-                    .set_zone(zone)
-                    .set_instance(name)
-                    .send()
-                    .await
-                    .map_err(crate::official::official_error)?;
+                let Some(value) = optional_sdk_response(
+                    self.instances
+                        .get()
+                        .set_project(&self.project_id)
+                        .set_zone(zone)
+                        .set_instance(name)
+                        .send()
+                        .await,
+                )?
+                else {
+                    return Ok(None);
+                };
                 if !value.service_accounts.is_empty() {
                     return Err(GcpError::Contract(
                         "observed VM unexpectedly has a project service account".into(),
                     ));
                 }
+                let boot_disk = value.disks.iter().find(|disk| disk.boot == Some(true));
+                let interface = value.network_interfaces.first();
+                let access_config =
+                    interface.and_then(|interface| interface.access_configs.first());
+                let metadata_items = value
+                    .metadata
+                    .as_ref()
+                    .map_or(&[][..], |metadata| metadata.items.as_slice());
+                let ssh_keys_hash = metadata_items
+                    .iter()
+                    .find(|item| item.key.as_deref() == Some("ssh-keys"))
+                    .and_then(|item| item.value.as_ref())
+                    .map(|value| sha256_hex(value));
+                let attributes = BTreeMap::from([
+                    (
+                        "access_config_count".into(),
+                        json!(interface.map_or(0, |interface| interface.access_configs.len())),
+                    ),
+                    (
+                        "boot_disk".into(),
+                        json!(
+                            boot_disk
+                                .and_then(|disk| disk.source.as_deref())
+                                .map(normalized_resource_reference)
+                        ),
+                    ),
+                    (
+                        "boot_disk_auto_delete".into(),
+                        json!(boot_disk.and_then(|disk| disk.auto_delete)),
+                    ),
+                    ("can_ip_forward".into(), json!(value.can_ip_forward)),
+                    (
+                        "deletion_protection".into(),
+                        json!(value.deletion_protection),
+                    ),
+                    ("disk_count".into(), json!(value.disks.len())),
+                    (
+                        "machine_type".into(),
+                        json!(value.machine_type.as_deref().and_then(last_path_segment)),
+                    ),
+                    ("metadata_key_count".into(), json!(metadata_items.len())),
+                    (
+                        "nat_ip".into(),
+                        json!(access_config.and_then(|access| access.nat_ip.as_deref())),
+                    ),
+                    (
+                        "network_interface_count".into(),
+                        json!(value.network_interfaces.len()),
+                    ),
+                    (
+                        "network_tags".into(),
+                        json!(sorted_strings(
+                            value
+                                .tags
+                                .as_ref()
+                                .map_or_else(Vec::new, |tags| tags.items.clone())
+                        )),
+                    ),
+                    (
+                        "service_account_count".into(),
+                        json!(value.service_accounts.len()),
+                    ),
+                    ("ssh_keys_sha256".into(), json!(ssh_keys_hash)),
+                    (
+                        "subnetwork".into(),
+                        json!(
+                            interface
+                                .and_then(|interface| interface.subnetwork.as_deref())
+                                .map(normalized_resource_reference)
+                        ),
+                    ),
+                ]);
                 sdk_receipt(
                     kind,
                     name,
@@ -1419,13 +1624,21 @@ impl GoogleCloudClient {
                     value.self_link,
                     value.description,
                     Some(&value.labels),
-                    BTreeMap::from([
-                        ("machine_type".into(), json!(value.machine_type)),
-                        ("service_accounts".into(), json!([])),
-                    ]),
+                    attributes,
                 )
+                .map(Some)
             }
         }
+    }
+}
+
+fn optional_sdk_response<T>(
+    response: std::result::Result<T, google_cloud_gax::error::Error>,
+) -> Result<Option<T>> {
+    match response {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.http_status_code() == Some(404) => Ok(None),
+        Err(error) => Err(crate::official::official_error(error)),
     }
 }
 
@@ -1684,10 +1897,11 @@ fn trusted_operation_url(value: &str, project_id: &str) -> Result<Url> {
 
 fn require_self_link(value: &str, project_id: &str, collection: &str) -> Result<()> {
     let url = Url::parse(value)?;
+    let trusted_api = matches!(url.host_str(), Some("compute.googleapis.com"))
+        || (url.host_str() == Some("www.googleapis.com") && url.path().starts_with("/compute/v1/"))
+        || matches!(url.host_str(), Some("dns.googleapis.com"));
     if url.scheme() != "https"
-        || url
-            .host_str()
-            .is_none_or(|host| host != "compute.googleapis.com" && host != "dns.googleapis.com")
+        || !trusted_api
         || !url.path().contains(&format!("/projects/{project_id}/"))
         || !url.path().contains(collection)
         || url.query().is_some()
@@ -1780,8 +1994,197 @@ fn validate_dns_change(change: &DnsChange) -> Result<()> {
     Ok(())
 }
 
-fn dns_current_allows_resume(change: &DnsChange, current: Option<&DnsRecordSet>) -> bool {
-    current == change.expected_current.as_ref() || current == change.additions.first()
+#[expect(
+    clippy::too_many_lines,
+    reason = "the six public resource specs are normalized into one validation contract"
+)]
+fn expected_resource_properties(
+    spec: ResourceSpecRef<'_>,
+) -> (
+    ResourceKind,
+    &str,
+    Option<&str>,
+    Uuid,
+    BTreeMap<String, Value>,
+) {
+    match spec {
+        ResourceSpecRef::Network(spec) => (
+            ResourceKind::Network,
+            &spec.name,
+            None,
+            spec.deployment_uuid,
+            BTreeMap::from([
+                ("auto_create_subnetworks".into(), json!(false)),
+                ("routing_mode".into(), json!("GLOBAL")),
+            ]),
+        ),
+        ResourceSpecRef::Subnetwork(spec) => (
+            ResourceKind::Subnetwork,
+            &spec.name,
+            Some(&spec.region),
+            spec.deployment_uuid,
+            BTreeMap::from([
+                ("ip_cidr_range".into(), json!(spec.cidr)),
+                (
+                    "network".into(),
+                    json!(normalized_resource_reference(&spec.network_self_link)),
+                ),
+            ]),
+        ),
+        ResourceSpecRef::Firewall(spec) => (
+            ResourceKind::Firewall,
+            &spec.name,
+            None,
+            spec.deployment_uuid,
+            BTreeMap::from([
+                (
+                    "allowed".into(),
+                    normalized_firewall_allowances(&spec.allowed),
+                ),
+                (
+                    "network".into(),
+                    json!(normalized_resource_reference(&spec.network_self_link)),
+                ),
+                (
+                    "source_ranges".into(),
+                    json!(sorted_strings(spec.source_ranges.clone())),
+                ),
+                (
+                    "target_tags".into(),
+                    json!(sorted_strings(vec![spec.target_tag.clone()])),
+                ),
+            ]),
+        ),
+        ResourceSpecRef::Address(spec) => (
+            ResourceKind::Address,
+            &spec.name,
+            Some(&spec.region),
+            spec.deployment_uuid,
+            BTreeMap::new(),
+        ),
+        ResourceSpecRef::Disk(spec) => (
+            ResourceKind::Disk,
+            &spec.name,
+            Some(&spec.zone),
+            spec.deployment_uuid,
+            BTreeMap::from([
+                ("size_gb".into(), json!(spec.size_gib)),
+                (
+                    "source_image".into(),
+                    json!(last_path_segment(&spec.source_image).unwrap_or(&spec.source_image)),
+                ),
+                ("type".into(), json!(spec.disk_type)),
+            ]),
+        ),
+        ResourceSpecRef::Instance(spec) => (
+            ResourceKind::Instance,
+            &spec.name,
+            Some(&spec.zone),
+            spec.deployment_uuid,
+            BTreeMap::from([
+                ("access_config_count".into(), json!(1)),
+                ("boot_disk_auto_delete".into(), json!(false)),
+                (
+                    "boot_disk".into(),
+                    json!(normalized_resource_reference(&spec.boot_disk_self_link)),
+                ),
+                ("can_ip_forward".into(), json!(false)),
+                ("deletion_protection".into(), json!(false)),
+                ("disk_count".into(), json!(1)),
+                ("machine_type".into(), json!(spec.machine_type)),
+                ("metadata_key_count".into(), json!(1)),
+                ("nat_ip".into(), json!(spec.address)),
+                ("network_interface_count".into(), json!(1)),
+                (
+                    "network_tags".into(),
+                    json!(sorted_strings(spec.network_tags.clone())),
+                ),
+                ("service_account_count".into(), json!(0)),
+                (
+                    "ssh_keys_sha256".into(),
+                    json!(sha256_hex(&format!(
+                        "{}:{}",
+                        spec.ssh_username, spec.ssh_public_key
+                    ))),
+                ),
+                (
+                    "subnetwork".into(),
+                    json!(normalized_resource_reference(&spec.subnetwork_self_link)),
+                ),
+            ]),
+        ),
+    }
+}
+
+fn normalized_resource_reference(value: &str) -> String {
+    value
+        .find("projects/")
+        .map_or_else(|| value.to_owned(), |position| value[position..].to_owned())
+}
+
+fn normalized_firewall_allowances(allowed: &[FirewallAllowance]) -> Value {
+    let mut allowed: Vec<_> = allowed
+        .iter()
+        .map(|allowance| {
+            (
+                allowance.protocol.clone(),
+                sorted_strings(allowance.ports.clone()),
+            )
+        })
+        .collect();
+    allowed.sort();
+    json!(
+        allowed
+            .into_iter()
+            .map(|(protocol, ports)| json!({ "protocol": protocol, "ports": ports }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn sorted_strings(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values
+}
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(value.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn dns_change_already_satisfied(
+    change: &DnsChange,
+    current: Option<&DnsRecordSet>,
+) -> Result<bool> {
+    validate_dns_change(change)?;
+    if current == change.additions.first() {
+        return Ok(true);
+    }
+    if current == change.expected_current.as_ref() {
+        return Ok(false);
+    }
+    Err(GcpError::Contract(
+        "Cloud DNS A record changed after planning; a new explicit plan is required".into(),
+    ))
+}
+
+pub fn require_dns_change_applied(
+    change: &DnsChange,
+    current: Option<&DnsRecordSet>,
+) -> Result<()> {
+    if dns_change_already_satisfied(change, current)? {
+        return Ok(());
+    }
+    Err(GcpError::Infrastructure(
+        "Cloud DNS change completed but the exact planned value is not present".into(),
+    ))
 }
 
 fn last_path_segment(value: &str) -> Option<&str> {
@@ -1806,6 +2209,102 @@ mod tests {
     #[derive(Default)]
     struct RecordingTransport {
         calls: Mutex<Vec<(Method, Url, Option<Value>)>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResourceResponse {
+        Absent,
+        Present(&'static str),
+        InfrastructureFailure,
+    }
+
+    struct DeleteTransport {
+        response: Mutex<ResourceResponse>,
+        deployment_uuid: Uuid,
+        delete_calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for DeleteTransport {
+        async fn request(
+            &self,
+            method: Method,
+            url: Url,
+            _bearer_token: &SecretString,
+            _body: Option<Value>,
+        ) -> Result<RestResponse> {
+            if url.host_str() == Some("cloudresourcemanager.googleapis.com") {
+                return Ok(RestResponse {
+                    status: 200,
+                    body: serde_json::to_vec(
+                        &json!({ "projectNumber": "123", "lifecycleState": "ACTIVE" }),
+                    )
+                    .expect("project JSON"),
+                });
+            }
+            if method == Method::GET {
+                return match *self.response.lock().expect("response lock") {
+                    ResourceResponse::Absent => Ok(RestResponse {
+                        status: 404,
+                        body: Vec::new(),
+                    }),
+                    ResourceResponse::Present(numeric_id) => Ok(RestResponse {
+                        status: 200,
+                        body: serde_json::to_vec(&json!({
+                            "id": numeric_id,
+                            "name": "dirextalk-node",
+                            "selfLink": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/instances/dirextalk-node",
+                            "description": deployment_marker(self.deployment_uuid),
+                            "zone": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a"
+                        }))
+                        .expect("resource JSON"),
+                    }),
+                    ResourceResponse::InfrastructureFailure => Err(GcpError::Infrastructure(
+                        "simulated transport failure".into(),
+                    )),
+                };
+            }
+            *self.delete_calls.lock().expect("delete calls lock") += 1;
+            Ok(RestResponse {
+                status: 200,
+                body: serde_json::to_vec(&json!({
+                    "name": "operation-1",
+                    "selfLink": "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/operations/operation-1",
+                    "status": "PENDING"
+                }))
+                .expect("operation JSON"),
+            })
+        }
+    }
+
+    fn instance_identity(deployment_uuid: Uuid) -> ResourceIdentity {
+        ResourceIdentity {
+            kind: ResourceKind::Instance,
+            name: "dirextalk-node".into(),
+            project_number: "123".into(),
+            location: Some("us-central1-a".into()),
+            numeric_id: "100".into(),
+            self_link: "https://compute.googleapis.com/compute/v1/projects/test-project/zones/us-central1-a/instances/dirextalk-node".into(),
+            deployment_uuid,
+        }
+    }
+
+    fn delete_client(
+        response: ResourceResponse,
+    ) -> (GoogleRestClient, Arc<DeleteTransport>, ResourceIdentity) {
+        let deployment_uuid = Uuid::new_v4();
+        let transport = Arc::new(DeleteTransport {
+            response: Mutex::new(response),
+            deployment_uuid,
+            delete_calls: Mutex::new(0),
+        });
+        let client = GoogleRestClient::with_transport(
+            "test-project",
+            "123",
+            SecretString::from("access-token"),
+            transport.clone(),
+        );
+        (client, transport, instance_identity(deployment_uuid))
     }
 
     #[async_trait]
@@ -1883,6 +2382,24 @@ mod tests {
     }
 
     #[test]
+    fn official_compute_self_links_accept_only_the_canonical_api_path() {
+        require_self_link(
+            "https://www.googleapis.com/compute/v1/projects/test-project/global/networks/dirextalk-network",
+            "test-project",
+            "/global/networks/",
+        )
+        .expect("official SDK self-link");
+        assert!(
+            require_self_link(
+                "https://www.googleapis.com/storage/v1/projects/test-project/global/networks/dirextalk-network",
+                "test-project",
+                "/global/networks/",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn dns_change_requires_exact_owned_value() {
         let owned = DnsRecordSet {
             name: "node.example.com.".into(),
@@ -1905,11 +2422,11 @@ mod tests {
             ..change.clone()
         };
         assert!(validate_dns_change(&stale).is_err());
-        assert!(dns_current_allows_resume(
-            &change,
-            change.expected_current.as_ref()
-        ));
-        assert!(dns_current_allows_resume(&change, None));
+        assert!(
+            !dns_change_already_satisfied(&change, change.expected_current.as_ref())
+                .expect("owned old value may be changed")
+        );
+        assert!(dns_change_already_satisfied(&change, None).expect("absence is desired"));
     }
 
     #[tokio::test]
@@ -1949,5 +2466,199 @@ mod tests {
         let body = body.as_ref().expect("insert body");
         assert!(body.get("serviceAccounts").is_none());
         assert_eq!(body["metadata"]["items"][0]["key"], "ssh-keys");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_treats_absent_target_as_already_satisfied() {
+        let (client, transport, identity) = delete_client(ResourceResponse::Absent);
+
+        let operation = client
+            .start_delete("123", Uuid::new_v4(), &identity)
+            .await
+            .expect("absence is expected");
+
+        assert!(operation.is_none());
+        assert_eq!(*transport.delete_calls.lock().expect("delete calls"), 0);
+        let observed = client
+            .get_resource(
+                "123",
+                identity.kind,
+                &identity.name,
+                identity.location.as_deref(),
+            )
+            .await
+            .expect("optional read");
+        require_resource_absent(&identity, observed.as_ref()).expect("delete postcondition");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_rejects_same_name_replacement() {
+        let (client, transport, identity) = delete_client(ResourceResponse::Present("101"));
+
+        let error = client
+            .start_delete("123", Uuid::new_v4(), &identity)
+            .await
+            .expect_err("replacement must not be deleted");
+
+        assert!(matches!(error, GcpError::Contract(_)));
+        assert_eq!(*transport.delete_calls.lock().expect("delete calls"), 0);
+    }
+
+    #[tokio::test]
+    async fn optional_resource_read_preserves_infrastructure_failure() {
+        let (client, _transport, identity) = delete_client(ResourceResponse::InfrastructureFailure);
+
+        let error = client
+            .get_resource(
+                "123",
+                identity.kind,
+                &identity.name,
+                identity.location.as_deref(),
+            )
+            .await
+            .expect_err("transport failure is not absence");
+
+        assert!(matches!(error, GcpError::Infrastructure(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_starts_only_for_the_exact_owned_resource() {
+        let (client, transport, identity) = delete_client(ResourceResponse::Present("100"));
+
+        let operation = client
+            .start_delete("123", Uuid::new_v4(), &identity)
+            .await
+            .expect("delete start")
+            .expect("operation started");
+
+        assert_eq!(operation.project_number, "123");
+        assert_eq!(*transport.delete_calls.lock().expect("delete calls"), 1);
+        *transport.response.lock().expect("response lock") = ResourceResponse::Absent;
+        let observed = client
+            .get_resource(
+                "123",
+                identity.kind,
+                &identity.name,
+                identity.location.as_deref(),
+            )
+            .await
+            .expect("post-delete read");
+        require_resource_absent(&identity, observed.as_ref()).expect("target is absent");
+    }
+
+    #[test]
+    fn deletion_postcondition_rejects_exact_survivor_and_replacement() {
+        let identity = instance_identity(Uuid::new_v4());
+        let exact = ResourceReceipt {
+            identity: identity.clone(),
+            observed_attributes: BTreeMap::new(),
+        };
+        let replacement = ResourceReceipt {
+            identity: ResourceIdentity {
+                numeric_id: "101".into(),
+                ..identity.clone()
+            },
+            observed_attributes: BTreeMap::new(),
+        };
+
+        assert!(matches!(
+            require_resource_absent(&identity, Some(&exact)),
+            Err(GcpError::Infrastructure(_))
+        ));
+        assert!(matches!(
+            require_resource_absent(&identity, Some(&replacement)),
+            Err(GcpError::Contract(_))
+        ));
+    }
+
+    #[test]
+    fn dns_recovery_accepts_only_exact_old_or_new_value() {
+        let old = DnsRecordSet {
+            name: "node.example.com.".into(),
+            record_type: "A".into(),
+            ttl: 300,
+            rrdatas: vec!["203.0.113.10".into()],
+        };
+        let new = DnsRecordSet {
+            rrdatas: vec!["203.0.113.11".into()],
+            ..old.clone()
+        };
+        let replacement = DnsRecordSet {
+            rrdatas: vec!["203.0.113.12".into()],
+            ..old.clone()
+        };
+        let change = DnsChange {
+            managed_zone: "example".into(),
+            expected_current: Some(old.clone()),
+            additions: vec![new.clone()],
+            deletions: vec![old.clone()],
+        };
+
+        assert!(!dns_change_already_satisfied(&change, Some(&old)).expect("old value"));
+        assert!(dns_change_already_satisfied(&change, Some(&new)).expect("new value"));
+        assert!(matches!(
+            dns_change_already_satisfied(&change, Some(&replacement)),
+            Err(GcpError::Contract(_))
+        ));
+        assert!(matches!(
+            require_dns_change_applied(&change, Some(&old)),
+            Err(GcpError::Infrastructure(_))
+        ));
+    }
+
+    #[test]
+    fn observed_property_drift_fails_with_unchanged_numeric_identity() {
+        let spec = NetworkSpec {
+            name: "dirextalk-network".into(),
+            deployment_uuid: Uuid::new_v4(),
+        };
+        let (_, _, _, _, attributes) =
+            expected_resource_properties(ResourceSpecRef::Network(&spec));
+        let mut receipt = ResourceReceipt {
+            identity: ResourceIdentity {
+                kind: ResourceKind::Network,
+                name: spec.name.clone(),
+                project_number: "123".into(),
+                location: None,
+                numeric_id: "100".into(),
+                self_link: "https://compute.googleapis.com/compute/v1/projects/test-project/global/networks/dirextalk-network".into(),
+                deployment_uuid: spec.deployment_uuid,
+            },
+            observed_attributes: attributes,
+        };
+        validate_resource_properties(ResourceSpecRef::Network(&spec), &receipt)
+            .expect("matching properties");
+
+        receipt
+            .observed_attributes
+            .insert("routing_mode".into(), json!("REGIONAL"));
+        let error = validate_resource_properties(ResourceSpecRef::Network(&spec), &receipt)
+            .expect_err("property drift must fail");
+        assert!(matches!(error, GcpError::Contract(_)));
+        assert_eq!(receipt.identity.numeric_id, "100");
+    }
+
+    #[test]
+    fn instance_observations_hash_ssh_metadata() {
+        let spec = InstanceSpec {
+            name: "dirextalk-node".into(),
+            zone: "us-central1-a".into(),
+            machine_type: "e2-custom-2-4096".into(),
+            subnetwork_self_link:
+                "projects/test-project/regions/us-central1/subnetworks/dirextalk-subnet".into(),
+            address: "203.0.113.10".into(),
+            boot_disk_self_link: "projects/test-project/zones/us-central1-a/disks/dirextalk-disk"
+                .into(),
+            network_tags: vec!["dirextalk-node".into()],
+            ssh_username: "dirextalk".into(),
+            ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".into(),
+            deployment_uuid: Uuid::new_v4(),
+        };
+        let (_, _, _, _, attributes) =
+            expected_resource_properties(ResourceSpecRef::Instance(&spec));
+        let serialized = serde_json::to_string(&attributes).expect("attributes JSON");
+
+        assert!(!serialized.contains(&spec.ssh_public_key));
+        assert!(attributes.contains_key("ssh_keys_sha256"));
     }
 }
