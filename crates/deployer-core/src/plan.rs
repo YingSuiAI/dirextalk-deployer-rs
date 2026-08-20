@@ -1,9 +1,12 @@
-use std::{collections::BTreeSet, net::Ipv4Addr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{validate_attributes, validate_resource};
+use crate::model::{validate_attributes, validate_resource, validate_resource_name_and_location};
 use crate::{
     CoreError, DeploymentConfig, DeploymentState, DnsMode, EffectAction, ExactReleaseIdentity,
     PlanDigest, PricingQuote, ProjectIdentity, ReleaseSelection, ResourceKind, ResourceRef, Result,
@@ -99,7 +102,7 @@ impl CanonicalDeploymentSpec {
 
 /// Stable DNS observation. Sets intentionally serialize in sorted order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "management")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "management")]
 pub enum PlanDnsObservation {
     CloudDns {
         zone_name: String,
@@ -121,7 +124,7 @@ pub struct DnsChangeApproval {
 
 /// Whether a plan starts a deployment or continues the same authenticated
 /// deployment after its static address has been reserved.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "stage")]
 pub enum DeploymentPlanStage {
     Initial,
@@ -129,6 +132,82 @@ pub enum DeploymentPlanStage {
         previous_plan_digest: PlanDigest,
         address: ResourceRef,
     },
+}
+
+impl<'de> Deserialize<'de> for DeploymentPlanStage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "stage")]
+        enum StrictStage {
+            Initial {},
+            DnsContinuation {
+                previous_plan_digest: PlanDigest,
+                address: ResourceRef,
+            },
+        }
+
+        Ok(match StrictStage::deserialize(deserializer)? {
+            StrictStage::Initial {} => Self::Initial,
+            StrictStage::DnsContinuation {
+                previous_plan_digest,
+                address,
+            } => Self::DnsContinuation {
+                previous_plan_digest,
+                address,
+            },
+        })
+    }
+}
+
+/// Exact immutable Ubuntu 24.04 amd64 image resolved before planning.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceImageIdentity {
+    pub project_id: String,
+    pub name: String,
+    pub numeric_id: u64,
+    pub self_link: String,
+}
+
+impl SourceImageIdentity {
+    fn validate(&self) -> Result<()> {
+        if self.project_id != "ubuntu-os-cloud"
+            || self.numeric_id == 0
+            || !self.name.starts_with("ubuntu-2404-")
+            || !self.name.contains("amd64")
+            || self.name.contains("family")
+        {
+            return Err(CoreError::InvalidPlan(
+                "Ubuntu source image identity is invalid",
+            ));
+        }
+        let url = url::Url::parse(&self.self_link)
+            .map_err(|_| CoreError::InvalidPlan("Ubuntu source image self-link is invalid"))?;
+        let expected_path = format!(
+            "/compute/v1/projects/{}/global/images/{}",
+            self.project_id, self.name
+        );
+        if self.self_link.len() > 2_048
+            || url.scheme() != "https"
+            || !matches!(
+                url.host_str(),
+                Some("compute.googleapis.com" | "www.googleapis.com")
+            )
+            || url.path() != expected_path
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(CoreError::InvalidPlan(
+                "Ubuntu source image self-link is invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// An exact planned mutation. Update/delete targets carry full immutable
@@ -141,18 +220,23 @@ pub struct PlannedEffect {
     pub resource_name: String,
     pub location: String,
     pub expected_attributes: std::collections::BTreeMap<String, String>,
+    pub source_image: Option<SourceImageIdentity>,
     pub target: Option<ResourceRef>,
 }
 
 impl PlannedEffect {
     fn validate(&self, identity: &ProjectIdentity, deployment_uuid: Uuid) -> Result<()> {
-        if self.resource_name.is_empty() || self.location.is_empty() {
-            return Err(CoreError::InvalidPlan(
-                "planned effect identity is incomplete",
-            ));
-        }
+        validate_resource_name_and_location(
+            self.resource_kind,
+            &self.resource_name,
+            &self.location,
+        )
+        .map_err(|_| CoreError::InvalidPlan("planned effect identity is incomplete"))?;
         validate_attributes(&self.expected_attributes)
             .map_err(|_| CoreError::InvalidPlan("planned effect attributes are unsafe"))?;
+        if let Some(image) = &self.source_image {
+            image.validate()?;
+        }
         match (self.action, &self.target) {
             (EffectAction::Create, None) => Ok(()),
             (EffectAction::Update | EffectAction::Delete, Some(target)) => {
@@ -215,7 +299,7 @@ impl DeploymentPlan {
             return Err(CoreError::InvalidPlan("plan project identity mismatch"));
         }
         if let ReleaseSelection::Exact(configured) = &self.spec.release
-            && configured != self.release.release_tag.as_str()
+            && configured != &self.release.release_tag
         {
             return Err(CoreError::InvalidPlan(
                 "resolved release differs from exact config selection",
@@ -315,7 +399,14 @@ fn validate_dns(
                 ));
             }
             if let Some(change) = change {
-                validate_cloud_dns_effect(spec, *zone_numeric_id, current_ipv4, *change, effects)?;
+                validate_cloud_dns_effect(
+                    spec,
+                    zone_name,
+                    *zone_numeric_id,
+                    current_ipv4,
+                    *change,
+                    effects,
+                )?;
             }
         }
         PlanDnsObservation::External { .. } => {
@@ -331,6 +422,7 @@ fn validate_dns(
 
 fn validate_cloud_dns_effect(
     spec: &CanonicalDeploymentSpec,
+    zone_name: &str,
     zone_numeric_id: u64,
     current_ipv4: &BTreeSet<Ipv4Addr>,
     change: DnsChangeApproval,
@@ -342,11 +434,23 @@ fn validate_cloud_dns_effect(
     let effect = dns_effects
         .next()
         .ok_or(CoreError::InvalidPlan("DNS change effect is missing"))?;
+    let current_values =
+        serde_json::to_string(current_ipv4).map_err(|_| CoreError::CanonicalSerialization)?;
+    let expected_attributes = BTreeMap::from([
+        ("current_values".to_owned(), current_values.clone()),
+        ("ttl".to_owned(), "300".to_owned()),
+        ("value".to_owned(), change.replacement_ipv4.to_string()),
+        ("zone_name".to_owned(), zone_name.to_owned()),
+        ("zone_numeric_id".to_owned(), zone_numeric_id.to_string()),
+    ]);
     if dns_effects.next().is_some()
         || effect.resource_name != spec.domain
         || effect.location != "global"
-        || effect.expected_attributes.get("value") != Some(&change.replacement_ipv4.to_string())
+        || effect.source_image.is_some()
     {
+        return Err(CoreError::InvalidPlan("DNS change effect is not exact"));
+    }
+    if effect.expected_attributes != expected_attributes {
         return Err(CoreError::InvalidPlan("DNS change effect is not exact"));
     }
     if current_ipv4.is_empty() {
@@ -360,11 +464,14 @@ fn validate_cloud_dns_effect(
             .target
             .as_ref()
             .ok_or(CoreError::InvalidPlan("DNS overwrite target is missing"))?;
-        let expected_values =
-            serde_json::to_string(current_ipv4).map_err(|_| CoreError::CanonicalSerialization)?;
+        let expected_target_attributes = BTreeMap::from([
+            ("current_values".to_owned(), current_values),
+            ("zone_name".to_owned(), zone_name.to_owned()),
+            ("zone_numeric_id".to_owned(), zone_numeric_id.to_string()),
+        ]);
         if effect.action != EffectAction::Update
             || target.numeric_id != zone_numeric_id
-            || target.observed_attributes.get("current_values") != Some(&expected_values)
+            || target.observed_attributes != expected_target_attributes
         {
             return Err(CoreError::InvalidPlan(
                 "DNS overwrite does not bind exact old values and zone",
@@ -386,6 +493,7 @@ fn validate_plan_stage(plan: &DeploymentPlan) -> Result<()> {
                     "initial plan cannot mutate DNS before address reservation",
                 ));
             }
+            validate_initial_effects(plan)?;
         }
         DeploymentPlanStage::DnsContinuation { address, .. } => {
             validate_resource(
@@ -394,7 +502,10 @@ fn validate_plan_stage(plan: &DeploymentPlan) -> Result<()> {
                 plan.deployment_uuid,
             )
             .map_err(|_| CoreError::InvalidPlan("continuation address identity is invalid"))?;
-            if address.resource_kind != ResourceKind::Address || !dns_mutation {
+            if address.resource_kind != ResourceKind::Address
+                || !dns_mutation
+                || plan.effects.len() != 1
+            {
                 return Err(CoreError::InvalidPlan(
                     "DNS continuation lacks address identity or DNS mutation",
                 ));
@@ -424,9 +535,102 @@ fn validate_plan_stage(plan: &DeploymentPlan) -> Result<()> {
     Ok(())
 }
 
+fn validate_initial_effects(plan: &DeploymentPlan) -> Result<()> {
+    if plan.effects.len() != 8 {
+        return Err(CoreError::InvalidPlan(
+            "initial plan does not contain the exact v0.1 topology",
+        ));
+    }
+    let suffix = &plan.deployment_uuid.simple().to_string()[..12];
+    let base = format!("dt-{}-{suffix}", plan.spec.deployment_name);
+    let expected = [
+        (
+            ResourceKind::Network,
+            format!("{base}-net"),
+            "global".to_owned(),
+            BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())]),
+        ),
+        (
+            ResourceKind::Subnet,
+            format!("{base}-subnet"),
+            plan.spec.region.clone(),
+            BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())]),
+        ),
+        (
+            ResourceKind::Firewall,
+            format!("{base}-web"),
+            "global".to_owned(),
+            BTreeMap::from([("ports".to_owned(), "tcp:80,tcp:443".to_owned())]),
+        ),
+        (
+            ResourceKind::Firewall,
+            format!("{base}-turn"),
+            "global".to_owned(),
+            BTreeMap::from([(
+                "ports".to_owned(),
+                "tcp:3478,udp:3478,udp:49160-49200".to_owned(),
+            )]),
+        ),
+        (
+            ResourceKind::Firewall,
+            format!("{base}-ssh"),
+            "global".to_owned(),
+            BTreeMap::from([("source".to_owned(), plan.spec.operator_ssh_cidr.clone())]),
+        ),
+        (
+            ResourceKind::Address,
+            format!("{base}-ip"),
+            plan.spec.region.clone(),
+            BTreeMap::new(),
+        ),
+        (
+            ResourceKind::Disk,
+            format!("{base}-boot"),
+            plan.spec.zone.clone(),
+            BTreeMap::from([
+                (
+                    "size_gib".to_owned(),
+                    plan.spec.boot_disk_size_gib.to_string(),
+                ),
+                ("type".to_owned(), plan.spec.boot_disk_type.clone()),
+            ]),
+        ),
+        (
+            ResourceKind::Instance,
+            format!("{base}-vm"),
+            plan.spec.zone.clone(),
+            BTreeMap::from([
+                ("machine_type".to_owned(), plan.spec.machine_type.clone()),
+                ("service_account".to_owned(), "none".to_owned()),
+            ]),
+        ),
+    ];
+    for (index, (kind, name, location, attributes)) in expected.into_iter().enumerate() {
+        let effect = &plan.effects[index];
+        let image_shape_valid = if kind == ResourceKind::Disk {
+            effect.source_image.is_some()
+        } else {
+            effect.source_image.is_none()
+        };
+        if effect.action != EffectAction::Create
+            || effect.resource_kind != kind
+            || effect.resource_name != name
+            || effect.location != location
+            || effect.expected_attributes != attributes
+            || effect.target.is_some()
+            || !image_shape_valid
+        {
+            return Err(CoreError::InvalidPlan(
+                "initial plan does not contain the exact v0.1 topology",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Exact disposition of the boot disk in a destroy approval.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "mode")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "mode")]
 pub enum BootDiskDisposition {
     Retain { disk: Option<ResourceRef> },
     Purge { disk: ResourceRef },
@@ -645,10 +849,7 @@ fn validate_disk_disposition(
 }
 
 fn validate_project(identity: &ProjectIdentity) -> Result<()> {
-    if identity.project_id.is_empty()
-        || identity.project_number == 0
-        || identity.oauth_principal.is_empty()
-    {
+    if identity.project_id.is_empty() || identity.project_number == 0 {
         return Err(CoreError::InvalidPlan("project identity is incomplete"));
     }
     Ok(())
@@ -660,10 +861,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        DeploymentPhase, GcpResources, LinuxAmd64ApplicationIdentity, LinuxAmd64UpdaterIdentity,
-        LocalWiringStatus, PricingCurrency, PricingLine, PricingQuote, ProjectIdentity,
-        RationalQuantity, ReleaseTag, Sha256Digest, SigningKeyIdentity, SourceRevision,
-        UnpricedExclusion, service_id,
+        DeploymentPhase, GcpResources, GoogleSubject, LinuxAmd64ApplicationIdentity,
+        LinuxAmd64UpdaterIdentity, LocalWiringStatus, PricingCurrency, PricingLine, PricingQuote,
+        ProjectIdentity, RationalQuantity, ReleaseTag, Sha256Digest, SigningKeyIdentity,
+        SourceRevision, UnpricedExclusion, service_id,
     };
 
     fn config() -> DeploymentConfig {
@@ -687,7 +888,7 @@ release = "stable"
         ProjectIdentity {
             project_id: "dirextalk-prod".to_owned(),
             project_number: 42,
-            oauth_principal: "operator@example.com".to_owned(),
+            oauth_principal: GoogleSubject::parse("operator.example").unwrap(),
         }
     }
 
@@ -755,10 +956,12 @@ release = "stable"
             resource_kind: kind,
             name: name.to_owned(),
             project_number: 42,
-            location: if matches!(kind, ResourceKind::Instance | ResourceKind::Disk) {
-                "us-central1-a".to_owned()
-            } else {
-                "global".to_owned()
+            location: match kind {
+                ResourceKind::Instance | ResourceKind::Disk => "us-central1-a".to_owned(),
+                ResourceKind::Subnet | ResourceKind::Address => "us-central1".to_owned(),
+                ResourceKind::Network | ResourceKind::Firewall | ResourceKind::DnsRecord => {
+                    "global".to_owned()
+                }
             },
             numeric_id,
             self_link: format!("https://compute.googleapis.com/{name}/{numeric_id}"),
@@ -769,7 +972,7 @@ release = "stable"
 
     fn deployment_plan() -> DeploymentPlan {
         let config = config();
-        DeploymentPlan {
+        let mut plan = DeploymentPlan {
             schema_version: 1,
             deployment_uuid: Uuid::new_v4(),
             stage: DeploymentPlanStage::Initial,
@@ -780,19 +983,84 @@ release = "stable"
             },
             release: release(),
             pricing: pricing(),
-            effects: vec![PlannedEffect {
-                action: EffectAction::Create,
-                resource_kind: ResourceKind::Network,
-                resource_name: "network".to_owned(),
-                location: "global".to_owned(),
-                expected_attributes: BTreeMap::from([(
-                    "cidr".to_owned(),
-                    "10.42.0.0/24".to_owned(),
-                )]),
-                target: None,
-            }],
+            effects: Vec::new(),
             cloud_worker: CloudWorkerDisposition::DisabledByProductScope,
-        }
+        };
+        let suffix = &plan.deployment_uuid.simple().to_string()[..12];
+        let base = format!("dt-production-{suffix}");
+        let effect =
+            |resource_kind, suffix: &str, location: &str, expected_attributes| PlannedEffect {
+                action: EffectAction::Create,
+                resource_kind,
+                resource_name: format!("{base}-{suffix}"),
+                location: location.to_owned(),
+                expected_attributes,
+                source_image: None,
+                target: None,
+            };
+        plan.effects = vec![
+            effect(
+                ResourceKind::Network,
+                "net",
+                "global",
+                BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())]),
+            ),
+            effect(
+                ResourceKind::Subnet,
+                "subnet",
+                "us-central1",
+                BTreeMap::from([("cidr".to_owned(), "10.42.0.0/24".to_owned())]),
+            ),
+            effect(
+                ResourceKind::Firewall,
+                "web",
+                "global",
+                BTreeMap::from([("ports".to_owned(), "tcp:80,tcp:443".to_owned())]),
+            ),
+            effect(
+                ResourceKind::Firewall,
+                "turn",
+                "global",
+                BTreeMap::from([(
+                    "ports".to_owned(),
+                    "tcp:3478,udp:3478,udp:49160-49200".to_owned(),
+                )]),
+            ),
+            effect(
+                ResourceKind::Firewall,
+                "ssh",
+                "global",
+                BTreeMap::from([("source".to_owned(), "203.0.113.7/32".to_owned())]),
+            ),
+            effect(ResourceKind::Address, "ip", "us-central1", BTreeMap::new()),
+            PlannedEffect {
+                source_image: Some(SourceImageIdentity {
+                    project_id: "ubuntu-os-cloud".to_owned(),
+                    name: "ubuntu-2404-noble-amd64-v20260801".to_owned(),
+                    numeric_id: 123,
+                    self_link: "https://compute.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20260801".to_owned(),
+                }),
+                ..effect(
+                    ResourceKind::Disk,
+                    "boot",
+                    "us-central1-a",
+                    BTreeMap::from([
+                        ("size_gib".to_owned(), "50".to_owned()),
+                        ("type".to_owned(), "pd-balanced".to_owned()),
+                    ]),
+                )
+            },
+            effect(
+                ResourceKind::Instance,
+                "vm",
+                "us-central1-a",
+                BTreeMap::from([
+                    ("machine_type".to_owned(), "e2-custom-2-4096".to_owned()),
+                    ("service_account".to_owned(), "none".to_owned()),
+                ]),
+            ),
+        ];
+        plan
     }
 
     #[test]
@@ -819,19 +1087,79 @@ release = "stable"
     }
 
     #[test]
+    fn initial_plan_requires_exact_order_and_exact_source_image() {
+        let mut reordered = deployment_plan();
+        reordered.effects.swap(0, 1);
+        assert!(matches!(reordered.digest(), Err(CoreError::InvalidPlan(_))));
+
+        let mut missing_image = deployment_plan();
+        missing_image.effects[6].source_image = None;
+        assert!(matches!(
+            missing_image.digest(),
+            Err(CoreError::InvalidPlan(_))
+        ));
+
+        let mut family_image = deployment_plan();
+        let image = family_image.effects[6].source_image.as_mut().unwrap();
+        image.name = "ubuntu-2404-lts-amd64-family".to_owned();
+        image.self_link = "https://compute.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64".to_owned();
+        assert!(matches!(
+            family_image.digest(),
+            Err(CoreError::InvalidPlan(
+                "Ubuntu source image identity is invalid"
+                    | "Ubuntu source image self-link is invalid"
+            ))
+        ));
+
+        let mut wrong_attribute = deployment_plan();
+        wrong_attribute.effects[2]
+            .expected_attributes
+            .insert("ports".to_owned(), "tcp:443".to_owned());
+        assert!(matches!(
+            wrong_attribute.digest(),
+            Err(CoreError::InvalidPlan(_))
+        ));
+    }
+
+    #[test]
+    fn tagged_plan_enums_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<DeploymentPlanStage>(r#"{"stage":"initial","unexpected":true}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PlanDnsObservation>(
+                r#"{"management":"external","current_ipv4":[],"unexpected":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<BootDiskDisposition>(
+                r#"{"mode":"retain","disk":null,"unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn deployment_digest_binds_every_external_contract_category() {
         let base = deployment_plan();
         let digest = base.digest().unwrap();
         let variants = [
             {
                 let mut plan = base.clone();
-                plan.project_identity.oauth_principal = "other@example.com".to_owned();
+                plan.project_identity.oauth_principal =
+                    GoogleSubject::parse("other.subject").unwrap();
                 plan
             },
             {
                 let mut plan = base.clone();
                 plan.spec.region = "us-east1".to_owned();
                 plan.spec.zone = "us-east1-b".to_owned();
+                plan.effects[1].location = "us-east1".to_owned();
+                plan.effects[5].location = "us-east1".to_owned();
+                plan.effects[6].location = "us-east1-b".to_owned();
+                plan.effects[7].location = "us-east1-b".to_owned();
                 plan
             },
             {
@@ -855,9 +1183,13 @@ release = "stable"
             },
             {
                 let mut plan = base.clone();
-                plan.effects[0]
-                    .expected_attributes
-                    .insert("cidr".to_owned(), "10.42.1.0/24".to_owned());
+                let image = plan.effects[6].source_image.as_mut().unwrap();
+                image.name = "ubuntu-2404-noble-amd64-v20260802".to_owned();
+                image.numeric_id += 1;
+                image.self_link = format!(
+                    "https://compute.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/{}",
+                    image.name
+                );
                 plan
             },
         ];
@@ -1017,6 +1349,7 @@ release = "stable"
             resource_name: "talk.example.com".to_owned(),
             location: "global".to_owned(),
             expected_attributes: BTreeMap::new(),
+            source_image: None,
             target: None,
         });
         assert!(matches!(plan.digest(), Err(CoreError::InvalidPlan(_))));
@@ -1049,15 +1382,19 @@ release = "stable"
                 replacement_ipv4: "203.0.113.42".parse().unwrap(),
             }),
         };
-        continuation.effects.push(PlannedEffect {
+        continuation.effects = vec![PlannedEffect {
             action: EffectAction::Update,
             resource_kind: ResourceKind::DnsRecord,
             resource_name: "talk.example.com".to_owned(),
             location: "global".to_owned(),
-            expected_attributes: BTreeMap::from([(
-                "value".to_owned(),
-                "203.0.113.42".to_owned(),
-            )]),
+            expected_attributes: BTreeMap::from([
+                ("current_values".to_owned(), "[\"203.0.113.1\"]".to_owned()),
+                ("ttl".to_owned(), "300".to_owned()),
+                ("value".to_owned(), "203.0.113.42".to_owned()),
+                ("zone_name".to_owned(), "example-com".to_owned()),
+                ("zone_numeric_id".to_owned(), "7".to_owned()),
+            ]),
+            source_image: None,
             target: Some(ResourceRef {
                 resource_kind: ResourceKind::DnsRecord,
                 name: "talk.example.com".to_owned(),
@@ -1066,13 +1403,14 @@ release = "stable"
                 numeric_id: 7,
                 self_link: "https://dns.googleapis.com/dns/v1/projects/dirextalk-prod/managedZones/example-com/rrsets/talk.example.com".to_owned(),
                 deployment_uuid: continuation.deployment_uuid,
-                observed_attributes: BTreeMap::from([(
-                    "current_values".to_owned(),
-                    "[\"203.0.113.1\"]".to_owned(),
-                )]),
+                observed_attributes: BTreeMap::from([
+                    ("current_values".to_owned(), "[\"203.0.113.1\"]".to_owned()),
+                    ("zone_name".to_owned(), "example-com".to_owned()),
+                    ("zone_numeric_id".to_owned(), "7".to_owned()),
+                ]),
             }),
-        });
-        assert!(continuation.digest().is_ok());
+        }];
+        continuation.digest().unwrap();
 
         let mut state = DeploymentState {
             schema_version: 1,
@@ -1082,6 +1420,7 @@ release = "stable"
             phase: DeploymentPhase::Applying,
             approved_plan_digest: Some(previous),
             pending_effect: None,
+            active_destroy: None,
             release_identity: Some(continuation.release.clone()),
             gcp_resources: GcpResources {
                 address: Some(match &continuation.stage {
@@ -1118,9 +1457,10 @@ release = "stable"
             deployment_uuid: uuid,
             service_id: service_id("production", 42).unwrap(),
             project_identity: identity(),
-            phase: DeploymentPhase::Complete,
+            phase: DeploymentPhase::Applying,
             approved_plan_digest: Some(deployment_plan().digest().unwrap()),
             pending_effect: None,
+            active_destroy: None,
             release_identity: Some(release()),
             gcp_resources: GcpResources {
                 boot_disk: Some(disk.clone()),

@@ -18,15 +18,16 @@ pub use config::{DeploymentConfig, DnsMode, ReleaseSelection, SCHEMA_VERSION};
 pub use digest::{PlanDigest, canonical_json, canonical_plan_digest};
 pub use error::{CoreError, Result};
 pub use model::{
-    DeploymentPhase, DeploymentState, EffectAction, GcpResources, HostReceipt, LocalWiringStatus,
-    OperationRef, PendingEffect, ProgressEvent, ProgressOperation, ProgressStatus, ProjectIdentity,
-    ResourceKind, ResourceRef, SshHostIdentity,
+    ActiveDestroyPlan, DeploymentPhase, DeploymentState, EffectAction, GcpResources, GoogleSubject,
+    HostReceipt, LocalWiringStatus, OperationRef, OperationUri, PendingEffect, ProgressEvent,
+    ProgressOperation, ProgressStatus, ProjectIdentity, ResourceKind, ResourceRef, SshHostIdentity,
+    SshHostKeyAlgorithm, SshSha256Fingerprint,
 };
 pub use paths::{NodePaths, service_id, validate_service_id};
 pub use plan::{
     BootDiskDisposition, CanonicalDeploymentSpec, CloudWorkerDisposition, DeploymentPlan,
     DeploymentPlanStage, DestroyPlan, DestroyTarget, DnsChangeApproval, PlanDnsObservation,
-    PlannedEffect,
+    PlannedEffect, SourceImageIdentity,
 };
 pub use pricing::{
     PricingCurrency, PricingLine, PricingQuote, RationalQuantity, UnpricedExclusion,

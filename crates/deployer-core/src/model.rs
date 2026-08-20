@@ -1,12 +1,219 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, net::Ipv4Addr, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 use crate::{
-    CoreError, ExactReleaseIdentity, PlanDigest, ReleaseTag, Result, SCHEMA_VERSION, Sha256Digest,
-    validate_service_id,
+    CoreError, DestroyPlan, DestroyTarget, ExactReleaseIdentity, PlanDigest, ReleaseTag, Result,
+    SCHEMA_VERSION, Sha256Digest, validate_service_id,
 };
+
+/// Stable Google OIDC `sub`, used as the immutable OAuth owner identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GoogleSubject(String);
+
+impl GoogleSubject {
+    /// Parses a bounded, persistence-safe Google subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidState`] for empty, oversized, whitespace,
+    /// control-character, separator, or otherwise unsafe values.
+    pub fn parse(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if !(1..=255).contains(&value.len())
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(CoreError::InvalidState("Google OAuth subject is invalid"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GoogleSubject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for GoogleSubject {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for GoogleSubject {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GoogleSubject {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Strict HTTPS Google API operation URI with no credentials, query, or
+/// fragment. Cross-field project, scope, and operation-id checks happen when
+/// the containing [`PendingEffect`] is validated.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperationUri(String);
+
+impl OperationUri {
+    /// Parses a bounded Google Compute or Cloud DNS operation URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidState`] for non-Google or secret-capable
+    /// URI shapes.
+    pub fn parse(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let url = url::Url::parse(&value)
+            .map_err(|_| CoreError::InvalidState("operation URI is invalid"))?;
+        if value.len() > 2_048
+            || url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(
+                url.host_str(),
+                Some("compute.googleapis.com" | "www.googleapis.com" | "dns.googleapis.com")
+            )
+        {
+            return Err(CoreError::InvalidState("operation URI is invalid"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OperationUri {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for OperationUri {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for OperationUri {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationUri {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Supported SSH host-key algorithms that may be persisted as a pin.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshHostKeyAlgorithm {
+    Rsa,
+    Ecdsa256,
+    Ecdsa384,
+    Ecdsa521,
+    Ed25519,
+}
+
+/// Transport-canonical `SHA256:<lowercase-hex>` host-key fingerprint.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SshSha256Fingerprint(String);
+
+impl SshSha256Fingerprint {
+    /// Parses a canonical SHA-256 host-key fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidState`] unless the suffix is exactly 64
+    /// lowercase hexadecimal characters.
+    pub fn parse(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let Some(encoded) = value.strip_prefix("SHA256:") else {
+            return Err(CoreError::InvalidState("SSH host fingerprint is invalid"));
+        };
+        if encoded.len() != 64
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(CoreError::InvalidState("SSH host fingerprint is invalid"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SshSha256Fingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for SshSha256Fingerprint {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for SshSha256Fingerprint {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SshSha256Fingerprint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Immutable authenticated GCP project and OAuth-principal binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -14,7 +221,7 @@ use crate::{
 pub struct ProjectIdentity {
     pub project_id: String,
     pub project_number: u64,
-    pub oauth_principal: String,
+    pub oauth_principal: GoogleSubject,
 }
 
 /// The lifecycle phase durably reached by a deployment.
@@ -60,7 +267,7 @@ pub struct OperationRef {
     pub project_number: u64,
     pub location: String,
     pub numeric_id: u64,
-    pub self_link: String,
+    pub self_link: OperationUri,
 }
 
 /// A cloud effect journaled before the first mutation.
@@ -133,9 +340,71 @@ impl GcpResources {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshHostIdentity {
-    pub address: String,
-    pub algorithm: String,
-    pub fingerprint_sha256: String,
+    pub address: Ipv4Addr,
+    pub algorithm: SshHostKeyAlgorithm,
+    pub fingerprint_sha256: SshSha256Fingerprint,
+}
+
+/// Sealed destroy/purge approval and durable progress cursor. The current
+/// target is `plan.targets[next_target_index]`; the cursor advances atomically
+/// with the resource receipt after each deletion.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveDestroyPlan {
+    pub plan: DestroyPlan,
+    pub plan_digest: PlanDigest,
+    pub next_target_index: u32,
+}
+
+impl ActiveDestroyPlan {
+    /// Creates a durable destroy cursor only for the exact approved digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidPlan`] if the approval differs from the
+    /// complete destroy/purge plan.
+    pub fn new(plan: DestroyPlan, approved: PlanDigest) -> Result<Self> {
+        if plan.digest()? != approved {
+            return Err(CoreError::InvalidPlan("destroy approval digest mismatch"));
+        }
+        Ok(Self {
+            plan,
+            plan_digest: approved,
+            next_target_index: 0,
+        })
+    }
+
+    #[must_use]
+    pub fn current_target(&self) -> Option<&DestroyTarget> {
+        usize::try_from(self.next_target_index)
+            .ok()
+            .and_then(|index| self.plan.targets.get(index))
+    }
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        usize::try_from(self.next_target_index).is_ok_and(|index| index == self.plan.targets.len())
+    }
+
+    /// Advances the durable cursor after the exact current target receipt has
+    /// been applied to state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidState`] for an out-of-order receipt or cursor
+    /// overflow.
+    pub fn advance(&mut self, deleted: &ResourceRef) -> Result<()> {
+        if self.current_target().map(|target| &target.resource) != Some(deleted) {
+            return Err(CoreError::InvalidState(
+                "destroy receipt does not match current target",
+            ));
+        }
+        self.next_target_index = self
+            .next_target_index
+            .checked_add(1)
+            .ok_or(CoreError::InvalidState("destroy target cursor overflow"))?;
+        Ok(())
+    }
 }
 
 /// Signed, digest-bound result emitted by the fixed one-shot host installer.
@@ -174,6 +443,7 @@ pub struct DeploymentState {
     /// separate digest derived from the identity-bound resource receipts.
     pub approved_plan_digest: Option<PlanDigest>,
     pub pending_effect: Option<PendingEffect>,
+    pub active_destroy: Option<ActiveDestroyPlan>,
     pub release_identity: Option<ExactReleaseIdentity>,
     pub gcp_resources: GcpResources,
     pub ssh_host_identity: Option<SshHostIdentity>,
@@ -202,9 +472,7 @@ impl DeploymentState {
         if self.project_identity.project_number == 0 {
             return Err(CoreError::InvalidState("project number must be non-zero"));
         }
-        if self.project_identity.project_id.is_empty()
-            || self.project_identity.oauth_principal.is_empty()
-        {
+        if !valid_project_id(&self.project_identity.project_id) {
             return Err(CoreError::InvalidState("project identity is incomplete"));
         }
         if matches!(
@@ -213,6 +481,7 @@ impl DeploymentState {
                 | DeploymentPhase::Installed
                 | DeploymentPhase::Complete
                 | DeploymentPhase::WaitingUser
+                | DeploymentPhase::Destroying
         ) && self.approved_plan_digest.is_none()
         {
             return Err(CoreError::InvalidState(
@@ -248,18 +517,12 @@ impl DeploymentState {
             validate_effect(
                 effect,
                 self.phase,
-                self.project_identity.project_number,
+                &self.project_identity,
                 self.deployment_uuid,
             )?;
         }
-        if let Some(identity) = &self.ssh_host_identity
-            && (identity.address.is_empty()
-                || identity.algorithm.is_empty()
-                || !identity.fingerprint_sha256.starts_with("SHA256:")
-                || identity.fingerprint_sha256.len() <= "SHA256:".len())
-        {
-            return Err(CoreError::InvalidState("SSH host identity is incomplete"));
-        }
+        validate_phase_receipts_and_resources(self)?;
+        validate_active_destroy(self)?;
         validate_host(self)?;
         if self.local_wiring.installed && !self.local_wiring.requested {
             return Err(CoreError::InvalidState("local wiring was not requested"));
@@ -291,7 +554,7 @@ pub(crate) fn validate_resource(
     }
     if resource.numeric_id == 0
         || !safe_public_name(&resource.name)
-        || !safe_location(&resource.location)
+        || !valid_resource_location(resource.resource_kind, &resource.location)
         || !trusted_google_self_link(&resource.self_link)
     {
         return Err(CoreError::InvalidState("resource identity is incomplete"));
@@ -299,10 +562,21 @@ pub(crate) fn validate_resource(
     validate_attributes(&resource.observed_attributes)
 }
 
+pub(crate) fn validate_resource_name_and_location(
+    kind: ResourceKind,
+    name: &str,
+    location: &str,
+) -> Result<()> {
+    if !safe_public_name(name) || !valid_resource_location(kind, location) {
+        return Err(CoreError::InvalidState("resource identity is incomplete"));
+    }
+    Ok(())
+}
+
 fn validate_effect(
     effect: &PendingEffect,
     phase: DeploymentPhase,
-    project_number: u64,
+    identity: &ProjectIdentity,
     deployment_uuid: Uuid,
 ) -> Result<()> {
     if matches!(
@@ -318,13 +592,14 @@ fn validate_effect(
             "pending effect UUID must be non-zero",
         ));
     }
-    if effect.project_number != project_number || effect.deployment_uuid != deployment_uuid {
+    if effect.project_number != identity.project_number || effect.deployment_uuid != deployment_uuid
+    {
         return Err(CoreError::InvalidState("pending effect identity mismatch"));
     }
     match (effect.action, &effect.target) {
         (EffectAction::Create, None) => {}
         (EffectAction::Update | EffectAction::Delete, Some(target)) => {
-            validate_resource(target, project_number, deployment_uuid)?;
+            validate_resource(target, identity.project_number, deployment_uuid)?;
             if target.resource_kind != effect.resource_kind
                 || target.name != effect.resource_name
                 || target.location != effect.location
@@ -340,25 +615,272 @@ fn validate_effect(
             ));
         }
     }
-    if effect.resource_name.is_empty() || effect.location.is_empty() {
+    if !safe_public_name(&effect.resource_name)
+        || !valid_resource_location(effect.resource_kind, &effect.location)
+    {
         return Err(CoreError::InvalidState(
             "pending effect identity is incomplete",
         ));
     }
     validate_attributes(&effect.expected_attributes)?;
-    if let Some(operation) = &effect.operation
-        && (operation.request_id != effect.effect_id
-            || operation.project_number != effect.project_number
-            || operation.numeric_id == 0
-            || !trusted_google_self_link(&operation.self_link)
-            || !safe_location(&operation.location))
+    if let Some(operation) = &effect.operation {
+        validate_operation(operation, effect, identity)?;
+    }
+    Ok(())
+}
+
+fn validate_operation(
+    operation: &OperationRef,
+    effect: &PendingEffect,
+    identity: &ProjectIdentity,
+) -> Result<()> {
+    if operation.request_id != effect.effect_id
+        || operation.project_number != effect.project_number
+        || operation.location != effect.location
+        || operation.numeric_id == 0
     {
+        return Err(CoreError::InvalidState("operation identity mismatch"));
+    }
+    let url = url::Url::parse(operation.self_link.as_str())
+        .map_err(|_| CoreError::InvalidState("operation identity mismatch"))?;
+    let segments: Vec<_> = url
+        .path_segments()
+        .ok_or(CoreError::InvalidState("operation identity mismatch"))?
+        .collect();
+    let operation_id = operation.numeric_id.to_string();
+    let expected_compute_scope = match effect.resource_kind {
+        ResourceKind::Network | ResourceKind::Firewall => Some(("global", "operations")),
+        ResourceKind::Subnet | ResourceKind::Address => Some(("regions", effect.location.as_str())),
+        ResourceKind::Disk | ResourceKind::Instance => Some(("zones", effect.location.as_str())),
+        ResourceKind::DnsRecord => None,
+    };
+    let valid = if let Some((scope_kind, scope_name)) = expected_compute_scope {
+        let expected = if scope_kind == "global" {
+            vec![
+                "compute",
+                "v1",
+                "projects",
+                identity.project_id.as_str(),
+                "global",
+                "operations",
+                operation_id.as_str(),
+            ]
+        } else {
+            vec![
+                "compute",
+                "v1",
+                "projects",
+                identity.project_id.as_str(),
+                scope_kind,
+                scope_name,
+                "operations",
+                operation_id.as_str(),
+            ]
+        };
+        matches!(
+            url.host_str(),
+            Some("compute.googleapis.com" | "www.googleapis.com")
+        ) && segments == expected
+    } else {
+        let zone = effect
+            .expected_attributes
+            .get("zone_name")
+            .ok_or(CoreError::InvalidState("operation identity mismatch"))?;
+        segments
+            == [
+                "dns",
+                "v1",
+                "projects",
+                identity.project_id.as_str(),
+                "managedZones",
+                zone,
+                "changes",
+                operation_id.as_str(),
+            ]
+            && url.host_str() == Some("dns.googleapis.com")
+    };
+    if !valid {
         return Err(CoreError::InvalidState("operation identity mismatch"));
     }
     Ok(())
 }
 
+fn validate_phase_receipts_and_resources(state: &DeploymentState) -> Result<()> {
+    let infrastructure_complete = state.gcp_resources.network.is_some()
+        && state.gcp_resources.subnet.is_some()
+        && state.gcp_resources.web_firewall.is_some()
+        && state.gcp_resources.turn_firewall.is_some()
+        && state.gcp_resources.ssh_firewall.is_some()
+        && state.gcp_resources.address.is_some()
+        && state.gcp_resources.instance.is_some()
+        && state.gcp_resources.boot_disk.is_some();
+    match state.phase {
+        DeploymentPhase::Planned => {
+            if state.pending_effect.is_some()
+                || state.active_destroy.is_some()
+                || state.gcp_resources.iter().next().is_some()
+                || state.ssh_host_identity.is_some()
+                || state.host_receipt.is_some()
+            {
+                return Err(CoreError::InvalidState(
+                    "planned deployment contains active receipts",
+                ));
+            }
+        }
+        DeploymentPhase::WaitingUser => {
+            if !infrastructure_complete
+                || state.pending_effect.is_some()
+                || state.ssh_host_identity.is_some()
+                || state.host_receipt.is_some()
+            {
+                return Err(CoreError::InvalidState(
+                    "waiting deployment infrastructure is incomplete",
+                ));
+            }
+        }
+        DeploymentPhase::Installed | DeploymentPhase::Complete => {
+            if !infrastructure_complete
+                || state.ssh_host_identity.is_none()
+                || state.host_receipt.is_none()
+                || state.pending_effect.is_some()
+            {
+                return Err(CoreError::InvalidState(
+                    "installed deployment receipts are incomplete",
+                ));
+            }
+            if state.phase == DeploymentPhase::Complete
+                && state.local_wiring.requested
+                && (!state.local_wiring.installed || !state.local_wiring.service_active)
+            {
+                return Err(CoreError::InvalidState(
+                    "complete deployment local wiring is incomplete",
+                ));
+            }
+        }
+        DeploymentPhase::Destroyed => {
+            if state.pending_effect.is_some()
+                || state.active_destroy.is_some()
+                || state.gcp_resources.network.is_some()
+                || state.gcp_resources.subnet.is_some()
+                || state.gcp_resources.web_firewall.is_some()
+                || state.gcp_resources.turn_firewall.is_some()
+                || state.gcp_resources.ssh_firewall.is_some()
+                || state.gcp_resources.address.is_some()
+                || state.gcp_resources.instance.is_some()
+                || state.gcp_resources.dns_record.is_some()
+            {
+                return Err(CoreError::InvalidState(
+                    "destroyed deployment retains managed resources",
+                ));
+            }
+        }
+        DeploymentPhase::Applying | DeploymentPhase::Destroying | DeploymentPhase::Failed => {}
+    }
+    Ok(())
+}
+
+fn validate_active_destroy(state: &DeploymentState) -> Result<()> {
+    let Some(active) = &state.active_destroy else {
+        if state.phase == DeploymentPhase::Destroying {
+            return Err(CoreError::InvalidState(
+                "destroying deployment lacks approved destroy plan",
+            ));
+        }
+        return Ok(());
+    };
+    if state.phase != DeploymentPhase::Destroying
+        || active.plan.digest()? != active.plan_digest
+        || active.plan.deployment_uuid != state.deployment_uuid
+        || active.plan.service_id != state.service_id
+        || active.plan.project_identity != state.project_identity
+    {
+        return Err(CoreError::InvalidState(
+            "active destroy plan identity mismatch",
+        ));
+    }
+    let index = usize::try_from(active.next_target_index)
+        .map_err(|_| CoreError::InvalidState("destroy target cursor is invalid"))?;
+    if index > active.plan.targets.len() {
+        return Err(CoreError::InvalidState("destroy target cursor is invalid"));
+    }
+    for (target_index, target) in active.plan.targets.iter().enumerate() {
+        let recorded = find_resource(&state.gcp_resources, &target.resource);
+        if target_index < index {
+            if recorded.is_some() {
+                return Err(CoreError::InvalidState(
+                    "completed destroy target remains recorded",
+                ));
+            }
+        } else if recorded != Some(&target.resource) {
+            return Err(CoreError::InvalidState(
+                "remaining destroy target identity mismatch",
+            ));
+        }
+    }
+    for (_, resource) in state.gcp_resources.iter() {
+        let remaining = active.plan.targets[index..]
+            .iter()
+            .any(|target| target.resource == *resource);
+        let retained_disk = matches!(
+            &active.plan.boot_disk,
+            crate::BootDiskDisposition::Retain { disk: Some(disk) } if disk == resource
+        );
+        if !remaining && !retained_disk {
+            return Err(CoreError::InvalidState(
+                "active destroy state contains an unapproved resource",
+            ));
+        }
+    }
+    match (&state.pending_effect, active.current_target()) {
+        (Some(effect), Some(target)) if pending_matches_destroy_target(effect, target) => {}
+        (None, _) => {}
+        _ => {
+            return Err(CoreError::InvalidState(
+                "pending delete differs from active destroy target",
+            ));
+        }
+    }
+    if active.is_complete() && state.pending_effect.is_some() {
+        return Err(CoreError::InvalidState(
+            "completed destroy cursor has a pending effect",
+        ));
+    }
+    Ok(())
+}
+
+fn find_resource<'a>(
+    resources: &'a GcpResources,
+    expected: &ResourceRef,
+) -> Option<&'a ResourceRef> {
+    resources
+        .iter()
+        .map(|(_, resource)| resource)
+        .find(|resource| {
+            resource.resource_kind == expected.resource_kind && resource.name == expected.name
+        })
+}
+
+fn pending_matches_destroy_target(effect: &PendingEffect, target: &DestroyTarget) -> bool {
+    let mut expected_attributes = target.resource.observed_attributes.clone();
+    if let Some(value) = target.expected_dns_ipv4 {
+        expected_attributes.insert("value".to_owned(), value.to_string());
+    }
+    effect.action == EffectAction::Delete
+        && effect.resource_kind == target.resource.resource_kind
+        && effect.resource_name == target.resource.name
+        && effect.location == target.resource.location
+        && effect.expected_attributes == expected_attributes
+        && effect.target.as_ref() == Some(&target.resource)
+}
+
 fn validate_host(state: &DeploymentState) -> Result<()> {
+    if state
+        .ssh_host_identity
+        .as_ref()
+        .is_some_and(|identity| !is_public_ipv4(identity.address))
+    {
+        return Err(CoreError::InvalidState("SSH host address is not public"));
+    }
     if state.host_receipt.is_some() && state.ssh_host_identity.is_none() {
         return Err(CoreError::InvalidState(
             "host receipt requires pinned SSH identity",
@@ -372,10 +894,22 @@ fn validate_host(state: &DeploymentState) -> Result<()> {
             "host receipt requires exact release identity",
         ));
     };
+    let address_matches = state
+        .gcp_resources
+        .address
+        .as_ref()
+        .and_then(|address| address.observed_attributes.get("address"))
+        .and_then(|address| address.parse::<Ipv4Addr>().ok())
+        == state
+            .ssh_host_identity
+            .as_ref()
+            .map(|identity| identity.address);
     if receipt.deployment_uuid != state.deployment_uuid
         || receipt.release_tag != release.release_tag
         || receipt.host_installer_sha256 != release.host_installer_linux_amd64_sha256
         || receipt.runtime_bundle_sha256 != release.runtime_bundle_linux_amd64_sha256
+        || receipt.installed_at_unix_ms == 0
+        || !address_matches
     {
         return Err(CoreError::InvalidState("host receipt identity mismatch"));
     }
@@ -383,6 +917,20 @@ fn validate_host(state: &DeploymentState) -> Result<()> {
         return Err(CoreError::InvalidState("host receipt is incomplete"));
     }
     Ok(())
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_unspecified()
+        && !address.is_broadcast()
+        && !address.is_multicast()
+        && !address.is_documentation()
+        && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+        && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        && octets[0] < 224
 }
 
 pub(crate) fn validate_attributes(attributes: &BTreeMap<String, String>) -> Result<()> {
@@ -460,8 +1008,37 @@ fn safe_public_name(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphanumeric)
 }
 
-fn safe_location(value: &str) -> bool {
-    value == "global" || safe_public_name(value)
+fn valid_resource_location(kind: ResourceKind, value: &str) -> bool {
+    match kind {
+        ResourceKind::Network | ResourceKind::Firewall | ResourceKind::DnsRecord => {
+            value == "global"
+        }
+        ResourceKind::Subnet | ResourceKind::Address => valid_region(value),
+        ResourceKind::Instance | ResourceKind::Disk => valid_zone(value),
+    }
+}
+
+fn valid_region(value: &str) -> bool {
+    (3..=63).contains(&value.len()) && safe_public_name(value) && value.contains('-')
+}
+
+fn valid_zone(value: &str) -> bool {
+    valid_region(value)
+        && value
+            .rsplit_once('-')
+            .is_some_and(|(region, suffix)| valid_region(region) && suffix.len() == 1)
+}
+
+fn valid_project_id(value: &str) -> bool {
+    (6..=30).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn trusted_google_self_link(value: &str) -> bool {
@@ -551,7 +1128,7 @@ mod tests {
             project_identity: ProjectIdentity {
                 project_id: "dirextalk-prod".to_owned(),
                 project_number: 42,
-                oauth_principal: "operator@example.com".to_owned(),
+                oauth_principal: GoogleSubject::parse("operator.example").unwrap(),
             },
             phase: DeploymentPhase::Applying,
             approved_plan_digest: Some(
@@ -560,6 +1137,7 @@ mod tests {
                     .unwrap(),
             ),
             pending_effect: None,
+            active_destroy: None,
             release_identity: Some(test_release_identity()),
             gcp_resources: GcpResources::default(),
             ssh_host_identity: None,
@@ -567,6 +1145,49 @@ mod tests {
             local_wiring: LocalWiringStatus::default(),
             integrity_digest: String::new(),
         }
+    }
+
+    fn resource(
+        state: &DeploymentState,
+        kind: ResourceKind,
+        name: &str,
+        location: &str,
+        numeric_id: u64,
+    ) -> ResourceRef {
+        ResourceRef {
+            resource_kind: kind,
+            name: name.to_owned(),
+            project_number: state.project_identity.project_number,
+            location: location.to_owned(),
+            numeric_id,
+            self_link: format!("https://compute.googleapis.com/{name}/{numeric_id}"),
+            deployment_uuid: state.deployment_uuid,
+            observed_attributes: BTreeMap::from([("name".to_owned(), name.to_owned())]),
+        }
+    }
+
+    fn active_destroy_state(purge_disk: bool) -> DeploymentState {
+        let mut state = state();
+        state.gcp_resources.network = Some(resource(
+            &state,
+            ResourceKind::Network,
+            "network",
+            "global",
+            11,
+        ));
+        state.gcp_resources.boot_disk = Some(resource(
+            &state,
+            ResourceKind::Disk,
+            "boot",
+            "us-central1-a",
+            12,
+        ));
+        let purge_id = purge_disk.then_some(12);
+        let plan = DestroyPlan::from_state(&state, purge_id).unwrap();
+        let digest = plan.digest().unwrap();
+        state.phase = DeploymentPhase::Destroying;
+        state.active_destroy = Some(ActiveDestroyPlan::new(plan, digest).unwrap());
+        state
     }
 
     #[test]
@@ -609,7 +1230,10 @@ mod tests {
                 project_number: 43,
                 location: "global".to_owned(),
                 numeric_id: 7,
-                self_link: "https://compute.googleapis.com/operation/7".to_owned(),
+                self_link: OperationUri::parse(
+                    "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/7",
+                )
+                .unwrap(),
             }),
         });
         assert!(state.validate().is_err());
@@ -618,7 +1242,6 @@ mod tests {
     #[test]
     fn delete_requires_full_target_and_operation_request_binding() {
         let mut state = state();
-        state.phase = DeploymentPhase::Destroying;
         let target = ResourceRef {
             resource_kind: ResourceKind::Network,
             name: "network".to_owned(),
@@ -651,7 +1274,10 @@ mod tests {
             project_number: 42,
             location: "global".to_owned(),
             numeric_id: 9,
-            self_link: "https://compute.googleapis.com/operation/9".to_owned(),
+            self_link: OperationUri::parse(
+                "https://compute.googleapis.com/compute/v1/projects/dirextalk-prod/global/operations/9",
+            )
+            .unwrap(),
         });
         state.pending_effect = Some(effect.clone());
         assert!(state.validate().is_err());
@@ -675,10 +1301,21 @@ mod tests {
         state.host_receipt = Some(receipt.clone());
         assert!(state.validate().is_err());
 
+        state.gcp_resources.address = Some(ResourceRef {
+            resource_kind: ResourceKind::Address,
+            name: "static-ip".to_owned(),
+            project_number: 42,
+            location: "us-central1".to_owned(),
+            numeric_id: 10,
+            self_link: "https://compute.googleapis.com/address/10".to_owned(),
+            deployment_uuid: state.deployment_uuid,
+            observed_attributes: BTreeMap::from([("address".to_owned(), "8.8.8.8".to_owned())]),
+        });
         state.ssh_host_identity = Some(SshHostIdentity {
-            address: "203.0.113.42".to_owned(),
-            algorithm: "ssh-ed25519".to_owned(),
-            fingerprint_sha256: "SHA256:host-key".to_owned(),
+            address: "8.8.8.8".parse().unwrap(),
+            algorithm: SshHostKeyAlgorithm::Ed25519,
+            fingerprint_sha256: SshSha256Fingerprint::parse(format!("SHA256:{}", "a".repeat(64)))
+                .unwrap(),
         });
         assert!(state.validate().is_ok());
 
@@ -697,6 +1334,123 @@ mod tests {
             state.validate(),
             Err(CoreError::InvalidState("host receipt identity mismatch"))
         ));
+    }
+
+    #[test]
+    fn typed_public_identity_fields_reject_noncanonical_values() {
+        assert!(GoogleSubject::parse("").is_err());
+        assert!(GoogleSubject::parse("subject with spaces").is_err());
+        assert!(OperationUri::parse("http://compute.googleapis.com/operation/1").is_err());
+        assert!(OperationUri::parse("https://evil.example/operation/1").is_err());
+        assert!(SshSha256Fingerprint::parse(format!("SHA256:{}", "A".repeat(64))).is_err());
+        assert!(SshSha256Fingerprint::parse(format!("SHA256:{}", "a".repeat(63))).is_err());
+
+        let mut state = state();
+        state.ssh_host_identity = Some(SshHostIdentity {
+            address: "10.0.0.1".parse().unwrap(),
+            algorithm: SshHostKeyAlgorithm::Ed25519,
+            fingerprint_sha256: SshSha256Fingerprint::parse(format!("SHA256:{}", "a".repeat(64)))
+                .unwrap(),
+        });
+        assert!(matches!(
+            state.validate(),
+            Err(CoreError::InvalidState("SSH host address is not public"))
+        ));
+
+        let unknown_algorithm = r#"{"address":"8.8.8.8","algorithm":"dss","fingerprint_sha256":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        assert!(serde_json::from_str::<SshHostIdentity>(unknown_algorithm).is_err());
+    }
+
+    #[test]
+    fn destroy_cursor_seals_order_and_crash_boundaries() {
+        let mut state = active_destroy_state(false);
+        assert!(state.validate().is_ok());
+        let target = state
+            .active_destroy
+            .as_ref()
+            .unwrap()
+            .current_target()
+            .unwrap()
+            .resource
+            .clone();
+        state.pending_effect = Some(PendingEffect {
+            effect_id: Uuid::new_v4(),
+            deployment_uuid: state.deployment_uuid,
+            project_number: state.project_identity.project_number,
+            action: EffectAction::Delete,
+            resource_kind: target.resource_kind,
+            resource_name: target.name.clone(),
+            location: target.location.clone(),
+            expected_attributes: target.observed_attributes.clone(),
+            target: Some(target.clone()),
+            operation: None,
+        });
+        assert!(state.validate().is_ok());
+
+        let mut out_of_order = state.clone();
+        let disk = out_of_order
+            .gcp_resources
+            .boot_disk
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            out_of_order
+                .active_destroy
+                .as_mut()
+                .unwrap()
+                .advance(&disk)
+                .is_err()
+        );
+
+        state.pending_effect = None;
+        state.gcp_resources.network = None;
+        state
+            .active_destroy
+            .as_mut()
+            .unwrap()
+            .advance(&target)
+            .unwrap();
+        assert!(state.active_destroy.as_ref().unwrap().is_complete());
+        assert!(state.validate().is_ok());
+
+        state.phase = DeploymentPhase::Destroyed;
+        state.active_destroy = None;
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn purge_cursor_requires_disk_removal_before_advancing() {
+        let mut state = active_destroy_state(true);
+        let disk = state.gcp_resources.boot_disk.as_ref().unwrap().clone();
+        assert_eq!(
+            state
+                .active_destroy
+                .as_ref()
+                .unwrap()
+                .current_target()
+                .unwrap()
+                .resource,
+            disk
+        );
+
+        let mut advanced_without_receipt = state.clone();
+        advanced_without_receipt
+            .active_destroy
+            .as_mut()
+            .unwrap()
+            .advance(&disk)
+            .unwrap();
+        assert!(advanced_without_receipt.validate().is_err());
+
+        state.gcp_resources.boot_disk = None;
+        state
+            .active_destroy
+            .as_mut()
+            .unwrap()
+            .advance(&disk)
+            .unwrap();
+        assert!(state.validate().is_ok());
     }
 
     #[test]

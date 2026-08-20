@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{CoreError, Result};
+use crate::{CoreError, ReleaseTag, Result};
 
 /// The only configuration schema supported by the fresh-only v0.1 deployer.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -39,7 +39,7 @@ pub enum DnsMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseSelection {
     Stable,
-    Exact(String),
+    Exact(ReleaseTag),
 }
 
 impl Serialize for ReleaseSelection {
@@ -49,7 +49,7 @@ impl Serialize for ReleaseSelection {
     {
         match self {
             Self::Stable => serializer.serialize_str("stable"),
-            Self::Exact(value) => serializer.serialize_str(value),
+            Self::Exact(value) => serializer.serialize_str(value.as_str()),
         }
     }
 }
@@ -62,10 +62,10 @@ impl<'de> Deserialize<'de> for ReleaseSelection {
         let value = String::deserialize(deserializer)?;
         if value == "stable" {
             Ok(Self::Stable)
-        } else if valid_exact_release(&value) {
-            Ok(Self::Exact(value))
         } else {
-            Err(serde::de::Error::custom("invalid release selection"))
+            ReleaseTag::parse(value)
+                .map(Self::Exact)
+                .map_err(serde::de::Error::custom)
         }
     }
 }
@@ -169,11 +169,6 @@ impl DeploymentConfig {
             return invalid("operator_ssh_cidr", "must be a canonical IPv4 /32 CIDR");
         }
         self.maximum_monthly_microusd()?;
-        if let ReleaseSelection::Exact(release) = &self.release
-            && !valid_exact_release(release)
-        {
-            return invalid("release", "must be stable or an exact release identifier");
-        }
         if !valid_agent_token(&self.connect_agent) {
             return invalid(
                 "connect_agent",
@@ -262,15 +257,6 @@ fn valid_ipv4_host_cidr(value: &str) -> bool {
     parsed.to_string() == address
 }
 
-fn valid_exact_release(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value != "stable"
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
-        && value.bytes().any(|byte| byte.is_ascii_digit())
-}
-
 fn valid_agent_token(value: &str) -> bool {
     (1..=63).contains(&value.len())
         && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
@@ -348,8 +334,8 @@ release = "stable"
     fn exact_release_must_be_bounded_and_identifier_safe() {
         let exact = MINIMAL.replace("release = \"stable\"", "release = \"v0.1.7+build.3\"");
         assert!(matches!(
-            DeploymentConfig::parse(&exact).unwrap().release,
-            ReleaseSelection::Exact(_)
+            DeploymentConfig::parse(&exact),
+            Err(CoreError::ConfigParse)
         ));
         let unsafe_release = MINIMAL.replace("release = \"stable\"", "release = \"../latest\"");
         assert!(matches!(
@@ -360,7 +346,7 @@ release = "stable"
 
     #[test]
     fn exact_release_serializes_back_to_the_public_string_shape() {
-        let exact = ReleaseSelection::Exact("v0.1.7".to_owned());
+        let exact = ReleaseSelection::Exact(ReleaseTag::parse("v0.1.7").unwrap());
         assert_eq!(serde_json::to_string(&exact).unwrap(), "\"v0.1.7\"");
     }
 

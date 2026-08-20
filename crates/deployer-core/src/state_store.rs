@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use fs2::FileExt;
+use fs4::{FileExt, TryLockError};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha2::Sha256;
@@ -38,12 +38,9 @@ impl StateStore {
         prepare_directory(paths.root())?;
         reject_symlink(&paths.lock_file())?;
         let lock = open_restricted(&paths.lock_file(), true)?;
-        lock.try_lock_exclusive().map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                CoreError::Locked
-            } else {
-                CoreError::io("lock", error)
-            }
+        FileExt::try_lock(&lock).map_err(|error| match error {
+            TryLockError::WouldBlock => CoreError::Locked,
+            TryLockError::Error(error) => CoreError::io("lock", error),
         })?;
         validate_owner(paths.root())?;
         validate_owner_file(&lock)?;
@@ -221,6 +218,7 @@ struct StateForDigest<'a> {
     phase: crate::DeploymentPhase,
     approved_plan_digest: &'a Option<PlanDigest>,
     pending_effect: &'a Option<crate::PendingEffect>,
+    active_destroy: &'a Option<crate::ActiveDestroyPlan>,
     release_identity: &'a Option<crate::ExactReleaseIdentity>,
     gcp_resources: &'a crate::GcpResources,
     ssh_host_identity: &'a Option<crate::SshHostIdentity>,
@@ -237,6 +235,7 @@ fn state_digest_input(state: &DeploymentState) -> Result<Vec<u8>> {
         phase: state.phase,
         approved_plan_digest: &state.approved_plan_digest,
         pending_effect: &state.pending_effect,
+        active_destroy: &state.active_destroy,
         release_identity: &state.release_identity,
         gcp_resources: &state.gcp_resources,
         ssh_host_identity: &state.ssh_host_identity,
@@ -450,7 +449,10 @@ mod tests {
 
     use super::*;
     use crate::release::test_release_identity;
-    use crate::{DeploymentPhase, GcpResources, LocalWiringStatus, ProjectIdentity};
+    use crate::{
+        ActiveDestroyPlan, DeploymentPhase, DestroyPlan, GcpResources, GoogleSubject,
+        LocalWiringStatus, ProjectIdentity, ResourceKind, ResourceRef,
+    };
 
     fn state(service_id: &str) -> DeploymentState {
         DeploymentState {
@@ -460,7 +462,7 @@ mod tests {
             project_identity: ProjectIdentity {
                 project_id: "dirextalk-prod".to_owned(),
                 project_number: 42,
-                oauth_principal: "operator@example.com".to_owned(),
+                oauth_principal: GoogleSubject::parse("operator.example").unwrap(),
             },
             phase: DeploymentPhase::Applying,
             approved_plan_digest: Some(
@@ -469,6 +471,7 @@ mod tests {
                     .unwrap(),
             ),
             pending_effect: None,
+            active_destroy: None,
             release_identity: Some(test_release_identity()),
             gcp_resources: GcpResources::default(),
             ssh_host_identity: None,
@@ -505,6 +508,32 @@ mod tests {
         fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
         let store = StateStore::open(temporary.path(), service_id).unwrap();
         assert!(matches!(store.read(), Err(CoreError::Integrity)));
+    }
+
+    #[test]
+    fn sealed_round_trip_preserves_active_destroy_cursor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let service_id = "production-0123456789ab";
+        let mut state = state(service_id);
+        state.gcp_resources.network = Some(ResourceRef {
+            resource_kind: ResourceKind::Network,
+            name: "network".to_owned(),
+            project_number: 42,
+            location: "global".to_owned(),
+            numeric_id: 11,
+            self_link: "https://compute.googleapis.com/network/11".to_owned(),
+            deployment_uuid: state.deployment_uuid,
+            observed_attributes: BTreeMap::from([("name".to_owned(), "network".to_owned())]),
+        });
+        let plan = DestroyPlan::from_state(&state, None).unwrap();
+        let digest = plan.digest().unwrap();
+        state.phase = DeploymentPhase::Destroying;
+        state.active_destroy = Some(ActiveDestroyPlan::new(plan, digest).unwrap());
+
+        let store = StateStore::open(temporary.path(), service_id).unwrap();
+        store.write(&state).unwrap();
+        let reopened = store.read().unwrap().unwrap();
+        assert_eq!(reopened.active_destroy, state.active_destroy);
     }
 
     #[test]
