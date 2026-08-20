@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IO_TIMEOUT: Duration = Duration::from_mins(1);
+const HOST_INSTALL_TIMEOUT: Duration = Duration::from_mins(30);
 const MAX_COMMAND_OUTPUT: usize = 1024 * 1024;
 const MAX_BOOTSTRAP_RECEIPT: usize = 64 * 1024;
 const PRODUCT_BOOTSTRAP_PATH: &str = "/var/dirextalk-message-server/p2p/bootstrap.json";
@@ -149,6 +150,13 @@ impl FixedRemoteCommand {
             }
         }
     }
+
+    const fn timeout(&self) -> Duration {
+        match self {
+            Self::RunHostInstaller { .. } => HOST_INSTALL_TIMEOUT,
+            _ => IO_TIMEOUT,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,11 +284,11 @@ impl SshClient {
     ) -> Result<Self, TransportError> {
         validate_username(username)?;
         let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
-        tcp.set_read_timeout(Some(IO_TIMEOUT))?;
-        tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+        tcp.set_read_timeout(Some(HOST_INSTALL_TIMEOUT))?;
+        tcp.set_write_timeout(Some(HOST_INSTALL_TIMEOUT))?;
         let mut session = Session::new()?;
         session.set_tcp_stream(tcp);
-        session.set_timeout(u32::try_from(IO_TIMEOUT.as_millis()).unwrap_or(u32::MAX));
+        session.set_timeout(timeout_millis(IO_TIMEOUT));
         session.handshake()?;
         let observed = observed_pin(&session)?;
         verify_host_key(pin, &observed)?;
@@ -299,7 +307,7 @@ impl SshClient {
         tcp.set_write_timeout(Some(IO_TIMEOUT))?;
         let mut session = Session::new()?;
         session.set_tcp_stream(tcp);
-        session.set_timeout(u32::try_from(IO_TIMEOUT.as_millis()).unwrap_or(u32::MAX));
+        session.set_timeout(timeout_millis(IO_TIMEOUT));
         session.handshake()?;
         observed_pin(&session)
     }
@@ -322,7 +330,12 @@ impl HostTransport for SshClient {
         file.write_all(bytes)?;
         file.fsync()?;
         drop(file);
-        sftp.rename(&temporary, final_path, None)?;
+        drop(sftp);
+        let committed = self.execute_bounded(&upload_commit_command(artifact), 1024)?;
+        if committed.exit_status != 0 {
+            return Err(TransportError::UploadVerification);
+        }
+        let sftp = self.session.sftp()?;
         let mut uploaded = sftp.open(final_path)?;
         let mut hasher = Sha256::new();
         let mut total = 0usize;
@@ -349,19 +362,37 @@ impl HostTransport for SshClient {
     }
 
     fn execute(&mut self, command: &FixedRemoteCommand) -> Result<CommandOutput, TransportError> {
-        self.execute_bounded(&command.command(), MAX_COMMAND_OUTPUT)
+        self.session.set_timeout(timeout_millis(command.timeout()));
+        let result = self.execute_bounded(&command.command(), MAX_COMMAND_OUTPUT);
+        self.session.set_timeout(timeout_millis(IO_TIMEOUT));
+        result
     }
 
     fn read_product_bootstrap(&mut self) -> Result<SecretBytes, TransportError> {
-        let output = self.execute_bounded(
-            &format!("/usr/bin/sudo --non-interactive /usr/bin/cat {PRODUCT_BOOTSTRAP_PATH}"),
-            MAX_BOOTSTRAP_RECEIPT,
-        )?;
+        let output = self.execute_bounded(&product_bootstrap_command(), MAX_BOOTSTRAP_RECEIPT)?;
         if output.exit_status != 0 {
             return Err(TransportError::BootstrapRead(output.exit_status));
         }
         Ok(SecretBytes(Zeroizing::new(output.stdout)))
     }
+}
+
+fn product_bootstrap_command() -> String {
+    format!(
+        "/usr/bin/sudo --non-interactive /usr/bin/docker compose --project-name dirextalk-p2p --file /var/dirextalk-message-server/docker-compose.yml exec --no-TTY message-server /bin/cat {PRODUCT_BOOTSTRAP_PATH}"
+    )
+}
+
+fn upload_commit_command(artifact: RemoteArtifact) -> String {
+    format!(
+        "/usr/bin/mv --force -- {}.upload {}",
+        artifact.path(),
+        artifact.path()
+    )
+}
+
+fn timeout_millis(timeout: Duration) -> u32 {
+    u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)
 }
 
 impl SshClient {
@@ -513,6 +544,30 @@ pub enum TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_host_install_gets_the_long_command_timeout() {
+        let digest = Sha256Digest::parse("a".repeat(64)).unwrap();
+        assert_eq!(
+            FixedRemoteCommand::RunHostInstaller {
+                request_sha256: digest,
+            }
+            .timeout(),
+            HOST_INSTALL_TIMEOUT
+        );
+        assert_eq!(
+            FixedRemoteCommand::VerifyCanonicalRuntime.timeout(),
+            IO_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn product_bootstrap_is_read_from_the_fixed_message_server_service() {
+        assert_eq!(
+            product_bootstrap_command(),
+            "/usr/bin/sudo --non-interactive /usr/bin/docker compose --project-name dirextalk-p2p --file /var/dirextalk-message-server/docker-compose.yml exec --no-TTY message-server /bin/cat /var/dirextalk-message-server/p2p/bootstrap.json"
+        );
+    }
     use std::collections::VecDeque;
 
     fn pin(byte: u8) -> HostKeyPin {
@@ -552,6 +607,10 @@ mod tests {
                 "/usr/bin/sudo --non-interactive /var/tmp/dirextalk-host-installer --request-sha256 {}",
                 "ab".repeat(32)
             )
+        );
+        assert_eq!(
+            upload_commit_command(RemoteArtifact::HostInstaller),
+            "/usr/bin/mv --force -- /var/tmp/dirextalk-host-installer.upload /var/tmp/dirextalk-host-installer"
         );
     }
 

@@ -262,7 +262,7 @@ services:
       - agent_secret_material:/run/secrets:ro
       - agent_knowledge_content:/var/lib/dirextalk-agent/knowledge-content
       - agent_knowledge_mount:/var/lib/dirextalk-agent/knowledge-mount:ro
-      - agent_core_data:/var/lib/dirextalk-agent/core-data
+      - agent_core_data:/var/lib/dirextalk-agent/extension-staging
     networks: [agent_private, agent_database, application, egress]
     depends_on:
       agent-migrate:

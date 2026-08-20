@@ -952,6 +952,10 @@ release = "stable"
     }
 
     fn resource(kind: ResourceKind, uuid: Uuid, name: &str, numeric_id: u64) -> ResourceRef {
+        let observed_attributes = match kind {
+            ResourceKind::Address => BTreeMap::from([("address".to_owned(), "8.8.8.8".to_owned())]),
+            _ => BTreeMap::new(),
+        };
         ResourceRef {
             resource_kind: kind,
             name: name.to_owned(),
@@ -966,7 +970,7 @@ release = "stable"
             numeric_id,
             self_link: format!("https://compute.googleapis.com/{name}/{numeric_id}"),
             deployment_uuid: uuid,
-            observed_attributes: BTreeMap::from([("name".to_owned(), name.to_owned())]),
+            observed_attributes,
         }
     }
 
@@ -1380,7 +1384,7 @@ release = "stable"
         );
         address
             .observed_attributes
-            .insert("address".to_owned(), "203.0.113.42".to_owned());
+            .insert("address".to_owned(), "8.8.8.8".to_owned());
         continuation.stage = DeploymentPlanStage::DnsContinuation {
             previous_plan_digest: previous.clone(),
             address,
@@ -1391,7 +1395,7 @@ release = "stable"
             zone_numeric_id: 7,
             current_ipv4: BTreeSet::from(["203.0.113.1".parse().unwrap()]),
             change: Some(DnsChangeApproval {
-                replacement_ipv4: "203.0.113.42".parse().unwrap(),
+                replacement_ipv4: "8.8.8.8".parse().unwrap(),
             }),
         };
         continuation.effects = vec![PlannedEffect {
@@ -1402,7 +1406,7 @@ release = "stable"
             expected_attributes: BTreeMap::from([
                 ("current_values".to_owned(), "[\"203.0.113.1\"]".to_owned()),
                 ("ttl".to_owned(), "300".to_owned()),
-                ("value".to_owned(), "203.0.113.42".to_owned()),
+                ("value".to_owned(), "8.8.8.8".to_owned()),
                 ("zone_name".to_owned(), "example-com".to_owned()),
                 ("zone_numeric_id".to_owned(), "7".to_owned()),
             ]),

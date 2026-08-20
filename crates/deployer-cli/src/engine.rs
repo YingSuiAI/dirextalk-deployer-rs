@@ -169,6 +169,7 @@ pub trait DeploymentBackend: Send + Sync {
         config: &DeploymentConfig,
         state: &DeploymentState,
     ) -> Result<LocalWiringStatus>;
+    async fn uninstall_connect(&self, state: &DeploymentState) -> Result<LocalWiringStatus>;
     async fn verify_product(
         &self,
         config: &DeploymentConfig,
@@ -460,8 +461,13 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
                 .await?;
             self.execute_effect(&mut state, &effect).await?;
         }
+        if state.local_wiring.installed {
+            state.local_wiring = self.backend.uninstall_connect(&state).await?;
+        }
         state.phase = DeploymentPhase::Destroyed;
         state.active_destroy = None;
+        state.ssh_host_identity = None;
+        state.host_receipt = None;
         self.store.write(&state)
     }
 
@@ -470,7 +476,6 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
         self.backend
             .revalidate_project(&state.project_identity)
             .await?;
-        revalidate_all(self.backend, &state).await?;
         if let Some(active) = &state.active_destroy {
             let active_purge = match &active.plan.boot_disk {
                 deployer_core::BootDiskDisposition::Retain { .. } => None,
@@ -481,6 +486,7 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
             }
             return Ok(active.plan.clone());
         }
+        revalidate_all(self.backend, &state).await?;
         DestroyPlan::from_state(&state, purge_disk).map_err(EngineError::from)
     }
 
@@ -1107,6 +1113,7 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         dns_ready: bool,
         already_absent: BTreeSet<String>,
+        missing_during_revalidation: BTreeSet<String>,
         replacement: BTreeSet<String>,
         fail_start: BTreeSet<String>,
         fail_poll_once: Mutex<BTreeSet<String>>,
@@ -1118,6 +1125,7 @@ mod tests {
                 events,
                 dns_ready,
                 already_absent: BTreeSet::new(),
+                missing_during_revalidation: BTreeSet::new(),
                 replacement: BTreeSet::new(),
                 fail_start: BTreeSet::new(),
                 fail_poll_once: Mutex::new(BTreeSet::new()),
@@ -1212,11 +1220,6 @@ mod tests {
             if effect.action == EffectAction::Delete {
                 return Ok(EffectReceipt::Deleted);
             }
-            let mut attributes = effect.expected_attributes.clone();
-            attributes.insert("name".into(), effect.resource_name.clone());
-            if effect.resource_kind == ResourceKind::Address {
-                attributes.insert("address".into(), "8.8.8.8".into());
-            }
             Ok(EffectReceipt::Present(ResourceRef {
                 resource_kind: effect.resource_kind,
                 name: effect.resource_name.clone(),
@@ -1228,7 +1231,7 @@ mod tests {
                     effect.resource_name
                 ),
                 deployment_uuid: effect.deployment_uuid,
-                observed_attributes: attributes,
+                observed_attributes: fake_observed_attributes(effect),
             }))
         }
 
@@ -1238,6 +1241,11 @@ mod tests {
             resource: &ResourceRef,
         ) -> Result<()> {
             self.event(format!("revalidate-resource:{}", resource.numeric_id));
+            if self.missing_during_revalidation.contains(&resource.name) {
+                return Err(EngineError::Backend(
+                    "recorded GCP resource is absent".into(),
+                ));
+            }
             if self.replacement.contains(&resource.name) {
                 return Err(EngineError::Backend(
                     "same-name resource has a different immutable identity".into(),
@@ -1328,6 +1336,11 @@ mod tests {
                 service_active: true,
                 last_checked_unix_ms: Some(1),
             })
+        }
+
+        async fn uninstall_connect(&self, _state: &DeploymentState) -> Result<LocalWiringStatus> {
+            self.event("uninstall-connect");
+            Ok(LocalWiringStatus::default())
         }
 
         async fn verify_product(
@@ -1650,11 +1663,6 @@ release = "stable"
             .iter()
             .find(|effect| effect.resource_kind == kind)
             .expect("planned resource");
-        let mut observed_attributes = effect.expected_attributes.clone();
-        observed_attributes.insert("name".into(), effect.resource_name.clone());
-        if kind == ResourceKind::Address {
-            observed_attributes.insert("address".into(), "8.8.8.8".into());
-        }
         ResourceRef {
             resource_kind: kind,
             name: effect.resource_name.clone(),
@@ -1666,7 +1674,110 @@ release = "stable"
                 effect.resource_name
             ),
             deployment_uuid: plan.deployment_uuid,
-            observed_attributes,
+            observed_attributes: fake_observed_attributes(&PendingEffect {
+                effect_id: Uuid::new_v4(),
+                deployment_uuid: plan.deployment_uuid,
+                project_number: plan.project_identity.project_number,
+                action: effect.action,
+                resource_kind: effect.resource_kind,
+                resource_name: effect.resource_name.clone(),
+                location: effect.location.clone(),
+                expected_attributes: effect.expected_attributes.clone(),
+                target: effect.target.clone(),
+                operation: None,
+            }),
+        }
+    }
+
+    fn fake_observed_attributes(effect: &PendingEffect) -> BTreeMap<String, String> {
+        let base = effect
+            .resource_name
+            .rsplit_once('-')
+            .map_or(effect.resource_name.as_str(), |(base, _)| base);
+        let network = format!("projects/dirextalk-prod/global/networks/{base}-net");
+        match effect.resource_kind {
+            ResourceKind::Network => BTreeMap::from([
+                ("auto_create_subnetworks".into(), "false".into()),
+                ("routing_mode".into(), "GLOBAL".into()),
+            ]),
+            ResourceKind::Subnet => BTreeMap::from([
+                (
+                    "ip_cidr_range".into(),
+                    effect
+                        .expected_attributes
+                        .get("cidr")
+                        .cloned()
+                        .unwrap_or_else(|| "10.42.0.0/24".into()),
+                ),
+                ("network".into(), network),
+            ]),
+            ResourceKind::Firewall => BTreeMap::from([
+                (
+                    "allowed".into(),
+                    r#"[{"ports":["443"],"protocol":"tcp"}]"#.into(),
+                ),
+                ("network".into(), network),
+                ("source_ranges".into(), r#"["0.0.0.0/0"]"#.into()),
+                ("target_tags".into(), format!(r#"["{base}"]"#)),
+            ]),
+            ResourceKind::Address => BTreeMap::from([("address".into(), "8.8.8.8".into())]),
+            ResourceKind::Disk => BTreeMap::from([
+                (
+                    "size_gb".into(),
+                    effect
+                        .expected_attributes
+                        .get("size_gib")
+                        .cloned()
+                        .unwrap_or_else(|| "50".into()),
+                ),
+                (
+                    "source_image".into(),
+                    "ubuntu-2404-noble-amd64-v20260801".into(),
+                ),
+                ("source_image_id".into(), "123456789".into()),
+                ("type".into(), "pd-balanced".into()),
+            ]),
+            ResourceKind::Instance => {
+                let region = effect
+                    .location
+                    .rsplit_once('-')
+                    .map_or("us-central1", |(region, _)| region);
+                BTreeMap::from([
+                    ("access_config_count".into(), "1".into()),
+                    (
+                        "boot_disk".into(),
+                        format!(
+                            "projects/dirextalk-prod/zones/{}/disks/{base}-boot",
+                            effect.location
+                        ),
+                    ),
+                    ("boot_disk_auto_delete".into(), "false".into()),
+                    ("can_ip_forward".into(), "false".into()),
+                    ("deletion_protection".into(), "false".into()),
+                    ("disk_count".into(), "1".into()),
+                    (
+                        "machine_type".into(),
+                        effect
+                            .expected_attributes
+                            .get("machine_type")
+                            .cloned()
+                            .unwrap_or_else(|| "e2-custom-2-4096".into()),
+                    ),
+                    ("metadata_key_count".into(), "1".into()),
+                    ("nat_ip".into(), "8.8.8.8".into()),
+                    ("network_interface_count".into(), "1".into()),
+                    ("network_tags".into(), format!(r#"["{base}"]"#)),
+                    ("service_account_count".into(), "0".into()),
+                    ("ssh_keys_sha256".into(), "a".repeat(64)),
+                    (
+                        "subnetwork".into(),
+                        format!(
+                            "projects/dirextalk-prod/regions/{region}/subnetworks/{base}-subnet"
+                        ),
+                    ),
+                ])
+            }
+            ResourceKind::DnsRecord => effect.expected_attributes.clone(),
         }
     }
 
@@ -1681,6 +1792,23 @@ release = "stable"
         .expect("plan");
         let network = resource_from_plan(&plan, ResourceKind::Network);
         let address = include_address.then(|| resource_from_plan(&plan, ResourceKind::Address));
+        let ssh_host_identity = include_address.then(|| SshHostIdentity {
+            address: "8.8.8.8".parse().expect("address"),
+            algorithm: deployer_core::SshHostKeyAlgorithm::Ed25519,
+            fingerprint_sha256: deployer_core::SshSha256Fingerprint::parse(format!(
+                "SHA256:{}",
+                "a".repeat(64)
+            ))
+            .expect("fingerprint"),
+        });
+        let host_receipt = include_address.then(|| HostReceipt {
+            deployment_uuid: plan.deployment_uuid,
+            release_tag: plan.release.release_tag.clone(),
+            host_installer_sha256: plan.release.host_installer_linux_amd64_sha256.clone(),
+            runtime_bundle_sha256: plan.release.runtime_bundle_linux_amd64_sha256.clone(),
+            installed_at_unix_ms: 1,
+            receipt_signature: "d".repeat(64),
+        });
         DeploymentState {
             schema_version: 1,
             deployment_uuid: plan.deployment_uuid,
@@ -1696,9 +1824,18 @@ release = "stable"
                 address,
                 ..GcpResources::default()
             },
-            ssh_host_identity: None,
-            host_receipt: None,
-            local_wiring: LocalWiringStatus::default(),
+            ssh_host_identity,
+            host_receipt,
+            local_wiring: if include_address {
+                LocalWiringStatus {
+                    requested: true,
+                    installed: true,
+                    service_active: true,
+                    last_checked_unix_ms: Some(1),
+                }
+            } else {
+                LocalWiringStatus::default()
+            },
             integrity_digest: String::new(),
         }
     }
@@ -1869,7 +2006,10 @@ release = "stable"
                 .is_some()
         );
 
-        let resumed_backend = FakeBackend::new(Arc::clone(&events), true);
+        let mut resumed_backend = FakeBackend::new(Arc::clone(&events), true);
+        resumed_backend
+            .missing_during_revalidation
+            .insert(network_name.clone());
         let resumed = Orchestrator::new(&resumed_backend, &store)
             .plan_destroy(None)
             .await
@@ -1900,6 +2040,16 @@ release = "stable"
         assert_eq!(final_state.phase, DeploymentPhase::Destroyed);
         assert!(final_state.active_destroy.is_none());
         assert!(final_state.pending_effect.is_none());
+        assert!(final_state.ssh_host_identity.is_none());
+        assert!(final_state.host_receipt.is_none());
+        assert_eq!(final_state.local_wiring, LocalWiringStatus::default());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "uninstall-connect")
+                .count(),
+            1
+        );
         assert!(final_state.gcp_resources.network.is_none());
     }
 
@@ -1929,10 +2079,18 @@ release = "stable"
                 disk_effect.location, disk_effect.resource_name
             ),
             deployment_uuid: plan.deployment_uuid,
-            observed_attributes: BTreeMap::from([(
-                "name".into(),
-                disk_effect.resource_name.clone(),
-            )]),
+            observed_attributes: fake_observed_attributes(&PendingEffect {
+                effect_id: Uuid::new_v4(),
+                deployment_uuid: plan.deployment_uuid,
+                project_number: plan.project_identity.project_number,
+                action: EffectAction::Create,
+                resource_kind: ResourceKind::Disk,
+                resource_name: disk_effect.resource_name.clone(),
+                location: disk_effect.location.clone(),
+                expected_attributes: disk_effect.expected_attributes.clone(),
+                target: None,
+                operation: None,
+            }),
         };
         let state = DeploymentState {
             schema_version: 1,

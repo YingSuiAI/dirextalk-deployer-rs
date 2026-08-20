@@ -523,7 +523,10 @@ mod tests {
             numeric_id: 11,
             self_link: "https://compute.googleapis.com/network/11".to_owned(),
             deployment_uuid: state.deployment_uuid,
-            observed_attributes: BTreeMap::from([("name".to_owned(), "network".to_owned())]),
+            observed_attributes: BTreeMap::from([
+                ("auto_create_subnetworks".to_owned(), "false".to_owned()),
+                ("routing_mode".to_owned(), "GLOBAL".to_owned()),
+            ]),
         });
         let plan = DestroyPlan::from_state(&state, None).unwrap();
         let digest = plan.digest().unwrap();

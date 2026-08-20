@@ -562,7 +562,7 @@ pub(crate) fn validate_resource(
     {
         return Err(CoreError::InvalidState("resource identity is incomplete"));
     }
-    validate_attributes(&resource.observed_attributes)
+    validate_resource_attributes(resource.resource_kind, &resource.observed_attributes)
 }
 
 pub(crate) fn validate_resource_name_and_location(
@@ -625,7 +625,11 @@ fn validate_effect(
             "pending effect identity is incomplete",
         ));
     }
-    validate_attributes(&effect.expected_attributes)?;
+    if effect.action == EffectAction::Delete {
+        validate_resource_attributes(effect.resource_kind, &effect.expected_attributes)?;
+    } else {
+        validate_attributes(&effect.expected_attributes)?;
+    }
     if let Some(operation) = &effect.operation {
         validate_operation(operation, effect, identity)?;
     }
@@ -898,12 +902,23 @@ fn validate_host(state: &DeploymentState) -> Result<()> {
             "host receipt requires exact release identity",
         ));
     };
-    let address_matches = state
+    let recorded_address = state
         .gcp_resources
         .address
         .as_ref()
         .and_then(|address| address.observed_attributes.get("address"))
-        .and_then(|address| address.parse::<Ipv4Addr>().ok())
+        .or_else(|| {
+            state.active_destroy.as_ref().and_then(|active| {
+                active
+                    .plan
+                    .targets
+                    .iter()
+                    .find(|target| target.resource.resource_kind == ResourceKind::Address)
+                    .and_then(|target| target.resource.observed_attributes.get("address"))
+            })
+        })
+        .and_then(|address| address.parse::<Ipv4Addr>().ok());
+    let address_matches = recorded_address
         == state
             .ssh_host_identity
             .as_ref()
@@ -938,7 +953,36 @@ fn is_public_ipv4(address: Ipv4Addr) -> bool {
 }
 
 pub(crate) fn validate_attributes(attributes: &BTreeMap<String, String>) -> Result<()> {
+    validate_attribute_keys(attributes)?;
     for (key, value) in attributes {
+        if !safe_attribute_value(key, value) {
+            return Err(CoreError::InvalidState(
+                "resource attributes contain an unsafe value",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource_attributes(
+    kind: ResourceKind,
+    attributes: &BTreeMap<String, String>,
+) -> Result<()> {
+    validate_attribute_keys(attributes)?;
+    if attributes
+        .iter()
+        .all(|(key, value)| safe_resource_attribute_value(kind, key, value))
+    {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidState(
+            "resource attributes contain an unsafe value",
+        ))
+    }
+}
+
+fn validate_attribute_keys(attributes: &BTreeMap<String, String>) -> Result<()> {
+    for key in attributes.keys() {
         let normalized = key.to_ascii_lowercase();
         if key.is_empty()
             || key.len() > 64
@@ -964,13 +1008,132 @@ pub(crate) fn validate_attributes(attributes: &BTreeMap<String, String>) -> Resu
                 "resource attributes contain an unsafe key",
             ));
         }
-        if !safe_attribute_value(key, value) {
-            return Err(CoreError::InvalidState(
-                "resource attributes contain an unsafe value",
-            ));
-        }
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservedFirewallAllowance {
+    protocol: String,
+    ports: Vec<String>,
+}
+
+fn safe_resource_attribute_value(kind: ResourceKind, key: &str, value: &str) -> bool {
+    if value.is_empty() || value.len() > 2_048 {
+        return false;
+    }
+    match (kind, key) {
+        (ResourceKind::Network, "auto_create_subnetworks")
+        | (
+            ResourceKind::Instance,
+            "boot_disk_auto_delete" | "can_ip_forward" | "deletion_protection",
+        ) => value == "false",
+        (ResourceKind::Network, "routing_mode") => value == "GLOBAL",
+        (ResourceKind::Subnet, "ip_cidr_range") => valid_ipv4_cidr(value, false),
+        (ResourceKind::Subnet | ResourceKind::Firewall, "network") => {
+            valid_normalized_resource_reference(value, "global", "networks")
+        }
+        (ResourceKind::Firewall, "allowed") => valid_firewall_allowances(value),
+        (ResourceKind::Firewall, "source_ranges") => valid_cidr_list(value),
+        (ResourceKind::Firewall, "target_tags") | (ResourceKind::Instance, "network_tags") => {
+            valid_name_list(value)
+        }
+        (ResourceKind::Address, "address") | (ResourceKind::Instance, "nat_ip") => {
+            value.parse::<Ipv4Addr>().is_ok_and(is_public_ipv4)
+        }
+        (ResourceKind::Disk, "size_gb" | "source_image_id")
+        | (ResourceKind::DnsRecord, "zone_numeric_id" | "ttl") => positive_integer(value),
+        (ResourceKind::Disk, "source_image")
+        | (ResourceKind::Instance, "machine_type")
+        | (ResourceKind::DnsRecord, "zone_name") => safe_public_name(value),
+        (ResourceKind::Disk, "type") => value == "pd-balanced",
+        (
+            ResourceKind::Instance,
+            "access_config_count" | "disk_count" | "metadata_key_count" | "network_interface_count",
+        ) => value == "1",
+        (ResourceKind::Instance, "service_account_count") => value == "0",
+        (ResourceKind::Instance, "boot_disk") => {
+            valid_normalized_resource_reference(value, "zones", "disks")
+        }
+        (ResourceKind::Instance, "ssh_keys_sha256") => valid_sha256(value),
+        (ResourceKind::Instance, "subnetwork") => {
+            valid_normalized_resource_reference(value, "regions", "subnetworks")
+        }
+        (ResourceKind::DnsRecord, "value") => value.parse::<Ipv4Addr>().is_ok(),
+        (ResourceKind::DnsRecord, "current_values") => {
+            serde_json::from_str::<Vec<Ipv4Addr>>(value).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn positive_integer(value: &str) -> bool {
+    value.parse::<u64>().is_ok_and(|number| number > 0)
+}
+
+fn valid_normalized_resource_reference(value: &str, scope: &str, collection: &str) -> bool {
+    let segments: Vec<_> = value.split('/').collect();
+    match segments.as_slice() {
+        ["projects", project, "global", observed_collection, name] => {
+            scope == "global"
+                && *observed_collection == collection
+                && valid_project_id(project)
+                && safe_public_name(name)
+        }
+        [
+            "projects",
+            project,
+            observed_scope,
+            location,
+            observed_collection,
+            name,
+        ] => {
+            *observed_scope == scope
+                && *observed_collection == collection
+                && valid_project_id(project)
+                && match scope {
+                    "regions" => valid_region(location),
+                    "zones" => valid_zone(location),
+                    _ => false,
+                }
+                && safe_public_name(name)
+        }
+        _ => false,
+    }
+}
+
+fn valid_firewall_allowances(value: &str) -> bool {
+    serde_json::from_str::<Vec<ObservedFirewallAllowance>>(value).is_ok_and(|allowances| {
+        !allowances.is_empty()
+            && allowances.iter().all(|allowance| {
+                matches!(allowance.protocol.as_str(), "tcp" | "udp")
+                    && !allowance.ports.is_empty()
+                    && allowance.ports.iter().all(|port| valid_port(port))
+            })
+    })
+}
+
+fn valid_port(value: &str) -> bool {
+    let parse = |value: &str| value.parse::<u16>().ok().filter(|port| *port > 0);
+    match value.split_once('-') {
+        Some((start, end)) => match (parse(start), parse(end)) {
+            (Some(start), Some(end)) => start <= end,
+            _ => false,
+        },
+        None => parse(value).is_some(),
+    }
+}
+
+fn valid_cidr_list(value: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(value).is_ok_and(|ranges| {
+        !ranges.is_empty() && ranges.iter().all(|range| valid_ipv4_cidr(range, false))
+    })
+}
+
+fn valid_name_list(value: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(value)
+        .is_ok_and(|names| !names.is_empty() && names.iter().all(|name| safe_public_name(name)))
 }
 
 fn safe_attribute_value(key: &str, value: &str) -> bool {
@@ -1166,7 +1329,7 @@ mod tests {
             numeric_id,
             self_link: format!("https://compute.googleapis.com/{name}/{numeric_id}"),
             deployment_uuid: state.deployment_uuid,
-            observed_attributes: BTreeMap::from([("name".to_owned(), name.to_owned())]),
+            observed_attributes: BTreeMap::new(),
         }
     }
 
@@ -1255,7 +1418,7 @@ mod tests {
             numeric_id: 8,
             self_link: "https://compute.googleapis.com/network/8".to_owned(),
             deployment_uuid: state.deployment_uuid,
-            observed_attributes: BTreeMap::from([("name".to_owned(), "network".to_owned())]),
+            observed_attributes: BTreeMap::new(),
         };
         let effect_id = Uuid::new_v4();
         let mut effect = PendingEffect {
@@ -1340,6 +1503,48 @@ mod tests {
             state.validate(),
             Err(CoreError::InvalidState("host receipt identity mismatch"))
         ));
+    }
+
+    #[test]
+    fn host_receipt_remains_bound_while_its_address_is_deleted() {
+        let mut state = state();
+        let release = state.release_identity.as_ref().unwrap();
+        state.host_receipt = Some(HostReceipt {
+            deployment_uuid: state.deployment_uuid,
+            release_tag: release.release_tag.clone(),
+            host_installer_sha256: release.host_installer_linux_amd64_sha256.clone(),
+            runtime_bundle_sha256: release.runtime_bundle_linux_amd64_sha256.clone(),
+            installed_at_unix_ms: 1,
+            receipt_signature: "d".repeat(64),
+        });
+        state.gcp_resources.address = Some(ResourceRef {
+            resource_kind: ResourceKind::Address,
+            name: "static-ip".to_owned(),
+            project_number: 42,
+            location: "us-central1".to_owned(),
+            numeric_id: 10,
+            self_link: "https://compute.googleapis.com/address/10".to_owned(),
+            deployment_uuid: state.deployment_uuid,
+            observed_attributes: BTreeMap::from([("address".to_owned(), "8.8.8.8".to_owned())]),
+        });
+        state.ssh_host_identity = Some(SshHostIdentity {
+            address: "8.8.8.8".parse().unwrap(),
+            algorithm: SshHostKeyAlgorithm::Ed25519,
+            fingerprint_sha256: SshSha256Fingerprint::parse(format!("SHA256:{}", "a".repeat(64)))
+                .unwrap(),
+        });
+        let plan = DestroyPlan::from_state(&state, None).unwrap();
+        let digest = plan.digest().unwrap();
+        let deleted = state.gcp_resources.address.take().unwrap();
+        state.phase = DeploymentPhase::Destroying;
+        state.active_destroy = Some(ActiveDestroyPlan::new(plan, digest).unwrap());
+        state
+            .active_destroy
+            .as_mut()
+            .unwrap()
+            .advance(&deleted)
+            .unwrap();
+        assert!(state.validate().is_ok());
     }
 
     #[test]
@@ -1481,6 +1686,85 @@ mod tests {
                 "resource attributes contain an unsafe key"
             ))
         ));
+    }
+
+    #[test]
+    fn gcp_receipt_attribute_shapes_are_explicit_per_resource_kind() {
+        let network = BTreeMap::from([
+            ("auto_create_subnetworks".into(), "false".into()),
+            ("routing_mode".into(), "GLOBAL".into()),
+        ]);
+        let subnet = BTreeMap::from([
+            ("ip_cidr_range".into(), "10.42.0.0/24".into()),
+            (
+                "network".into(),
+                "projects/dirextalk-prod/global/networks/dt-network".into(),
+            ),
+        ]);
+        let firewall = BTreeMap::from([
+            (
+                "allowed".into(),
+                r#"[{"ports":["3478"],"protocol":"tcp"},{"ports":["3478","49160-49200"],"protocol":"udp"}]"#.into(),
+            ),
+            (
+                "network".into(),
+                "projects/dirextalk-prod/global/networks/dt-network".into(),
+            ),
+            ("source_ranges".into(), r#"["0.0.0.0/0"]"#.into()),
+            ("target_tags".into(), r#"["dt-0123456789ab"]"#.into()),
+        ]);
+        let address = BTreeMap::from([("address".into(), "8.8.8.8".into())]);
+        let disk = BTreeMap::from([
+            ("size_gb".into(), "50".into()),
+            (
+                "source_image".into(),
+                "ubuntu-2404-noble-amd64-v20260801".into(),
+            ),
+            ("source_image_id".into(), "123456789".into()),
+            ("type".into(), "pd-balanced".into()),
+        ]);
+        let instance = BTreeMap::from([
+            ("access_config_count".into(), "1".into()),
+            (
+                "boot_disk".into(),
+                "projects/dirextalk-prod/zones/us-central1-a/disks/dt-boot".into(),
+            ),
+            ("boot_disk_auto_delete".into(), "false".into()),
+            ("can_ip_forward".into(), "false".into()),
+            ("deletion_protection".into(), "false".into()),
+            ("disk_count".into(), "1".into()),
+            ("machine_type".into(), "e2-custom-2-4096".into()),
+            ("metadata_key_count".into(), "1".into()),
+            ("nat_ip".into(), "8.8.8.8".into()),
+            ("network_interface_count".into(), "1".into()),
+            ("network_tags".into(), r#"["dt-0123456789ab"]"#.into()),
+            ("service_account_count".into(), "0".into()),
+            ("ssh_keys_sha256".into(), "a".repeat(64)),
+            (
+                "subnetwork".into(),
+                "projects/dirextalk-prod/regions/us-central1/subnetworks/dt-subnet".into(),
+            ),
+        ]);
+
+        for (kind, attributes) in [
+            (ResourceKind::Network, network),
+            (ResourceKind::Subnet, subnet),
+            (ResourceKind::Firewall, firewall),
+            (ResourceKind::Address, address),
+            (ResourceKind::Disk, disk),
+            (ResourceKind::Instance, instance),
+        ] {
+            validate_resource_attributes(kind, &attributes)
+                .unwrap_or_else(|error| panic!("{kind:?} attributes failed: {error}"));
+        }
+
+        assert!(
+            validate_resource_attributes(
+                ResourceKind::Network,
+                &BTreeMap::from([("ip_cidr_range".into(), "10.42.0.0/24".into())])
+            )
+            .is_err()
+        );
     }
 
     #[test]
