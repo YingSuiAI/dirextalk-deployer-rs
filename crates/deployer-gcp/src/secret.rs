@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -19,6 +20,21 @@ pub trait SecretStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<SecretString>>;
     fn set(&self, account: &str, value: &SecretString) -> Result<()>;
     fn delete(&self, account: &str) -> Result<()>;
+}
+
+pub trait PassphraseProvider: Send + Sync {
+    fn passphrase(&self) -> Result<SecretString>;
+}
+
+#[derive(Clone)]
+struct FixedPassphraseProvider {
+    passphrase: SecretString,
+}
+
+impl PassphraseProvider for FixedPassphraseProvider {
+    fn passphrase(&self) -> Result<SecretString> {
+        Ok(self.passphrase.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,11 +79,22 @@ impl SecretStore for KeyringStore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EncryptedFileStore {
     directory: PathBuf,
     service: String,
-    passphrase: SecretString,
+    passphrase_provider: Arc<dyn PassphraseProvider>,
+}
+
+impl std::fmt::Debug for EncryptedFileStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EncryptedFileStore")
+            .field("directory", &self.directory)
+            .field("service", &self.service)
+            .field("passphrase_provider", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,10 +113,23 @@ impl EncryptedFileStore {
         service: impl Into<String>,
         passphrase: SecretString,
     ) -> Self {
+        Self::with_passphrase_provider(
+            directory,
+            service,
+            Arc::new(FixedPassphraseProvider { passphrase }),
+        )
+    }
+
+    #[must_use]
+    pub fn with_passphrase_provider(
+        directory: impl Into<PathBuf>,
+        service: impl Into<String>,
+        passphrase_provider: Arc<dyn PassphraseProvider>,
+    ) -> Self {
         Self {
             directory: directory.into(),
             service: service.into(),
-            passphrase,
+            passphrase_provider,
         }
     }
 
@@ -104,7 +144,8 @@ impl EncryptedFileStore {
     }
 
     fn derive_key(&self, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        if self.passphrase.expose_secret().chars().count() < 16 {
+        let passphrase = self.passphrase_provider.passphrase()?;
+        if passphrase.expose_secret().chars().count() < 16 {
             return Err(GcpError::CredentialStorage(
                 "encrypted credential fallback requires a passphrase of at least 16 characters"
                     .into(),
@@ -112,11 +153,7 @@ impl EncryptedFileStore {
         }
         let mut key = Zeroizing::new([0_u8; 32]);
         Argon2::default()
-            .hash_password_into(
-                self.passphrase.expose_secret().as_bytes(),
-                salt,
-                key.as_mut(),
-            )
+            .hash_password_into(passphrase.expose_secret().as_bytes(), salt, key.as_mut())
             .map_err(|_| GcpError::CredentialStorage("Argon2id key derivation failed".into()))?;
         Ok(key)
     }
@@ -319,17 +356,129 @@ fn set_file_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use secrecy::{ExposeSecret as _, SecretString};
 
-    use super::{EncryptedFileStore, SecretStore};
+    use super::{CredentialStore, EncryptedFileStore, PassphraseProvider, SecretStore};
+    use crate::Result;
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+        passphrase: &'static str,
+    }
+
+    impl PassphraseProvider for CountingProvider {
+        fn passphrase(&self) -> Result<SecretString> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SecretString::from(self.passphrase))
+        }
+    }
+
+    enum PrimaryValue {
+        Present(&'static str),
+        Missing,
+    }
+
+    struct FakePrimaryStore(PrimaryValue);
+
+    impl SecretStore for FakePrimaryStore {
+        fn get(&self, _account: &str) -> Result<Option<SecretString>> {
+            match self.0 {
+                PrimaryValue::Present(value) => Ok(Some(SecretString::from(value))),
+                PrimaryValue::Missing => Ok(None),
+            }
+        }
+
+        fn set(&self, _account: &str, _value: &SecretString) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn counting_provider(
+        calls: &Arc<AtomicUsize>,
+        passphrase: &'static str,
+    ) -> Arc<dyn PassphraseProvider> {
+        Arc::new(CountingProvider {
+            calls: Arc::clone(calls),
+            passphrase,
+        })
+    }
+
+    #[test]
+    fn primary_secret_does_not_request_fallback_passphrase() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let store = CredentialStore::new(
+            FakePrimaryStore(PrimaryValue::Present("keyring-secret")),
+            fallback,
+        );
+
+        let loaded = store
+            .get("operator@example.com")
+            .expect("load")
+            .expect("present");
+
+        assert_eq!(loaded.expose_secret(), "keyring-secret");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn missing_primary_and_fallback_file_do_not_request_passphrase() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let store = CredentialStore::new(FakePrimaryStore(PrimaryValue::Missing), fallback);
+
+        assert!(store.get("operator@example.com").expect("load").is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fallback_requests_passphrase_only_when_encrypting_or_decrypting() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = EncryptedFileStore::with_passphrase_provider(
+            directory.path(),
+            "dirextalk-test",
+            counting_provider(&calls, "correct horse battery staple"),
+        );
+        let secret = SecretString::from("refresh-token-super-secret");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        store.set("operator@example.com", &secret).expect("store");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let loaded = store
+            .get("operator@example.com")
+            .expect("load")
+            .expect("present");
+
+        assert_eq!(loaded.expose_secret(), secret.expose_secret());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn encrypted_file_round_trip_does_not_contain_secret() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let passphrase = "correct horse battery staple";
         let store = EncryptedFileStore::new(
             directory.path(),
             "dirextalk-test",
-            SecretString::from("correct horse battery staple"),
+            SecretString::from(passphrase),
         );
         let secret = SecretString::from("refresh-token-super-secret");
         store.set("operator@example.com", &secret).expect("store");
@@ -344,26 +493,32 @@ mod tests {
         )
         .expect("read envelope");
         assert!(!raw.contains(secret.expose_secret()));
+        assert!(!raw.contains(passphrase));
         let loaded = store
             .get("operator@example.com")
             .expect("load")
             .expect("present");
         assert_eq!(loaded.expose_secret(), secret.expose_secret());
-        assert!(!format!("{store:?}").contains(secret.expose_secret()));
+        let debug = format!("{store:?}");
+        assert!(!debug.contains(secret.expose_secret()));
+        assert!(!debug.contains(passphrase));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]
-    fn encrypted_file_rejects_weak_passphrase() {
+    fn encrypted_file_rejects_weak_provider_passphrase_when_used() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = EncryptedFileStore::new(
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = EncryptedFileStore::with_passphrase_provider(
             directory.path(),
             "dirextalk-test",
-            SecretString::from("too-short"),
+            counting_provider(&calls, "too-short"),
         );
         assert!(
             store
                 .set("operator@example.com", &SecretString::from("refresh-token"))
                 .is_err()
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

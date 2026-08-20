@@ -30,4 +30,6 @@ pub use preflight::{
     longest_matching_zone,
 };
 pub use rest::{GoogleRestClient, HttpTransport, ReqwestTransport, RestResponse};
-pub use secret::{CredentialStore, EncryptedFileStore, KeyringStore, SecretStore};
+pub use secret::{
+    CredentialStore, EncryptedFileStore, KeyringStore, PassphraseProvider, SecretStore,
+};
