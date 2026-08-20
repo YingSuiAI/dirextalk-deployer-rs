@@ -174,12 +174,17 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                 DeployCommand::Resume(args) => {
                     let config = load_config(&args.config)?;
                     let store = self.stores.open_for_config(&config)?;
-                    completion_envelope(
-                        command_name(cli),
-                        Orchestrator::new(self.control, &store)
-                            .resume(&config)
-                            .await?,
-                    )
+                    let orchestrator = Orchestrator::new(self.control, &store);
+                    if args.pending_only {
+                        orchestrator.resume_pending_only(&config).await?;
+                        Ok(CommandEnvelope::success(
+                            command_name(cli),
+                            "DEPLOY_PENDING_EFFECT_RECONCILED",
+                            "The journaled effect was identity-verified and recorded; no later effect was started.",
+                        ))
+                    } else {
+                        completion_envelope(command_name(cli), orchestrator.resume(&config).await?)
+                    }
                 }
                 DeployCommand::Status(args) => {
                     let config = load_config(&args.config)?;

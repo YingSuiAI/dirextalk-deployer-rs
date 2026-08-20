@@ -89,7 +89,7 @@ pub struct DeployArgs {
 pub enum DeployCommand {
     Plan(ConfigArgs),
     Apply(ApprovedConfigArgs),
-    Resume(ConfigArgs),
+    Resume(ResumeArgs),
     Status(ConfigArgs),
     Verify(ConfigArgs),
     Destroy(DestroyArgs),
@@ -99,6 +99,16 @@ pub enum DeployCommand {
 pub struct ConfigArgs {
     #[arg(long, value_name = "DEPLOYMENT_TOML")]
     pub config: PathBuf,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct ResumeArgs {
+    #[arg(long, value_name = "DEPLOYMENT_TOML")]
+    pub config: PathBuf,
+    /// Reconcile only the currently journaled effect, then stop before the
+    /// next planned effect.
+    #[arg(long)]
+    pub pending_only: bool,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -200,5 +210,26 @@ mod tests {
         };
         assert_eq!(args.project, "dirextalk-prod");
         assert_eq!(args.approve.as_deref(), Some("sha256:abcd"));
+    }
+
+    #[test]
+    fn resume_pending_only_is_an_explicit_stop_boundary() {
+        let cli = Cli::try_parse_from([
+            "dirextalk-deployer",
+            "deploy",
+            "resume",
+            "--config",
+            "deployment.toml",
+            "--pending-only",
+        ])
+        .expect("valid command");
+        let TopLevelCommand::Deploy(deploy) = cli.command else {
+            panic!("expected deploy command");
+        };
+        let DeployCommand::Resume(resume) = deploy.command else {
+            panic!("expected resume command");
+        };
+        assert_eq!(resume.config, std::path::PathBuf::from("deployment.toml"));
+        assert!(resume.pending_only);
     }
 }

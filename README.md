@@ -140,6 +140,13 @@ dirextalk-deployer deploy status --config <deployment.toml>
 dirextalk-deployer deploy resume --config <deployment.toml>
 ```
 
+To stop immediately after recovering only the currently journaled cloud
+effect, use `deploy resume --config <deployment.toml> --pending-only`. It
+revalidates the original approved plan and identities, reconciles that one
+effect through the normal recovery path, and returns
+`DEPLOY_PENDING_EFFECT_RECONCILED` before any later effect or host installation.
+It requires an existing pending effect; it never advances an idle deployment.
+
 ## DNS waiting
 
 `dns_mode = "auto"` uses the longest matching existing public Cloud DNS zone

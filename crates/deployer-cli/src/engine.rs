@@ -360,6 +360,42 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
         self.resume_plan(config, &plan).await
     }
 
+    /// Reconciles exactly the currently journaled effect from the approved
+    /// plan and stops before starting any later effect.
+    pub async fn resume_pending_only(&self, config: &DeploymentConfig) -> Result<()> {
+        let plan = self
+            .store
+            .read_plan()?
+            .ok_or(EngineError::StatePlanMismatch)?;
+        let mut state = self.store.read()?.ok_or(EngineError::MissingState)?;
+        let plan_digest = plan.digest()?;
+        if state.approved_plan_digest.as_ref() != Some(&plan_digest)
+            || state.deployment_uuid != plan.deployment_uuid
+            || state.project_identity != plan.project_identity
+            || plan.spec != CanonicalDeploymentSpec::try_from(config)?
+        {
+            return Err(EngineError::StatePlanMismatch);
+        }
+        let pending = state.pending_effect.as_ref().ok_or_else(|| {
+            EngineError::WaitingUser("there is no journaled effect to reconcile".into())
+        })?;
+        if pending.deployment_uuid != plan.deployment_uuid
+            || pending.project_number != plan.project_identity.project_number
+        {
+            return Err(EngineError::StatePlanMismatch);
+        }
+        let planned = plan
+            .effects
+            .iter()
+            .find(|planned| planned_matches(pending, planned))
+            .ok_or(EngineError::StatePlanMismatch)?;
+        self.backend
+            .revalidate_project(&state.project_identity)
+            .await?;
+        self.resume_pending(&mut state, planned.source_image.as_ref())
+            .await
+    }
+
     pub async fn destroy(&self, plan: &DestroyPlan, approved: &PlanDigest) -> Result<()> {
         if plan.digest()? != *approved {
             return Err(EngineError::ApprovalMismatch);
@@ -1477,6 +1513,85 @@ release = "stable"
             store.read().expect("state").expect("present").phase,
             DeploymentPhase::Complete
         );
+    }
+
+    #[tokio::test]
+    async fn pending_only_reconciles_one_effect_and_stops_before_the_next() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = MemoryStore::with_events(Arc::clone(&events));
+        let config = config();
+        let plan = build_plan(
+            &config,
+            observations(PlanDnsObservation::External {
+                current_ipv4: BTreeSet::new(),
+            }),
+            None,
+        )
+        .expect("plan");
+        let first = plan.effects.first().expect("first effect");
+        let second = plan.effects.get(1).expect("second effect");
+        let digest = plan.digest().expect("digest");
+        let mut interrupted_backend = FakeBackend::new(Arc::clone(&events), true);
+        interrupted_backend
+            .fail_start
+            .insert(first.resource_name.clone());
+        assert!(
+            Orchestrator::new(&interrupted_backend, &store)
+                .apply(&plan, &digest)
+                .await
+                .is_err()
+        );
+        let interrupted = store.read().expect("state").expect("present");
+        assert_eq!(
+            interrupted
+                .pending_effect
+                .as_ref()
+                .expect("pending")
+                .resource_name,
+            first.resource_name
+        );
+        assert!(
+            interrupted
+                .pending_effect
+                .as_ref()
+                .expect("pending")
+                .operation
+                .is_none()
+        );
+
+        let recovery_backend = FakeBackend::new(Arc::clone(&events), true);
+        Orchestrator::new(&recovery_backend, &store)
+            .resume_pending_only(&config)
+            .await
+            .expect("pending-only recovery");
+
+        let recovered = store.read().expect("state").expect("present");
+        assert!(recovered.pending_effect.is_none());
+        assert!(resource_for_effect(&recovered.gcp_resources, first).is_some());
+        assert!(resource_for_effect(&recovered.gcp_resources, second).is_none());
+        assert_eq!(recovered.phase, DeploymentPhase::Applying);
+        {
+            let events = events.lock().expect("events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| *event == &format!("start:{}", first.resource_name))
+                    .count(),
+                2
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event == &format!("start:{}", second.resource_name))
+            );
+            assert!(!events.iter().any(|event| event == "install-host"));
+        }
+        assert!(matches!(
+            Orchestrator::new(&recovery_backend, &store)
+                .resume_pending_only(&config)
+                .await,
+            Err(EngineError::WaitingUser(_))
+        ));
     }
 
     #[tokio::test]

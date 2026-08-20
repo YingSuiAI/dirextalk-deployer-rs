@@ -73,7 +73,10 @@ run apply or an approved destroy.
    its exact `sha256:<plan-id>` approval digest.
 6. On interruption, preserve state, inspect `deploy status`, and run
    `deploy resume` for the same config. Never retry a mutation by resource name
-   or create a same-name replacement.
+   or create a same-name replacement. When explicitly asked to reconcile only
+   the currently journaled effect and stop, use `deploy resume --pending-only`;
+   it must not start a later effect or host installation, and an idle state is
+   an action-required result rather than permission to advance.
 7. When external DNS is required, give the operator only the displayed A
    record, wait for propagation, and resume. A conflicting record requires a
    new plan and approval.
