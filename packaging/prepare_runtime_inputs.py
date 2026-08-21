@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import io
 import json
 import os
 import pathlib
 import re
 import tempfile
+import tarfile
 import urllib.parse
 import urllib.request
 
@@ -95,6 +98,51 @@ def write_json(path: pathlib.Path, value: object, mode: int = 0o644) -> None:
         os.fsync(temporary.fileno())
     temporary_path.chmod(mode)
     temporary_path.replace(path)
+
+
+def build_split_runtime_archive(
+    source: pathlib.Path, destination: pathlib.Path, source_revision: str
+) -> None:
+    files = sorted(
+        path for path in source.rglob("*") if path.is_file() and path.name != ".gitignore"
+    )
+    if len(files) < 20 or any(path.is_symlink() for path in files):
+        fail("split runtime source tree is incomplete or unsafe")
+    receipts: list[str] = []
+    payloads: list[tuple[str, bytes, int]] = []
+    for path in files:
+        relative = path.relative_to(source).as_posix()
+        data = path.read_bytes()
+        if not data:
+            fail(f"split runtime source file is empty: {relative}")
+        mode = 0o755 if relative.startswith("scripts/") and relative.endswith(".sh") else 0o644
+        payloads.append((relative, data, mode))
+        receipts.append(f"{hashlib.sha256(data).hexdigest()}  ./{relative}\n")
+    revision = (source_revision + "\n").encode()
+    payloads.append(("SOURCE_REVISION", revision, 0o644))
+    receipts.append(f"{hashlib.sha256(revision).hexdigest()}  ./SOURCE_REVISION\n")
+    manifest = "".join(sorted(receipts)).encode()
+    payloads.append(("SOURCE_FILES.sha256", manifest, 0o644))
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        for relative, data, mode in sorted(payloads):
+            info = tarfile.TarInfo(f"deploy/split-agent/{relative}")
+            info.size = len(data)
+            info.mode = mode
+            info.uid = info.gid = info.mtime = 0
+            archive.addfile(info, io.BytesIO(data))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
+        temporary_path = pathlib.Path(temporary.name)
+        with gzip.GzipFile(
+            filename="", fileobj=temporary, mode="wb", mtime=0
+        ) as compressed:
+            compressed.write(raw.getvalue())
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    temporary_path.chmod(0o600)
+    temporary_path.replace(destination)
 
 
 def inputs() -> dict[str, object]:
@@ -239,31 +287,35 @@ def main() -> None:
     arguments = parser.parse_args()
     repository_root = pathlib.Path(__file__).resolve().parent.parent
     values = inputs()
-    compose_path = repository_root / "runtime/docker-compose.yml"
+    split_runtime_source = repository_root / "runtime/split-agent"
     updater_unit_path = repository_root / "packaging/dirextalk-updater.service"
     helper_paths = {
         "caddyfile_path": repository_root / "runtime/Caddyfile",
-        "message_server_initializer_path": repository_root / "runtime/initialize-message-server.sh",
-        "agent_secret_materializer_path": repository_root / "runtime/materialize-agent-secrets.sh",
-        "message_server_entrypoint_path": repository_root / "runtime/message-server-entrypoint.sh",
-        "capability_ca_initializer_path": repository_root / "runtime/initialize-capability-ca.sh",
-        "postgres_entrypoint_path": repository_root / "runtime/postgres-entrypoint.sh",
-        "postgres_initializer_path": repository_root / "runtime/initialize-postgres.sh",
+        "edge_compose_override_path": repository_root / "runtime/edge-compose.override.yaml",
+        "product_bootstrap_reader_path": repository_root / "runtime/read-product-bootstrap.sh",
+        "runtime_verifier_path": repository_root / "runtime/verify-runtime.sh",
     }
     static_paths = {
-        "compose_file": compose_path,
         "caddyfile": helper_paths["caddyfile_path"],
-        "message_server_initializer": helper_paths["message_server_initializer_path"],
-        "agent_secret_materializer": helper_paths["agent_secret_materializer_path"],
-        "message_server_entrypoint": helper_paths["message_server_entrypoint_path"],
-        "capability_ca_initializer": helper_paths["capability_ca_initializer_path"],
-        "postgres_entrypoint": helper_paths["postgres_entrypoint_path"],
-        "postgres_initializer": helper_paths["postgres_initializer_path"],
+        "edge_compose_override": helper_paths["edge_compose_override_path"],
+        "product_bootstrap_reader": helper_paths["product_bootstrap_reader_path"],
+        "runtime_verifier": helper_paths["runtime_verifier_path"],
         "updater_unit": updater_unit_path,
     }
     for label, path in static_paths.items():
         if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
             fail(f"root-owned runtime asset is missing or unsafe: {label}")
+    required_split_paths = [
+        split_runtime_source / "compose.yaml",
+        split_runtime_source / "compose.production.yaml",
+        split_runtime_source / "edge-compose.yaml",
+        split_runtime_source / "scripts/provision-local.sh",
+        split_runtime_source / "scripts/start-local.sh",
+        split_runtime_source / "scripts/update-agent-local.sh",
+        split_runtime_source / "scripts/prepare-runner-cgroups.sh",
+    ]
+    if any(not path.is_file() or path.is_symlink() for path in required_split_paths):
+        fail("canonical split runtime source tree is incomplete or unsafe")
     static_receipts = {
         label: {"path": str(path.relative_to(repository_root)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for label, path in static_paths.items()
@@ -278,6 +330,14 @@ def main() -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
     release_dir.mkdir(parents=True, exist_ok=True)
     updater_path = work_dir / "dirextalk-updater"
+    split_runtime_archive = work_dir / "split-agent-runtime.tar.gz"
+    build_split_runtime_archive(
+        split_runtime_source, split_runtime_archive, str(values["source_revision"])
+    )
+    static_receipts["split_runtime_archive"] = {
+        "path": "runtime/split-agent",
+        "sha256": hashlib.sha256(split_runtime_archive.read_bytes()).hexdigest(),
+    }
     updater = values["updater"]
     assert isinstance(updater, dict)
     download(
@@ -293,14 +353,11 @@ def main() -> None:
         "schema_version": 1,
         "release": values["release"],
         "images": image_references(values),
-        "compose_path": str(compose_path),
         "caddyfile_path": str(helper_paths["caddyfile_path"]),
-        "message_server_initializer_path": str(helper_paths["message_server_initializer_path"]),
-        "agent_secret_materializer_path": str(helper_paths["agent_secret_materializer_path"]),
-        "message_server_entrypoint_path": str(helper_paths["message_server_entrypoint_path"]),
-        "capability_ca_initializer_path": str(helper_paths["capability_ca_initializer_path"]),
-        "postgres_entrypoint_path": str(helper_paths["postgres_entrypoint_path"]),
-        "postgres_initializer_path": str(helper_paths["postgres_initializer_path"]),
+        "edge_compose_override_path": str(helper_paths["edge_compose_override_path"]),
+        "product_bootstrap_reader_path": str(helper_paths["product_bootstrap_reader_path"]),
+        "runtime_verifier_path": str(helper_paths["runtime_verifier_path"]),
+        "split_runtime_archive_path": str(split_runtime_archive),
         "updater_binary_path": str(updater_path),
         "updater_unit_path": str(updater_unit_path),
         "updater_version": updater["version"],

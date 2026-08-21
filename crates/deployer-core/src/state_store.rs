@@ -19,6 +19,7 @@ use crate::{CoreError, DeploymentState, NodePaths, PlanDigest, Result, canonical
 /// a canonical SHA-256 integrity digest.
 pub struct StateStore {
     paths: NodePaths,
+    expected_service_id: String,
     lock: File,
     seal_key: Zeroizing<[u8; 32]>,
     directory_identity: FilesystemIdentity,
@@ -34,7 +35,22 @@ impl StateStore {
     /// Returns an error for an unsafe path, wrong owner, conflicting lock, or
     /// filesystem failure.
     pub fn open(nodes_root: impl AsRef<Path>, service_id: &str) -> Result<Self> {
-        let paths = NodePaths::new(nodes_root, service_id)?;
+        Self::open_named(nodes_root, service_id, service_id)
+    }
+
+    /// Opens and locks an authenticated store under a user-facing directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe directory or service identity, wrong
+    /// owner, conflicting lock, or filesystem failure.
+    pub fn open_named(
+        nodes_root: impl AsRef<Path>,
+        directory_name: &str,
+        service_id: &str,
+    ) -> Result<Self> {
+        crate::validate_service_id(service_id)?;
+        let paths = NodePaths::new_named(nodes_root, directory_name)?;
         prepare_directory(paths.root())?;
         reject_symlink(&paths.lock_file())?;
         let lock = open_restricted(&paths.lock_file(), true)?;
@@ -50,6 +66,7 @@ impl StateStore {
         let seal_key_identity = path_identity(&paths.state_seal_key_file())?;
         let store = Self {
             paths,
+            expected_service_id: service_id.to_owned(),
             lock,
             seal_key,
             directory_identity,
@@ -93,6 +110,11 @@ impl StateStore {
         state.integrity_digest.clear();
         verify_state_digest(&state, &self.seal_key, &persisted_digest)?;
         state.validate()?;
+        if state.service_id != self.expected_service_id {
+            return Err(CoreError::InvalidState(
+                "state service id differs from the locked deployment directory",
+            ));
+        }
         state.integrity_digest = format!("hmac-sha256:{}", hex::encode(persisted_digest));
         Ok(Some(state))
     }
@@ -106,16 +128,9 @@ impl StateStore {
     pub fn write(&self, state: &DeploymentState) -> Result<()> {
         self.revalidate_filesystem_identity()?;
         state.validate()?;
-        if state.service_id
-            != self
-                .paths
-                .root()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-        {
+        if state.service_id != self.expected_service_id {
             return Err(CoreError::InvalidState(
-                "service id does not match state path",
+                "state service id differs from the locked deployment directory",
             ));
         }
         let mut sealed = state.clone();
@@ -459,6 +474,7 @@ mod tests {
             schema_version: 1,
             deployment_uuid: Uuid::new_v4(),
             service_id: service_id.to_owned(),
+            local_directory: String::new(),
             project_identity: ProjectIdentity {
                 project_id: "dirextalk-prod".to_owned(),
                 project_number: 42,
@@ -557,9 +573,36 @@ mod tests {
         assert!(matches!(
             store.write(&state("different-0123456789ab")),
             Err(CoreError::InvalidState(
-                "service id does not match state path"
+                "state service id differs from the locked deployment directory"
             ))
         ));
+    }
+
+    #[test]
+    fn domain_directory_remains_bound_to_internal_service_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let service_id = "production-0123456789ab";
+        let store =
+            StateStore::open_named(temporary.path(), "talk.example.com", service_id).unwrap();
+        let mut expected = state(service_id);
+        expected.local_directory = "talk.example.com".into();
+        store.write(&expected).unwrap();
+        let observed = store.read().unwrap().unwrap();
+        assert_eq!(observed.service_id, expected.service_id);
+        assert_eq!(observed.local_directory, expected.local_directory);
+        assert!(
+            temporary
+                .path()
+                .join("talk.example.com/state.json")
+                .is_file()
+        );
+        assert!(!temporary.path().join(service_id).exists());
+    }
+
+    #[test]
+    fn legacy_state_keeps_its_original_authenticated_shape() {
+        let value = serde_json::to_value(state("production-0123456789ab")).unwrap();
+        assert!(value.get("local_directory").is_none());
     }
 
     #[cfg(unix)]

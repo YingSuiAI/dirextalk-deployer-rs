@@ -23,7 +23,7 @@ pub use model::{
     ProgressOperation, ProgressStatus, ProjectIdentity, ResourceKind, ResourceRef, SshHostIdentity,
     SshHostKeyAlgorithm, SshSha256Fingerprint,
 };
-pub use paths::{NodePaths, service_id, validate_service_id};
+pub use paths::{NodePaths, service_id, validate_node_directory_name, validate_service_id};
 pub use plan::{
     BootDiskDisposition, CanonicalDeploymentSpec, CloudWorkerDisposition, DeploymentPlan,
     DeploymentPlanStage, DestroyPlan, DestroyTarget, DnsChangeApproval, PlanDnsObservation,

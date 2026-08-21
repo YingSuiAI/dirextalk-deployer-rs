@@ -2399,7 +2399,12 @@ fn ipv4_set(values: Vec<String>) -> Result<std::collections::BTreeSet<Ipv4Addr>>
 fn service_paths(state: &DeploymentState) -> Result<ServicePaths> {
     let base = BaseDirs::new()
         .ok_or_else(|| EngineError::State("current user home is unavailable".into()))?;
-    ServicePaths::new(base.home_dir(), &state.service_id).map_err(connect_error)
+    let directory = if state.local_directory.is_empty() {
+        &state.service_id
+    } else {
+        &state.local_directory
+    };
+    ServicePaths::new(base.home_dir(), directory).map_err(connect_error)
 }
 
 fn read_product_secrets(state: &DeploymentState) -> Result<StoredProductSecrets> {
@@ -3343,6 +3348,7 @@ release = "stable"
             schema_version: 1,
             deployment_uuid,
             service_id: "production-0123456789ab".into(),
+            local_directory: "talk.example.com".into(),
             project_identity: ProjectIdentity {
                 project_id: "dirextalk-prod".into(),
                 project_number: 42,

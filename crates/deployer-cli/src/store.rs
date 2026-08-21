@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use deployer_core::{DeploymentConfig, DeploymentPlan, StateStore, service_id};
+use deployer_core::{
+    DeploymentConfig, DeploymentPlan, StateStore, service_id, validate_service_id,
+};
 use directories::BaseDirs;
 
 use crate::application::StoreFactory;
@@ -40,7 +42,7 @@ impl StoreFactory for FilesystemStores {
             &plan.spec.deployment_name,
             plan.project_identity.project_number,
         )?;
-        StateStore::open(&self.nodes_root, &id).map_err(EngineError::from)
+        StateStore::open_named(&self.nodes_root, &plan.spec.domain, &id).map_err(EngineError::from)
     }
 
     fn open_for_config(&self, config: &DeploymentConfig) -> Result<Self::Store> {
@@ -69,10 +71,17 @@ impl StoreFactory for FilesystemStores {
             let Some(candidate) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if !file_type.is_dir() || !candidate.starts_with(&prefix) {
+            if !file_type.is_dir()
+                || (candidate != config.domain && !candidate.starts_with(&prefix))
+            {
                 continue;
             }
-            let store = StateStore::open(&self.nodes_root, &candidate)?;
+            let service_id = if candidate == config.domain {
+                state_service_id(&entry.path())?
+            } else {
+                candidate.clone()
+            };
+            let store = StateStore::open_named(&self.nodes_root, &candidate, &service_id)?;
             let Some(state) = store.read()? else { continue };
             if state.project_identity.project_id == config.project_id
                 && match_id.replace(candidate).is_some()
@@ -83,12 +92,33 @@ impl StoreFactory for FilesystemStores {
             }
         }
         match match_id {
-            Some(id) => StateStore::open(&self.nodes_root, &id)
-                .map(Some)
-                .map_err(EngineError::from),
+            Some(directory) => {
+                let service_id = if directory == config.domain {
+                    state_service_id(&self.nodes_root.join(&directory))?
+                } else {
+                    directory.clone()
+                };
+                StateStore::open_named(&self.nodes_root, &directory, &service_id)
+                    .map(Some)
+                    .map_err(EngineError::from)
+            }
             None => Ok(None),
         }
     }
+}
+
+fn state_service_id(directory: &Path) -> Result<String> {
+    let bytes = std::fs::read(directory.join("state.json"))
+        .map_err(|_| EngineError::State("deployment state identity could not be read".into()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| EngineError::State("deployment state identity is invalid".into()))?;
+    let service_id = value
+        .get("service_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| EngineError::State("deployment state lacks its service identity".into()))?
+        .to_owned();
+    validate_service_id(&service_id)?;
+    Ok(service_id)
 }
 
 #[cfg(test)]
@@ -123,13 +153,15 @@ release = "stable"
         let temporary = tempfile::tempdir().expect("temporary");
         let factory = FilesystemStores::new(temporary.path());
         let id = service_id("production", 42).expect("service id");
-        let store = StateStore::open(temporary.path(), &id).expect("store");
+        let store = StateStore::open_named(temporary.path(), "talk.example.com", &id)
+            .expect("domain-named store");
         let approved = canonical_plan_digest(&serde_json::json!({"plan": "test"})).expect("digest");
         store
             .write(&DeploymentState {
                 schema_version: 1,
                 deployment_uuid: Uuid::new_v4(),
-                service_id: id,
+                service_id: id.clone(),
+                local_directory: "talk.example.com".into(),
                 project_identity: ProjectIdentity {
                     project_id: "dirextalk-prod".into(),
                     project_number: 42,
@@ -160,6 +192,13 @@ release = "stable"
                 .project_number,
             42
         );
+        assert!(
+            temporary
+                .path()
+                .join("talk.example.com/state.json")
+                .is_file()
+        );
+        assert!(!temporary.path().join(id).exists());
     }
 
     fn test_release_identity() -> deployer_core::ExactReleaseIdentity {

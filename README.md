@@ -204,8 +204,9 @@ normal chat message. The Cloud Worker is reported as
 `disabled_by_product_scope`.
 
 Local credentials and generated state live under
-`~/.dirextalk/nodes/<service_id>/`. Do not copy that directory into a
-repository, support ticket, or chat. Reports and structured output remain
+`~/.dirextalk/nodes/<domain>/`; the project-bound internal service id remains
+inside authenticated state instead of becoming the folder name. Do not copy
+that directory into a repository, support ticket, or chat. Reports and structured output remain
 redacted except for the documented `initial_login_password` in a successful
 deployment completion envelope. Treat any other unexpected secret in output as
 a failure and stop sharing the output.

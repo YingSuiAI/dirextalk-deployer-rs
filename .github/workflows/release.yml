@@ -183,11 +183,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker compose --file runtime/docker-compose.yml \
+          split="runtime/split-agent"
+          docker compose --file "${split}/compose.yaml" \
+            --file "${split}/compose.production.yaml" \
             config --no-interpolate --format json \
-            > "${RUNNER_TEMP}/runtime-work/docker-compose.json"
+            > "${RUNNER_TEMP}/runtime-work/split-compose.json"
+          docker compose --file "${split}/edge-compose.yaml" \
+            --file runtime/edge-compose.override.yaml \
+            config --no-interpolate --format json \
+            > "${RUNNER_TEMP}/runtime-work/edge-compose.json"
           python3 packaging/validate_runtime_compose.py \
-            "${RUNNER_TEMP}/runtime-work/docker-compose.json" \
+            "${RUNNER_TEMP}/runtime-work/split-compose.json" \
+            "${RUNNER_TEMP}/runtime-work/edge-compose.json" \
             "${RUNNER_TEMP}/runtime-work/bundle-request.json"
 
       - name: Verify application image provenance

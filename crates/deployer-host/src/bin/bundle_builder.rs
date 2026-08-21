@@ -83,53 +83,35 @@ mod unix {
             return Err("build request schema_version must be 1".into());
         }
 
-        let compose_file = read_owned_asset(
-            &request.compose_path,
-            owner,
-            MAX_RUNTIME_TEMPLATE_BYTES,
-            "Compose template",
-        )?;
         let caddyfile = read_owned_asset(
             &request.caddyfile_path,
             owner,
             MAX_RUNTIME_TEMPLATE_BYTES,
             "Caddyfile",
         )?;
-        let message_server_initializer = read_owned_asset(
-            &request.message_server_initializer_path,
+        let edge_compose_override = read_owned_asset(
+            &request.edge_compose_override_path,
             owner,
             MAX_RUNTIME_TEMPLATE_BYTES,
-            "message-server initializer",
+            "edge Compose override",
         )?;
-        let agent_secret_materializer = read_owned_asset(
-            &request.agent_secret_materializer_path,
+        let product_bootstrap_reader = read_owned_asset(
+            &request.product_bootstrap_reader_path,
             owner,
             MAX_RUNTIME_TEMPLATE_BYTES,
-            "Agent secret materializer",
+            "product bootstrap reader",
         )?;
-        let message_server_entrypoint = read_owned_asset(
-            &request.message_server_entrypoint_path,
+        let runtime_verifier = read_owned_asset(
+            &request.runtime_verifier_path,
             owner,
             MAX_RUNTIME_TEMPLATE_BYTES,
-            "message-server entrypoint",
+            "runtime verifier",
         )?;
-        let capability_ca_initializer = read_owned_asset(
-            &request.capability_ca_initializer_path,
+        let split_runtime_archive = read_owned_asset(
+            &request.split_runtime_archive_path,
             owner,
             MAX_RUNTIME_TEMPLATE_BYTES,
-            "Capability CA initializer",
-        )?;
-        let postgres_entrypoint = read_owned_asset(
-            &request.postgres_entrypoint_path,
-            owner,
-            MAX_RUNTIME_TEMPLATE_BYTES,
-            "PostgreSQL entrypoint",
-        )?;
-        let postgres_initializer = read_owned_asset(
-            &request.postgres_initializer_path,
-            owner,
-            MAX_RUNTIME_TEMPLATE_BYTES,
-            "PostgreSQL initializer",
+            "split Agent runtime archive",
         )?;
         let updater_binary = read_owned_asset(
             &request.updater_binary_path,
@@ -154,14 +136,11 @@ mod unix {
         let output_identity = resolved_target(&request.output_bundle_path)?;
         let overwrites_input = [
             arguments.request.as_path(),
-            request.compose_path.as_path(),
             request.caddyfile_path.as_path(),
-            request.message_server_initializer_path.as_path(),
-            request.agent_secret_materializer_path.as_path(),
-            request.message_server_entrypoint_path.as_path(),
-            request.capability_ca_initializer_path.as_path(),
-            request.postgres_entrypoint_path.as_path(),
-            request.postgres_initializer_path.as_path(),
+            request.edge_compose_override_path.as_path(),
+            request.product_bootstrap_reader_path.as_path(),
+            request.runtime_verifier_path.as_path(),
+            request.split_runtime_archive_path.as_path(),
             request.updater_binary_path.as_path(),
             request.updater_unit_path.as_path(),
             seed_path.as_path(),
@@ -188,14 +167,11 @@ mod unix {
             &request.release,
             request.images,
             BundleAssets {
-                compose_file,
                 caddyfile,
-                message_server_initializer,
-                agent_secret_materializer,
-                message_server_entrypoint,
-                capability_ca_initializer,
-                postgres_entrypoint,
-                postgres_initializer,
+                edge_compose_override,
+                product_bootstrap_reader,
+                runtime_verifier,
+                split_runtime_archive,
                 updater_binary,
                 updater_unit,
                 updater_version: request.updater_version,

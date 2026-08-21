@@ -26,8 +26,9 @@ zone, domain, DNS mode (`auto`, `cloud_dns`, or `external`), machine type,
 boot-disk size/type, operator SSH CIDR, maximum monthly USD, stable or exact
 release selection, and local connect agent. Unknown fields are rejected.
 
-State lives under `~/.dirextalk/nodes/<service_id>/state.json`. It is sealed,
-locked, and atomically replaced. It records project identity, phase,
+State lives under `~/.dirextalk/nodes/<domain>/state.json`; its authenticated
+payload retains a distinct project-bound service id. It is sealed, locked, and
+atomically replaced. It records project identity, phase,
 `PendingEffect`, exact release, GCP resource references, SSH host identity,
 host receipt, redacted local-wiring status, and integrity digest. Secrets live
 only in their owning restrictive credential stores and are excluded from state
@@ -85,6 +86,12 @@ digest-bound host installer and release bundle. The one-shot installer accepts
 only a strict request, invokes fixed programs with typed argv, writes a signed
 receipt, installs the canonical production topology, and installs the pinned
 `dirextalk-updater` with its resident watchdog disabled.
+
+The Agent runtime uses the original three-container topology: `agent`,
+`extension-runner`, and `core-runner`. Its protected environment, manifest,
+cleanup receipt, runner isolation, update scripts, volumes, and networks are
+installed together. Update readiness is checked through the updater control
+socket and both receipt-bound update adapters.
 
 Cloud DNS auto mode selects the longest matching existing public managed zone.
 The initial approved intent binds the zone identity and observed A-record set;

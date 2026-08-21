@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     CoreError, DestroyPlan, DestroyTarget, ExactReleaseIdentity, PlanDigest, ReleaseTag, Result,
-    SCHEMA_VERSION, Sha256Digest, validate_service_id,
+    SCHEMA_VERSION, Sha256Digest, validate_node_directory_name, validate_service_id,
 };
 
 /// Stable Google OIDC `sub`, used as the immutable OAuth owner identity.
@@ -440,6 +440,8 @@ pub struct DeploymentState {
     pub schema_version: u32,
     pub deployment_uuid: Uuid,
     pub service_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub local_directory: String,
     pub project_identity: ProjectIdentity,
     pub phase: DeploymentPhase,
     /// Exact approved deployment plan used by apply/resume. Destroy uses a
@@ -469,6 +471,9 @@ impl DeploymentState {
             return Err(CoreError::UnsupportedStateSchema);
         }
         validate_service_id(&self.service_id)?;
+        if !self.local_directory.is_empty() {
+            validate_node_directory_name(&self.local_directory)?;
+        }
         if self.deployment_uuid.is_nil() {
             return Err(CoreError::InvalidState("deployment UUID must be non-zero"));
         }
@@ -1291,6 +1296,7 @@ mod tests {
             schema_version: 1,
             deployment_uuid: Uuid::new_v4(),
             service_id: "production-0123456789ab".to_owned(),
+            local_directory: "talk.example.com".to_owned(),
             project_identity: ProjectIdentity {
                 project_id: "dirextalk-prod".to_owned(),
                 project_number: 42,

@@ -347,6 +347,7 @@ impl DeploymentPlan {
         if self.deployment_uuid != state.deployment_uuid
             || self.project_identity != state.project_identity
             || state.release_identity.as_ref() != Some(&self.release)
+            || (!state.local_directory.is_empty() && state.local_directory != self.spec.domain)
         {
             return Err(CoreError::InvalidPlan(
                 "continuation state or release identity mismatch",
@@ -1439,6 +1440,7 @@ release = "stable"
             schema_version: 1,
             deployment_uuid: continuation.deployment_uuid,
             service_id: service_id("production", 42).unwrap(),
+            local_directory: "talk.example.com".to_owned(),
             project_identity: identity(),
             phase: DeploymentPhase::Applying,
             approved_plan_digest: Some(previous),
@@ -1479,6 +1481,7 @@ release = "stable"
             schema_version: 1,
             deployment_uuid: uuid,
             service_id: service_id("production", 42).unwrap(),
+            local_directory: "talk.example.com".to_owned(),
             project_identity: identity(),
             phase: DeploymentPhase::Applying,
             approved_plan_digest: Some(deployment_plan().digest().unwrap()),
