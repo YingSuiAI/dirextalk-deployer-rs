@@ -30,8 +30,12 @@ State lives under `~/.dirextalk/nodes/<service_id>/state.json`. It is sealed,
 locked, and atomically replaced. It records project identity, phase,
 `PendingEffect`, exact release, GCP resource references, SSH host identity,
 host receipt, redacted local-wiring status, and integrity digest. Secrets live
-only in their owning restrictive credential stores and are excluded from
-state, reports, stdout, and JSONL.
+only in their owning restrictive credential stores and are excluded from state
+and reports. The only deliberate credential output is the eight-digit initial
+App login password: a successful `deploy apply` or full `deploy resume` emits
+it together with `service_domain` and `service_url` in human, JSON, and JSONL
+output. It is absent from status, verification, diagnostics, failures, and
+progress events.
 
 `project prepare --project <id>` is a distinct dry-first workflow for exactly
 `serviceusage.googleapis.com`, `cloudresourcemanager.googleapis.com`,
@@ -97,3 +101,6 @@ the eight-digit App initialization code, real `agent_room_id`, a service-scoped
 `dirextalk-connect` daemon, HTTP MCP initialization, tool discovery, and a
 read-only MCP call. Cloud Worker is reported as
 `disabled_by_product_scope`. Normal chat messages are never sent by validation.
+On successful completion, the initialization code is labeled as the initial
+login password and returned with the service domain and HTTPS URL so the
+operator can sign in immediately.

@@ -3,7 +3,6 @@
 use std::io::{self, Write};
 
 use deployer_core::ProgressEvent;
-use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -19,7 +18,7 @@ pub enum OutcomeStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CommandEnvelope {
     pub schema_version: u32,
     pub command: String,
@@ -28,29 +27,7 @@ pub struct CommandEnvelope {
     pub message: String,
     pub data: Value,
     #[serde(skip)]
-    pub human_initialization_code: Option<SecretString>,
-    #[serde(skip)]
     pub progress: Vec<ProgressEvent>,
-}
-
-impl PartialEq for CommandEnvelope {
-    fn eq(&self, other: &Self) -> bool {
-        self.schema_version == other.schema_version
-            && self.command == other.command
-            && self.status == other.status
-            && self.code == other.code
-            && self.message == other.message
-            && self.data == other.data
-            && self.progress == other.progress
-            && match (
-                &self.human_initialization_code,
-                &other.human_initialization_code,
-            ) {
-                (Some(left), Some(right)) => left.expose_secret() == right.expose_secret(),
-                (None, None) => true,
-                _ => false,
-            }
-    }
 }
 
 impl CommandEnvelope {
@@ -84,12 +61,6 @@ impl CommandEnvelope {
     }
 
     #[must_use]
-    pub fn with_human_initialization_code(mut self, code: SecretString) -> Self {
-        self.human_initialization_code = Some(code);
-        self
-    }
-
-    #[must_use]
     pub fn with_progress(mut self, progress: Vec<ProgressEvent>) -> Self {
         self.progress = progress;
         self
@@ -108,7 +79,6 @@ impl CommandEnvelope {
             code: code.into(),
             message: message.into(),
             data: Value::Object(Map::new()),
-            human_initialization_code: None,
             progress: Vec::new(),
         }
     }
@@ -156,9 +126,6 @@ fn render_human(envelope: &CommandEnvelope, writer: &mut impl Write) -> io::Resu
             }
         }
     }
-    if let Some(code) = &envelope.human_initialization_code {
-        writeln!(writer, "initialization_code: {}", code.expose_secret())?;
-    }
     Ok(())
 }
 
@@ -174,7 +141,7 @@ mod tests {
     use crate::cli::OutputFormat;
 
     #[test]
-    fn machine_output_is_one_stable_secret_free_envelope() {
+    fn machine_output_is_one_stable_envelope() {
         let envelope = CommandEnvelope::waiting(
             "deploy.apply",
             "DNS_RECORD_REQUIRED",

@@ -44,6 +44,12 @@ Every command supports `--output human|json|jsonl`. Exit `0` is success, `2`
 is an expected `waiting_user` condition, and `1` is a contract or
 infrastructure failure.
 
+A completed `deploy apply` or full `deploy resume` emits `service_domain`,
+`service_url`, and `initial_login_password` in every output format. This is the
+only command result that intentionally carries the eight-digit App login
+password; status, verification, progress, failure, and report output remain
+credential-free.
+
 `deploy resume --pending-only` requires an existing journaled effect from the
 original approved plan. It reconciles exactly that effect and returns
 `DEPLOY_PENDING_EFFECT_RECONCILED` without starting a later effect or host

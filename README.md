@@ -148,6 +148,11 @@ The deployer records each cloud mutation before executing it. If it stops or
 reports an infrastructure error, preserve the node state and resume it; do not
 start another same-name deployment.
 
+Successful `deploy apply` and full `deploy resume` output the service domain,
+HTTPS URL, and eight-digit initial login password in human, JSON, and JSONL
+formats. Save the password for first login. It is intentionally not repeated by
+later status, verification, diagnostics, failure, or progress output.
+
 ```text
 dirextalk-deployer deploy status --config <deployment.toml>
 dirextalk-deployer deploy resume --config <deployment.toml>
@@ -200,9 +205,10 @@ normal chat message. The Cloud Worker is reported as
 
 Local credentials and generated state live under
 `~/.dirextalk/nodes/<service_id>/`. Do not copy that directory into a
-repository, support ticket, or chat. Reports and structured output are
-redacted; treat any unexpected secret in output as a failure and stop sharing
-the output.
+repository, support ticket, or chat. Reports and structured output remain
+redacted except for the documented `initial_login_password` in a successful
+deployment completion envelope. Treat any other unexpected secret in output as
+a failure and stop sharing the output.
 
 ## Destroy
 
@@ -230,8 +236,10 @@ read-back confirm every intended deletion.
 
 ## Output and exit codes
 
-Every command accepts `--output human|json|jsonl`. Structured output is useful
-for automation but is not a secret transport.
+Every command accepts `--output human|json|jsonl`. A successful deployment
+completion intentionally includes the service address and initial login
+password in all three formats; callers must avoid sending that one result to
+shared logs. Other structured output is not a secret transport.
 
 - `0`: success.
 - `2`: expected `waiting_user`, commonly external DNS or browser action.

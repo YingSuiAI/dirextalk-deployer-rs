@@ -95,9 +95,13 @@ proved by authenticated project inspection or information the user supplied.
    the currently journaled effect and stop, use `deploy resume --pending-only`;
    it must not start a later effect or host installation, and an idle state is
    an action-required result rather than permission to advance.
-8. Run `deploy verify`, then `connect install`, `connect status`, and
-   `connect doctor` when `install_connect = true`. Verification must remain
-   read-only and must not send normal chat.
+8. A successful `deploy apply` or full `deploy resume` returns the service
+   domain, HTTPS URL, and eight-digit initial login password in every output
+   format. Display the URL and password explicitly in the deployment result;
+   do not hide them merely because the CLI used JSON. Then run `deploy verify`,
+   `connect install`, `connect status`, and `connect doctor` when
+   `install_connect = true`. Verification must remain read-only and must not
+   send normal chat.
 9. To stop the node, generate the destroy plan, explain retained resources,
    obtain one natural-language destroy confirmation, and pass its internal plan
    identifier without exposing it. Confirm deletion with status and GCP
@@ -110,11 +114,14 @@ than resetting state.
 ## Secrets and billing
 
 Never ask the user to paste authorization codes or tokens, SSH private keys,
-Matrix or agent tokens, the App initialization code, service-account keys, or
-payment data. Do not print, persist, or place secrets in arguments, config,
-reports, or chat. Authentication credentials remain in the restricted isolated
-Dirextalk gcloud configuration; generated node secrets remain in the restricted
-service directory.
+Matrix or agent tokens, service-account keys, or payment data. Do not print,
+persist, or place those secrets in arguments, config, reports, or chat.
+Authentication credentials remain in the restricted isolated Dirextalk gcloud
+configuration; generated node secrets remain in the restricted service
+directory. The initial App login password is the intentional exception: show
+it once with the service URL in the successful deployment result because the
+operator needs it for first login. Do not repeat it in later status, verify,
+diagnostic, failure, or progress output.
 
 `maximum_monthly_usd` limits the accepted estimate, not the GCP bill. Normal
 destroy retains the boot disk, which can keep billing until a separate
