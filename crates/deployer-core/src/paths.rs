@@ -45,7 +45,16 @@ pub fn validate_service_id(value: &str) -> Result<()> {
 }
 
 fn valid_name(value: &str) -> bool {
-    value.len() <= 40 && validate_service_id(value).is_ok()
+    !value.is_empty()
+        && value.len() <= 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 /// Canonical paths for one service-scoped deployment.
@@ -118,6 +127,7 @@ mod tests {
         assert_eq!(first, service_id("production", 42).unwrap());
         assert_ne!(first, service_id("production", 43).unwrap());
         assert!(first.starts_with("production-"));
+        assert!(service_id("a1", 42).unwrap().starts_with("a1-"));
     }
 
     #[test]

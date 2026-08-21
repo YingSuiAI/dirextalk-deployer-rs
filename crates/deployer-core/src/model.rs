@@ -1143,8 +1143,7 @@ fn safe_attribute_value(key: &str, value: &str) -> bool {
     match key {
         "name" | "type" | "machine_type" | "status" | "zone_name" => safe_public_name(value),
         "service_account" => value == "none",
-        "cidr" => valid_ipv4_cidr(value, false),
-        "source" => valid_ipv4_cidr(value, true),
+        "cidr" | "source" => valid_ipv4_cidr(value, false),
         "ports" => value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || b":,-".contains(&byte)
         }),
@@ -1765,6 +1764,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn planned_firewall_source_accepts_open_but_rejects_invalid_cidrs() {
+        assert!(
+            validate_attributes(&BTreeMap::from([(
+                "source".to_owned(),
+                "0.0.0.0/0".to_owned(),
+            )]))
+            .is_ok()
+        );
+
+        for invalid in ["203.0.113.7/24", "0.0.0.0/33", "not-a-cidr"] {
+            assert!(
+                validate_attributes(&BTreeMap::from([
+                    ("source".to_owned(), invalid.to_owned(),)
+                ]))
+                .is_err()
+            );
+        }
     }
 
     #[test]

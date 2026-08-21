@@ -20,7 +20,8 @@ You need:
 - permission to enable the five fixed Dirextalk GCP APIs and create the
   resources shown by later deployment plans;
 - an existing long-lived domain and control of its DNS; and
-- an operator public IPv4 address expressed as a `/32` SSH CIDR.
+- an explicit canonical IPv4 SSH source CIDR. The supplied configuration uses
+  `0.0.0.0/0` so SSH remains reachable when the operator's public IP changes.
 
 The deployer does not create a project, link a billing account, create a DNS
 zone, or register a domain. A deployment creates paid resources. They continue
@@ -29,6 +30,15 @@ normal destroy plan can continue billing afterward. Set a GCP budget and alerts
 independently; the plan estimate is a guardrail, not a bill or price guarantee.
 
 ## Install a stable release
+
+Install the current multi-platform CLI package from npm using the Rust
+project's distinct package name (the historical `dirextalk-deployer` package
+is unrelated and must not be used):
+
+```text
+npm install --global dirextalk-deployer-rs@latest
+dirextalk-deployer --version
+```
 
 Download the archive for Windows amd64, Linux amd64, macOS amd64, or macOS
 arm64 from the GitHub release. Download `SHA256SUMS` and
@@ -63,11 +73,19 @@ an exact supported release identifier when reproducibility requires a specific
 version. `maximum_monthly_usd` makes planning fail when the estimate exceeds
 the operator's limit; it does not cap the GCP bill.
 
-The default remains `e2-custom-2-4096`. `machine_type = "e2-small"` selects
-the cheaper shared-core alternative with two guest vCPUs and 2 GiB memory. It
-sustains 0.5 vCPU in aggregate, is priced from 365 monthly E2 core-hours plus
-1,460 GiB-hours at the 730-hour planning horizon, and still requires two units
-of regional `CPUS` quota.
+`operator_ssh_cidr = "0.0.0.0/0"` deliberately allows SSH from any IPv4
+source so a changing operator address does not lock out recovery. A canonical
+narrower IPv4 CIDR remains supported when the operator has a stable range. The
+configured value is included in both the SSH firewall effect and the plan
+digest, so changing it requires reviewing and approving a new plan.
+
+Every deployment chooses one of two supported machine profiles. The default
+economy profile is `e2-small`: two shared guest vCPUs, 2 GiB memory, and 0.5
+sustained vCPU in aggregate. It is priced from 365 monthly E2 core-hours plus
+1,460 GiB-hours at the 730-hour planning horizon and still requires two units
+of regional `CPUS` quota. Choose `e2-custom-2-4096` for the standard profile
+with two fully billable vCPUs and 4 GiB memory. Other machine types are
+rejected before cloud planning.
 
 `connect_agent = "auto"` detects one supported local Agent runtime. Detection
 fails closed when the result is ambiguous or unknown; it never guesses or

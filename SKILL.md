@@ -1,14 +1,13 @@
 ---
-name: dirextalk-deployer
+name: dirextalk-deployer-rs
 description: Deploy, resume, inspect, verify, connect, or destroy a fresh Dirextalk production node in an existing billing-enabled GCP project. Use for the GCP Rust deployer; do not use for AWS or existing-node migration.
 ---
 
 # Dirextalk GCP Deployer
 
-Use a locally available Rust `dirextalk-deployer` CLI. This repository copy of
-the Skill documents the GCP contract; its presence is not evidence that the
-Skill has been published or installed. Read `README.md` for the operator flow
-and `references/gcp-v0.1-contract.md` before changing public behavior.
+Use the installed Rust `dirextalk-deployer` CLI. Read `README.md` only when the
+operator flow needs detail, and read `references/gcp-v0.1-contract.md` before
+changing public behavior.
 
 ## Preflight
 
@@ -17,23 +16,14 @@ Google Cloud CLI from
 <https://cloud.google.com/sdk/docs/install-sdk#linux>. Require `gcloud version`
 to succeed.
 
-Before using any deployer command, inspect the local executable's help. Require
-`dirextalk-deployer --help` to expose the Rust CLI command surface `auth`,
-`project`, `deploy`, and `connect`, and confirm their help can be opened. Fail
-closed if help exposes a legacy `skill` workflow, identifies an npm package or
-AWS deployer, or omits any required command. Do not repair a mismatch by
-running `npm install -g dirextalk-deployer`, `dirextalk-deployer skill
-refresh`, `dirextalk-deployer skill install`, or `dirextalk-deployer skill
-update`. Never use legacy AWS Bash scripts, AWS credentials, or AWS tooling as
-a fallback.
+Once per task, inspect `dirextalk-deployer --help`. Require the Rust command
+surface `auth`, `project`, `deploy`, and `connect`, and reject a legacy `skill`
+workflow or missing command. Do not repair a mismatch with the historical npm
+package `dirextalk-deployer` or legacy AWS tooling.
 
 ```text
 gcloud version
 dirextalk-deployer --help
-dirextalk-deployer auth --help
-dirextalk-deployer project --help
-dirextalk-deployer deploy --help
-dirextalk-deployer connect --help
 ```
 
 ## Boundary
@@ -54,10 +44,15 @@ run apply or an approved destroy.
 
 ## Lifecycle
 
-1. Copy `examples/deployment.toml` outside the repository and replace all
-   example values. Never add secrets to the config. `connect_agent = "auto"`
-   must fail closed when local Agent detection is ambiguous or unknown; resolve
-   the ambiguity or use one exact supported Agent name instead of guessing.
+1. Before writing the config, ask the user to choose between economy
+   `e2-small` (default; two shared vCPUs, 2 GiB) and standard
+   `e2-custom-2-4096` (two fully billable vCPUs, 4 GiB). Copy
+   `examples/deployment.toml` outside the repository and replace all example
+   values. Use `operator_ssh_cidr = "0.0.0.0/0"` unless the user explicitly
+   chooses a stable narrower IPv4 CIDR. Never add secrets to the config.
+   `connect_agent = "auto"` must fail closed when local Agent detection is
+   ambiguous or unknown; resolve the ambiguity or use one exact supported
+   Agent name instead of guessing.
 2. Run `auth login`, let the operator finish gcloud-brokered authentication only
    at the URL printed by gcloud or in its browser, then use `auth status` and
    `project inspect` to verify authentication and immutable project identity.

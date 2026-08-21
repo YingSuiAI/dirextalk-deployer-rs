@@ -876,7 +876,7 @@ project_id = "dirextalk-prod"
 region = "us-central1"
 zone = "us-central1-a"
 domain = "talk.example.com"
-operator_ssh_cidr = "203.0.113.7/32"
+operator_ssh_cidr = "0.0.0.0/0"
 maximum_monthly_usd = 150.0
 release = "stable"
 "#,
@@ -1034,7 +1034,7 @@ release = "stable"
                 ResourceKind::Firewall,
                 "ssh",
                 "global",
-                BTreeMap::from([("source".to_owned(), "203.0.113.7/32".to_owned())]),
+                BTreeMap::from([("source".to_owned(), "0.0.0.0/0".to_owned())]),
             ),
             effect(ResourceKind::Address, "ip", "us-central1", BTreeMap::new()),
             PlannedEffect {
@@ -1059,7 +1059,7 @@ release = "stable"
                 "vm",
                 "us-central1-a",
                 BTreeMap::from([
-                    ("machine_type".to_owned(), "e2-custom-2-4096".to_owned()),
+                    ("machine_type".to_owned(), "e2-small".to_owned()),
                     ("service_account".to_owned(), "none".to_owned()),
                 ]),
             ),
@@ -1206,6 +1206,13 @@ release = "stable"
                     "https://compute.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/{}",
                     image.name
                 );
+                plan
+            },
+            {
+                let mut plan = base.clone();
+                plan.spec.operator_ssh_cidr = "203.0.113.7/32".to_owned();
+                plan.effects[4].expected_attributes =
+                    BTreeMap::from([("source".to_owned(), "203.0.113.7/32".to_owned())]);
                 plan
             },
         ];

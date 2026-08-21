@@ -12,12 +12,14 @@ domain = "chat.example.com"
 # one external A record. Other allowed values are cloud_dns and external.
 dns_mode = "auto"
 
-machine_type = "e2-custom-2-4096"
+# Economy (default): e2-small. Standard: e2-custom-2-4096.
+machine_type = "e2-small"
 boot_disk_size_gib = 50
 boot_disk_type = "pd-balanced"
 
-# Use the operator's real public IPv4 as a single-host /32; never use 0.0.0.0/0.
-operator_ssh_cidr = "203.0.113.42/32"
+# Keep SSH reachable when the operator's public IPv4 changes. The exact source
+# CIDR is approval-bound; replace this only when a stable narrower range exists.
+operator_ssh_cidr = "0.0.0.0/0"
 
 # Planning stops above this estimate. This is not a GCP billing cap.
 maximum_monthly_usd = 150.0

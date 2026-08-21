@@ -8,9 +8,11 @@ linking, GKE, multi-node topology, GUI, or GCP Cloud Worker implementation.
 
 The supported local releases are Windows amd64, Linux amd64, macOS amd64 and
 macOS arm64. The only server target is Ubuntu 24.04 amd64 with systemd 254 or
-newer. The default VM is `e2-custom-2-4096` with a 50 GiB `pd-balanced` boot
-disk. The explicit cheaper alternative is `e2-small`: two shared guest vCPUs,
-2 GiB memory, 0.5 sustained/billable vCPU, and two regional `CPUS` quota units.
+newer. The default VM is the economy `e2-small` profile with a 50 GiB
+`pd-balanced` boot disk: two shared guest vCPUs, 2 GiB memory, 0.5
+sustained/billable vCPU, and two regional `CPUS` quota units. The standard
+alternative is `e2-custom-2-4096` with two fully billable vCPUs and 4 GiB
+memory. These are the only supported machine choices.
 
 ## Public behavior
 
@@ -50,8 +52,11 @@ client, consent-screen, or scope-review configuration of its own.
 ## Effects and identity
 
 The deployer creates one custom VPC, `10.42.0.0/24` subnet, tag-scoped public
-web and TURN firewall rules, `/32` operator SSH rule, regional static IPv4,
-Ubuntu VM, and 50 GiB boot disk. The VM has no project service account.
+web and TURN firewall rules, an explicit canonical IPv4 SSH source rule
+(`0.0.0.0/0` in the supplied configuration), regional static IPv4, Ubuntu VM,
+and 50 GiB boot disk. The VM has no project service account. The exact SSH
+source is part of the canonical spec and firewall effect, and therefore remains
+bound by the approved plan digest.
 
 Every resource reference records project number, location, numeric id,
 self-link, deployment UUID and observed attributes. Every mutation follows:

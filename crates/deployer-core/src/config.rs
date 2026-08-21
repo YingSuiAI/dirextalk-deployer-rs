@@ -6,7 +6,7 @@ use crate::{CoreError, ReleaseTag, Result};
 pub const SCHEMA_VERSION: u32 = 1;
 
 fn default_machine_type() -> String {
-    "e2-custom-2-4096".to_owned()
+    "e2-small".to_owned()
 }
 
 const fn default_boot_disk_size_gib() -> u32 {
@@ -127,7 +127,7 @@ impl DeploymentConfig {
         if self.schema_version != SCHEMA_VERSION {
             return invalid("schema_version", "must equal 1");
         }
-        if self.deployment_name.len() < 3 || !valid_label(&self.deployment_name, 40) {
+        if !valid_label(&self.deployment_name, 40) {
             return invalid(
                 "deployment_name",
                 "must be a lowercase DNS label of at most 40 characters",
@@ -150,8 +150,8 @@ impl DeploymentConfig {
         if !valid_domain(&self.domain) {
             return invalid("domain", "must be a canonical lowercase DNS name");
         }
-        if !valid_machine_type(&self.machine_type) {
-            return invalid("machine_type", "must be a valid GCP machine type name");
+        if !matches!(self.machine_type.as_str(), "e2-small" | "e2-custom-2-4096") {
+            return invalid("machine_type", "must be e2-small or e2-custom-2-4096");
         }
         if !(50..=65_536).contains(&self.boot_disk_size_gib) {
             return invalid("boot_disk_size_gib", "must be between 50 and 65536 GiB");
@@ -165,8 +165,8 @@ impl DeploymentConfig {
                 "must be pd-balanced, pd-ssd, or pd-standard",
             );
         }
-        if !valid_ipv4_host_cidr(&self.operator_ssh_cidr) {
-            return invalid("operator_ssh_cidr", "must be a canonical IPv4 /32 CIDR");
+        if !valid_ipv4_cidr(&self.operator_ssh_cidr) {
+            return invalid("operator_ssh_cidr", "must be a canonical IPv4 CIDR");
         }
         self.maximum_monthly_microusd()?;
         if !valid_agent_token(&self.connect_agent) {
@@ -236,10 +236,6 @@ fn valid_gcp_location(value: &str) -> bool {
     (3..=63).contains(&value.len()) && valid_label(value, 63) && value.contains('-')
 }
 
-fn valid_machine_type(value: &str) -> bool {
-    valid_label(value, 63)
-}
-
 fn valid_domain(value: &str) -> bool {
     if value.len() > 253 || value.ends_with('.') || !value.contains('.') {
         return false;
@@ -247,14 +243,28 @@ fn valid_domain(value: &str) -> bool {
     value.split('.').all(|label| valid_label(label, 63))
 }
 
-fn valid_ipv4_host_cidr(value: &str) -> bool {
-    let Some(address) = value.strip_suffix("/32") else {
+fn valid_ipv4_cidr(value: &str) -> bool {
+    let Some((address, prefix_text)) = value.split_once('/') else {
         return false;
     };
     let Ok(parsed) = address.parse::<std::net::Ipv4Addr>() else {
         return false;
     };
-    parsed.to_string() == address
+    let Ok(prefix) = prefix_text.parse::<u8>() else {
+        return false;
+    };
+    if parsed.to_string() != address || prefix.to_string() != prefix_text {
+        return false;
+    }
+    let Some(host_bits) = 32_u32.checked_sub(u32::from(prefix)) else {
+        return false;
+    };
+    let host_mask = if host_bits == 32 {
+        u32::MAX
+    } else {
+        (1_u32 << host_bits) - 1
+    };
+    u32::from(parsed) & host_mask == 0
 }
 
 fn valid_agent_token(value: &str) -> bool {
@@ -276,7 +286,7 @@ project_id = "dirextalk-prod"
 region = "us-central1"
 zone = "us-central1-a"
 domain = "talk.example.com"
-operator_ssh_cidr = "203.0.113.7/32"
+operator_ssh_cidr = "0.0.0.0/0"
 maximum_monthly_usd = 150.0
 release = "stable"
 "#;
@@ -285,7 +295,7 @@ release = "stable"
     fn parses_defaults() {
         let config = DeploymentConfig::parse(MINIMAL).unwrap();
         assert_eq!(config.dns_mode, DnsMode::Auto);
-        assert_eq!(config.machine_type, "e2-custom-2-4096");
+        assert_eq!(config.machine_type, "e2-small");
         assert_eq!(config.boot_disk_size_gib, 50);
         assert_eq!(config.boot_disk_type, "pd-balanced");
         assert_eq!(config.connect_agent, "auto");
@@ -293,10 +303,29 @@ release = "stable"
     }
 
     #[test]
-    fn accepts_the_explicit_e2_small_shared_core_choice() {
-        let configured = format!("{MINIMAL}\nmachine_type = \"e2-small\"\n");
-        let config = DeploymentConfig::parse(&configured).expect("e2-small config");
-        assert_eq!(config.machine_type, "e2-small");
+    fn accepts_the_explicit_standard_machine_choice() {
+        let configured = format!("{MINIMAL}\nmachine_type = \"e2-custom-2-4096\"\n");
+        let config = DeploymentConfig::parse(&configured).expect("standard machine config");
+        assert_eq!(config.machine_type, "e2-custom-2-4096");
+    }
+
+    #[test]
+    fn rejects_machine_types_outside_the_two_supported_choices() {
+        let configured = format!("{MINIMAL}\nmachine_type = \"e2-medium\"\n");
+        assert!(matches!(
+            DeploymentConfig::parse(&configured),
+            Err(CoreError::ConfigValidation {
+                field: "machine_type",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn accepts_two_character_deployment_name() {
+        let configured = MINIMAL.replace("production", "a1");
+        let config = DeploymentConfig::parse(&configured).expect("two-character deployment name");
+        assert_eq!(config.deployment_name, "a1");
     }
 
     #[test]
@@ -309,7 +338,21 @@ release = "stable"
     }
 
     #[test]
-    fn rejects_wrong_schema_and_non_host_cidr() {
+    fn accepts_canonical_ipv4_ssh_source_cidrs() {
+        let open = DeploymentConfig::parse(MINIMAL).expect("open SSH source");
+        assert_eq!(open.operator_ssh_cidr, "0.0.0.0/0");
+
+        let restricted = MINIMAL.replace("0.0.0.0/0", "203.0.113.0/24");
+        assert_eq!(
+            DeploymentConfig::parse(&restricted)
+                .expect("restricted SSH source")
+                .operator_ssh_cidr,
+            "203.0.113.0/24"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_schema_and_noncanonical_cidr() {
         let wrong_schema = MINIMAL.replace("schema_version = 1", "schema_version = 2");
         assert!(matches!(
             DeploymentConfig::parse(&wrong_schema),
@@ -319,14 +362,16 @@ release = "stable"
             })
         ));
 
-        let wide_cidr = MINIMAL.replace("203.0.113.7/32", "203.0.113.0/24");
-        assert!(matches!(
-            DeploymentConfig::parse(&wide_cidr),
-            Err(CoreError::ConfigValidation {
-                field: "operator_ssh_cidr",
-                ..
-            })
-        ));
+        for invalid_cidr in ["203.0.113.7/24", "0.0.0.0/33", "0.0.0.0/00"] {
+            let configured = MINIMAL.replace("0.0.0.0/0", invalid_cidr);
+            assert!(matches!(
+                DeploymentConfig::parse(&configured),
+                Err(CoreError::ConfigValidation {
+                    field: "operator_ssh_cidr",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

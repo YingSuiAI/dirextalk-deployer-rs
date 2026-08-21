@@ -1806,18 +1806,18 @@ fn pricing_quote(
             (
                 select_exact_price(
                     prices,
-                    "E2 Instance Core running in APAC",
+                    "E2 Instance Core running",
                     &["e2", "core"],
-                    "APAC E2 shared-core CPU",
+                    "regional E2 shared-core CPU",
                 )?,
                 checked_quantity(machine.billable_vcpus, 730)?,
             ),
             (
                 select_exact_price(
                     prices,
-                    "E2 Instance Ram running in APAC",
+                    "E2 Instance Ram running",
                     &["e2", "ram"],
-                    "APAC E2 shared-core memory",
+                    "regional E2 shared-core memory",
                 )?,
                 checked_quantity(machine.memory_gib, 730)?,
             ),
@@ -1921,7 +1921,10 @@ fn select_exact_price<'a>(
 ) -> Result<&'a deployer_gcp::SkuPrice> {
     let matches: Vec<_> = prices
         .iter()
-        .filter(|price| price.currency_code == "USD" && price.description == description)
+        .filter(|price| {
+            price.currency_code == "USD"
+                && exact_or_localized_sku_description(&price.description, description)
+        })
         .collect();
     match matches.as_slice() {
         [price] => Ok(price),
@@ -1931,6 +1934,30 @@ fn select_exact_price<'a>(
             pricing_candidates(prices, diagnostic_needles)
         ))),
     }
+}
+
+fn exact_or_localized_sku_description(candidate: &str, base: &str) -> bool {
+    if candidate == base {
+        return true;
+    }
+    let Some(region_name) = candidate
+        .strip_prefix(base)
+        .and_then(|suffix| suffix.strip_prefix(" in "))
+    else {
+        return false;
+    };
+    safe_region_name(region_name)
+}
+
+fn safe_region_name(region_name: &str) -> bool {
+    (1..=80).contains(&region_name.len())
+        && region_name.split([' ', '-']).all(|word| {
+            !word.is_empty()
+                && word.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                && !["regional", "hyperdisk", "spot", "preemptible", "idle"]
+                    .iter()
+                    .any(|excluded| word.eq_ignore_ascii_case(excluded))
+        })
 }
 
 fn pricing_candidates(prices: &[deployer_gcp::SkuPrice], needles: &[&str]) -> String {
@@ -3386,10 +3413,25 @@ release = "stable"
         let prices = [
             described_price(
                 "REGIONAL-HIGH",
-                "Regional Balanced PD Capacity",
+                "Regional Balanced PD Capacity in Hong Kong",
                 900_000_000,
             ),
-            described_price("ZONAL-EXACT", "Balanced PD Capacity", 100_000_000),
+            described_price(
+                "HYPERDISK-HIGH",
+                "Hyperdisk Balanced Capacity in Hong Kong",
+                800_000_000,
+            ),
+            described_price(
+                "SPOT-HIGH",
+                "Balanced PD Capacity in Hong Kong Spot",
+                700_000_000,
+            ),
+            described_price("IDLE-HIGH", "Balanced PD Capacity in idle", 600_000_000),
+            described_price(
+                "ZONAL-LOCALIZED",
+                "Balanced PD Capacity in Hong Kong",
+                100_000_000,
+            ),
         ];
         let selected = select_exact_price(
             &prices,
@@ -3398,7 +3440,50 @@ release = "stable"
             "zonal pd-balanced capacity",
         )
         .expect("exact zonal SKU");
-        assert_eq!(selected.sku_id, "ZONAL-EXACT");
+        assert_eq!(selected.sku_id, "ZONAL-LOCALIZED");
+    }
+
+    #[test]
+    fn exact_zonal_balanced_disk_selection_rejects_regional_localized_sku() {
+        let prices = [described_price(
+            "REGIONAL-ONLY",
+            "Regional Balanced PD Capacity in Hong Kong",
+            100_000_000,
+        )];
+
+        let error = select_exact_price(
+            &prices,
+            "Balanced PD Capacity",
+            &["balanced", "capacity"],
+            "zonal pd-balanced capacity",
+        )
+        .expect_err("regional SKU must not satisfy the zonal price");
+        assert!(error.to_string().contains("matched 0"));
+    }
+
+    #[test]
+    fn exact_zonal_balanced_disk_selection_rejects_multiple_localized_skus() {
+        let prices = [
+            described_price(
+                "LOCALIZED-ONE",
+                "Balanced PD Capacity in Hong Kong",
+                100_000_000,
+            ),
+            described_price(
+                "LOCALIZED-TWO",
+                "Balanced PD Capacity in Singapore",
+                100_000_000,
+            ),
+        ];
+
+        let error = select_exact_price(
+            &prices,
+            "Balanced PD Capacity",
+            &["balanced", "capacity"],
+            "zonal pd-balanced capacity",
+        )
+        .expect_err("ambiguous localized SKUs must fail closed");
+        assert!(error.to_string().contains("matched 2"));
     }
 
     #[test]
@@ -3410,7 +3495,11 @@ release = "stable"
                 9,
             ),
             described_price("IDLE-HIGH", "Static Ip Charge", 8),
-            described_price("ATTACHED-EXACT", "External IP Charge on a Standard VM", 1),
+            described_price(
+                "ATTACHED-LOCALIZED",
+                "External IP Charge on a Standard VM in Hong Kong",
+                1,
+            ),
         ];
         let selected = select_exact_price(
             &prices,
@@ -3419,56 +3508,57 @@ release = "stable"
             "attached in-use static IPv4",
         )
         .expect("exact attached IP SKU");
-        assert_eq!(selected.sku_id, "ATTACHED-EXACT");
+        assert_eq!(selected.sku_id, "ATTACHED-LOCALIZED");
     }
 
     #[test]
-    fn e2_small_quote_uses_half_cpu_two_gib_and_exact_infrastructure_skus() {
-        let prices = [
-            described_price(
-                "92C8-7C92-6AEF",
-                "E2 Instance Core running in APAC",
-                10_000_000,
-            ),
-            described_price(
-                "FD4D-A383-8DAB",
-                "E2 Instance Ram running in APAC",
-                2_000_000,
-            ),
-            described_price("6AE1-525F-8B80", "Balanced PD Capacity", 100_000_000),
-            described_price(
-                "C054-7F72-A02E",
-                "External IP Charge on a Standard VM",
-                4_000_000,
-            ),
-            described_price(
-                "REGIONAL-WRONG",
-                "Regional Balanced PD Capacity",
-                900_000_000,
-            ),
-            described_price("IDLE-WRONG", "Static Ip Charge", 900_000_000),
-        ];
+    fn e2_small_quote_uses_each_region_family_and_exact_infrastructure_skus() {
+        for region_family in ["APAC", "Americas", "EMEA"] {
+            let prices = [
+                described_price(
+                    "92C8-7C92-6AEF",
+                    &format!("E2 Instance Core running in {region_family}"),
+                    10_000_000,
+                ),
+                described_price(
+                    "FD4D-A383-8DAB",
+                    &format!("E2 Instance Ram running in {region_family}"),
+                    2_000_000,
+                ),
+                described_price("6AE1-525F-8B80", "Balanced PD Capacity", 100_000_000),
+                described_price(
+                    "C054-7F72-A02E",
+                    "External IP Charge on a Standard VM",
+                    4_000_000,
+                ),
+                described_price(
+                    "REGIONAL-WRONG",
+                    "Regional Balanced PD Capacity",
+                    900_000_000,
+                ),
+                described_price("IDLE-WRONG", "Static Ip Charge", 900_000_000),
+            ];
 
-        let quote = pricing_quote(&e2_small_config(), &prices).expect("e2-small quote");
-        let quantity = |sku_id: &str| {
-            quote
-                .lines
-                .iter()
-                .find(|line| line.sku_id == sku_id)
-                .expect("selected SKU")
-                .usage_quantity
-        };
-        assert_eq!(quantity("92C8-7C92-6AEF"), whole_quantity(365));
-        assert_eq!(quantity("FD4D-A383-8DAB"), whole_quantity(1_460));
-        assert_eq!(quantity("6AE1-525F-8B80"), whole_quantity(50));
-        assert_eq!(quantity("C054-7F72-A02E"), whole_quantity(730));
-        assert_eq!(quote.total_microusd, 14_490_000);
-        assert!(
-            quote
-                .lines
-                .iter()
-                .all(|line| { !matches!(line.sku_id.as_str(), "REGIONAL-WRONG" | "IDLE-WRONG") })
-        );
+            let quote = pricing_quote(&e2_small_config(), &prices).expect("e2-small quote");
+            let quantity = |sku_id: &str| {
+                quote
+                    .lines
+                    .iter()
+                    .find(|line| line.sku_id == sku_id)
+                    .expect("selected SKU")
+                    .usage_quantity
+            };
+            assert_eq!(quantity("92C8-7C92-6AEF"), whole_quantity(365));
+            assert_eq!(quantity("FD4D-A383-8DAB"), whole_quantity(1_460));
+            assert_eq!(quantity("6AE1-525F-8B80"), whole_quantity(50));
+            assert_eq!(quantity("C054-7F72-A02E"), whole_quantity(730));
+            assert_eq!(quote.total_microusd, 14_490_000);
+            assert!(
+                quote.lines.iter().all(|line| {
+                    !matches!(line.sku_id.as_str(), "REGIONAL-WRONG" | "IDLE-WRONG")
+                })
+            );
+        }
     }
 
     fn whole_quantity(numerator: u64) -> RationalQuantity {
