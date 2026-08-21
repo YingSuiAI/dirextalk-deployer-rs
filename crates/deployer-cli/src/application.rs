@@ -414,23 +414,6 @@ fn completion_envelope(command: &str, completion: Completion) -> EngineResult<Co
         )
         .with_data(json!({ "record_type": "A", "name": name, "value": value }))
         .map_err(|_| EngineError::Backend("DNS output could not be encoded".into())),
-        Completion::WaitingDnsReplan {
-            name,
-            value,
-            current_values,
-        } => CommandEnvelope::waiting(
-            command,
-            "DNS_REPLAN_REQUIRED",
-            "The static address is reserved. Review a new exact DNS continuation plan.",
-        )
-        .with_data(json!({
-            "record_type": "A",
-            "name": name,
-            "current_values": current_values,
-            "replacement_value": value,
-            "next_command": "deploy plan",
-        }))
-        .map_err(|_| EngineError::Backend("DNS continuation output could not be encoded".into())),
     }
 }
 

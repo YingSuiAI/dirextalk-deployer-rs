@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::Ipv4Addr;
 
@@ -56,18 +56,8 @@ pub struct PlanObservations {
 
 #[derive(Clone, Debug)]
 pub enum Completion {
-    Complete {
-        initialization_code: SecretString,
-    },
-    WaitingExternalDns {
-        name: String,
-        value: String,
-    },
-    WaitingDnsReplan {
-        name: String,
-        value: String,
-        current_values: BTreeSet<Ipv4Addr>,
-    },
+    Complete { initialization_code: SecretString },
+    WaitingExternalDns { name: String, value: String },
 }
 
 impl PartialEq for Completion {
@@ -91,22 +81,6 @@ impl PartialEq for Completion {
                     value: right_value,
                 },
             ) => left_name == right_name && left_value == right_value,
-            (
-                Self::WaitingDnsReplan {
-                    name: left_name,
-                    value: left_value,
-                    current_values: left_current,
-                },
-                Self::WaitingDnsReplan {
-                    name: right_name,
-                    value: right_value,
-                    current_values: right_current,
-                },
-            ) => {
-                left_name == right_name
-                    && left_value == right_value
-                    && left_current == right_current
-            }
             _ => false,
         }
     }
@@ -275,10 +249,12 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
         self.backend
             .revalidate_project(&state.project_identity)
             .await?;
+        let automatic_dns = automatic_cloud_dns_effect(config, plan, &state)?;
         let pending_plan = match state.pending_effect.as_ref() {
             Some(pending) => Some(
                 plan.effects
                     .iter()
+                    .chain(automatic_dns.iter())
                     .find(|planned| planned_matches(pending, planned))
                     .ok_or(EngineError::StatePlanMismatch)?,
             ),
@@ -312,21 +288,8 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
             }
         }
 
-        if let PlanDnsObservation::CloudDns {
-            current_ipv4,
-            change: None,
-            ..
-        } = &plan.observed_dns
-            && state.gcp_resources.dns_record.is_none()
-        {
-            let address = public_address(&state)?;
-            state.phase = DeploymentPhase::WaitingUser;
-            self.store.write(&state)?;
-            return Ok(Completion::WaitingDnsReplan {
-                name: config.domain.clone(),
-                value: address,
-                current_values: current_ipv4.clone(),
-            });
+        if let Some(effect) = automatic_cloud_dns_effect(config, plan, &state)? {
+            self.execute_effect(&mut state, &effect).await?;
         }
 
         if state.host_receipt.is_none() {
@@ -385,9 +348,11 @@ impl<'a, B: DeploymentBackend, S: DeploymentStore> Orchestrator<'a, B, S> {
         {
             return Err(EngineError::StatePlanMismatch);
         }
+        let automatic_dns = automatic_cloud_dns_effect(config, &plan, &state)?;
         let planned = plan
             .effects
             .iter()
+            .chain(automatic_dns.iter())
             .find(|planned| planned_matches(pending, planned))
             .ok_or(EngineError::StatePlanMismatch)?;
         self.backend
@@ -950,6 +915,74 @@ fn planned_matches(pending: &PendingEffect, planned: &PlannedEffect) -> bool {
         && pending.target == planned.target
 }
 
+fn automatic_cloud_dns_effect(
+    config: &DeploymentConfig,
+    plan: &DeploymentPlan,
+    state: &DeploymentState,
+) -> Result<Option<PlannedEffect>> {
+    if state.gcp_resources.dns_record.is_some()
+        || !matches!(plan.stage, DeploymentPlanStage::Initial)
+    {
+        return Ok(None);
+    }
+    let PlanDnsObservation::CloudDns {
+        zone_name,
+        zone_numeric_id,
+        current_ipv4,
+        change: None,
+    } = &plan.observed_dns
+    else {
+        return Ok(None);
+    };
+    let Some(address) = state.gcp_resources.address.as_ref() else {
+        return Ok(None);
+    };
+    let replacement: Ipv4Addr = address
+        .observed_attributes
+        .get("address")
+        .ok_or_else(|| EngineError::State("reserved address value is missing".into()))?
+        .parse()
+        .map_err(|_| EngineError::State("reserved address value is invalid".into()))?;
+    let current_values = serde_json::to_string(current_ipv4)
+        .map_err(|_| EngineError::Backend("DNS values could not be encoded".into()))?;
+    let target = (!current_ipv4.is_empty()).then(|| ResourceRef {
+        resource_kind: ResourceKind::DnsRecord,
+        name: config.domain.clone(),
+        project_number: state.project_identity.project_number,
+        location: "global".into(),
+        numeric_id: *zone_numeric_id,
+        self_link: format!(
+            "https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{zone_name}/rrsets/{}/A",
+            state.project_identity.project_id, config.domain
+        ),
+        deployment_uuid: state.deployment_uuid,
+        observed_attributes: BTreeMap::from([
+            ("zone_name".into(), zone_name.clone()),
+            ("zone_numeric_id".into(), zone_numeric_id.to_string()),
+            ("current_values".into(), current_values.clone()),
+        ]),
+    });
+    Ok(Some(PlannedEffect {
+        action: if target.is_some() {
+            EffectAction::Update
+        } else {
+            EffectAction::Create
+        },
+        resource_kind: ResourceKind::DnsRecord,
+        resource_name: config.domain.clone(),
+        location: "global".into(),
+        expected_attributes: BTreeMap::from([
+            ("zone_name".into(), zone_name.clone()),
+            ("zone_numeric_id".into(), zone_numeric_id.to_string()),
+            ("current_values".into(), current_values),
+            ("value".into(), replacement.to_string()),
+            ("ttl".into(), "300".into()),
+        ]),
+        source_image: None,
+        target,
+    }))
+}
+
 fn public_address(state: &DeploymentState) -> Result<String> {
     state
         .gcp_resources
@@ -1043,7 +1076,10 @@ fn apply_receipt(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
 
@@ -1655,6 +1691,150 @@ release = "stable"
         let state = store.read().expect("state").expect("present");
         assert_eq!(state.phase, DeploymentPhase::WaitingUser);
         assert!(state.host_receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_dns_is_derived_from_the_approved_intent_without_a_second_plan() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = MemoryStore::with_events(Arc::clone(&events));
+        let backend = FakeBackend::new(Arc::clone(&events), true);
+        let plan = build_plan(
+            &config(),
+            observations(PlanDnsObservation::CloudDns {
+                zone_name: "example-com".into(),
+                zone_numeric_id: 77,
+                current_ipv4: BTreeSet::new(),
+                change: None,
+            }),
+            None,
+        )
+        .expect("plan");
+        let digest = plan.digest().expect("digest");
+
+        assert!(matches!(
+            Orchestrator::new(&backend, &store)
+                .apply(&plan, &digest)
+                .await
+                .expect("complete"),
+            Completion::Complete { .. }
+        ));
+
+        let state = store.read().expect("state").expect("present");
+        assert_eq!(state.phase, DeploymentPhase::Complete);
+        let dns = state.gcp_resources.dns_record.expect("managed DNS receipt");
+        assert_eq!(dns.name, "talk.example.com");
+        assert_eq!(dns.observed_attributes["value"], "8.8.8.8");
+        let events = events.lock().expect("events");
+        let dns_start = events
+            .iter()
+            .position(|event| event == "start:talk.example.com")
+            .expect("DNS start");
+        let host_install = events
+            .iter()
+            .position(|event| event == "install-host")
+            .expect("host install");
+        assert!(dns_start < host_install);
+    }
+
+    #[tokio::test]
+    async fn interrupted_derived_dns_operation_resumes_from_the_initial_plan() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = MemoryStore::with_events(Arc::clone(&events));
+        let plan = build_plan(
+            &config(),
+            observations(PlanDnsObservation::CloudDns {
+                zone_name: "example-com".into(),
+                zone_numeric_id: 77,
+                current_ipv4: BTreeSet::new(),
+                change: None,
+            }),
+            None,
+        )
+        .expect("plan");
+        let digest = plan.digest().expect("digest");
+        let first_backend = FakeBackend::new(Arc::clone(&events), true);
+        first_backend
+            .fail_poll_once
+            .lock()
+            .expect("poll failure lock")
+            .insert("talk.example.com".into());
+
+        assert!(matches!(
+            Orchestrator::new(&first_backend, &store)
+                .apply(&plan, &digest)
+                .await,
+            Err(EngineError::Backend(message)) if message.contains("interrupted operation")
+        ));
+        let interrupted = store.read().expect("state").expect("present");
+        assert_eq!(
+            interrupted
+                .pending_effect
+                .as_ref()
+                .expect("pending DNS")
+                .resource_name,
+            "talk.example.com"
+        );
+
+        let resumed_backend = FakeBackend::new(events, true);
+        assert!(matches!(
+            Orchestrator::new(&resumed_backend, &store)
+                .resume(&config())
+                .await
+                .expect("resumed"),
+            Completion::Complete { .. }
+        ));
+        let complete = store.read().expect("state").expect("present");
+        assert_eq!(complete.phase, DeploymentPhase::Complete);
+        assert!(complete.gcp_resources.dns_record.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_only_reconciles_a_journaled_derived_dns_operation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = MemoryStore::with_events(Arc::clone(&events));
+        let plan = build_plan(
+            &config(),
+            observations(PlanDnsObservation::CloudDns {
+                zone_name: "example-com".into(),
+                zone_numeric_id: 77,
+                current_ipv4: BTreeSet::new(),
+                change: None,
+            }),
+            None,
+        )
+        .expect("plan");
+        let digest = plan.digest().expect("digest");
+        let first_backend = FakeBackend::new(Arc::clone(&events), true);
+        first_backend
+            .fail_poll_once
+            .lock()
+            .expect("poll failure lock")
+            .insert("talk.example.com".into());
+        assert!(
+            Orchestrator::new(&first_backend, &store)
+                .apply(&plan, &digest)
+                .await
+                .is_err()
+        );
+
+        let recovery_backend = FakeBackend::new(Arc::clone(&events), true);
+        Orchestrator::new(&recovery_backend, &store)
+            .resume_pending_only(&config())
+            .await
+            .expect("derived DNS pending-only recovery");
+
+        let recovered = store.read().expect("state").expect("present");
+        assert!(recovered.pending_effect.is_none());
+        assert!(recovered.gcp_resources.dns_record.is_some());
+        assert!(recovered.host_receipt.is_none());
+        assert_eq!(recovered.phase, DeploymentPhase::Applying);
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| event == "install-host")
+        );
     }
 
     fn resource_from_plan(plan: &DeploymentPlan, kind: ResourceKind) -> ResourceRef {

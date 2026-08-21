@@ -2566,6 +2566,23 @@ fn connect_controller(
 }
 
 fn agent_selection(configured: &str) -> Result<AgentSelection> {
+    let runtime_override = (configured == "auto")
+        .then(|| std::env::var("DIREXTALK_CONNECT_AGENT").ok())
+        .flatten();
+    let path = std::env::var_os("PATH");
+    agent_selection_from(configured, runtime_override.as_deref(), path.as_deref())
+}
+
+fn agent_selection_from(
+    configured: &str,
+    runtime_override: Option<&str>,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<AgentSelection> {
+    let configured = if configured == "auto" {
+        runtime_override.unwrap_or(configured)
+    } else {
+        configured
+    };
     if configured == "openclaw" {
         return Ok(AgentSelection {
             connect_agent: ConnectAgent::Acp,
@@ -2579,7 +2596,7 @@ fn agent_selection(configured: &str) -> Result<AgentSelection> {
         });
     }
     let connect_agent = if configured == "auto" {
-        let path = std::env::var_os("PATH").ok_or_else(|| {
+        let path = path.ok_or_else(|| {
             EngineError::WaitingUser("PATH is unavailable; select connect_agent".into())
         })?;
         let candidates = [
@@ -2595,7 +2612,7 @@ fn agent_selection(configured: &str) -> Result<AgentSelection> {
         ];
         let found: Vec<_> = candidates
             .into_iter()
-            .filter(|(binary, _, _)| executable_path_in(&path, binary).is_some())
+            .filter(|(binary, _, _)| executable_path_in(path, binary).is_some())
             .map(|(_, agent, runtime)| AgentSelection {
                 connect_agent: agent,
                 host_runtime: runtime,
@@ -3739,6 +3756,25 @@ release = "stable"
             }
         );
         assert!(agent_selection("unknown-agent").is_err());
+    }
+
+    #[test]
+    fn explicit_runtime_override_resolves_auto_before_path_detection() {
+        assert_eq!(
+            agent_selection_from("auto", Some("codex"), None).unwrap(),
+            AgentSelection {
+                connect_agent: ConnectAgent::Codex,
+                host_runtime: HostRuntime::Direct,
+            }
+        );
+        assert_eq!(
+            agent_selection_from("claudecode", Some("codex"), None).unwrap(),
+            AgentSelection {
+                connect_agent: ConnectAgent::ClaudeCode,
+                host_runtime: HostRuntime::Direct,
+            }
+        );
+        assert!(agent_selection_from("auto", Some("unknown-agent"), None).is_err());
     }
 
     #[test]

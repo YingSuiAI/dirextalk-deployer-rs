@@ -82,11 +82,15 @@ only a strict request, invokes fixed programs with typed argv, writes a signed
 receipt, installs the canonical production topology, and installs the pinned
 `dirextalk-updater` with its resident watchdog disabled.
 
-Cloud DNS auto mode selects the longest matching existing public managed zone;
-otherwise deployment stops in `waiting_user` with exactly one required A
-record. Conflicting records require a new explicit plan. Authoritative and
-independent public-recursive DNS proof must run on the verified server before
-TLS integration.
+Cloud DNS auto mode selects the longest matching existing public managed zone.
+The initial approved intent binds the zone identity and observed A-record set;
+after its exact static address receipt is persisted, the deployer derives and
+journals the deterministic A-record mutation and continues without a second
+user approval. The DNS adapter still requires the bound old record set, so a
+concurrent replacement fails closed. Without a matching managed zone,
+deployment stops in `waiting_user` with exactly one required external A record.
+Authoritative and independent public-recursive DNS proof must run on the
+verified server before TLS integration.
 
 Completion requires PostgreSQL, Message Server, Agent, Matrix, HTTPS, TURN,
 the eight-digit App initialization code, real `agent_room_id`, a service-scoped

@@ -76,8 +76,8 @@ the operator's limit; it does not cap the GCP bill.
 `operator_ssh_cidr = "0.0.0.0/0"` deliberately allows SSH from any IPv4
 source so a changing operator address does not lock out recovery. A canonical
 narrower IPv4 CIDR remains supported when the operator has a stable range. The
-configured value is included in both the SSH firewall effect and the plan
-digest, so changing it requires reviewing and approving a new plan.
+configured value is included in both the SSH firewall effect and the internal
+plan binding, so changing it requires a new user-facing deployment review.
 
 Every deployment chooses one of two supported machine profiles. The default
 economy profile is `e2-small`: two shared guest vCPUs, 2 GiB memory, and 0.5
@@ -87,12 +87,13 @@ of regional `CPUS` quota. Choose `e2-custom-2-4096` for the standard profile
 with two fully billable vCPUs and 4 GiB memory. Other machine types are
 rejected before cloud planning.
 
-`connect_agent = "auto"` detects one supported local Agent runtime. Detection
-fails closed when the result is ambiguous or unknown; it never guesses or
-generates a generic fallback. Resolve the ambiguity or set the exact supported
-Agent name, then rerun. `install_connect = true` installs and verifies the
-service-scoped `dirextalk-connect` bridge; set it to `false` only when local
-installation is intentionally deferred.
+`connect_agent = "auto"` detects one supported local Agent runtime. An
+orchestrator that already knows its runtime should set
+`DIREXTALK_CONNECT_AGENT` to the canonical Agent token before planning and
+applying; an explicit non-`auto` config value takes precedence. PATH detection
+still fails closed when the result is ambiguous or unknown. `install_connect =
+true` installs and verifies the service-scoped `dirextalk-connect` bridge; set
+it to `false` only when local installation is intentionally deferred.
 
 ## Authenticate and inspect the project
 
@@ -119,35 +120,29 @@ Only authentication and broker identity cross the gcloud process boundary.
 Project discovery, pricing, planning, and resource lifecycle calls remain
 in-process API operations; the deployer does not run gcloud resource commands.
 
-`project prepare` is a separate approval-bound workflow. Its first invocation
-is read-only in GCP and reports the complete fixed prerequisite set plus the
+`project prepare` first reports the complete fixed prerequisite set plus the
 currently missing subset: Service Usage, Resource Manager, Cloud Billing,
-Compute Engine, and Cloud DNS. Review the project id and number and approve
-only that current digest:
-
-```text
-dirextalk-deployer project prepare --project <project-id> --approve sha256:<plan-id>
-```
-
-The approved run enables only the missing services, recording and resuming
-each Service Usage operation before moving to the next. It does not create a
-project, link billing, or create paid resources.
+Compute Engine, and Cloud DNS. The Skill verifies the immutable project
+identity and passes the plan's opaque binding internally; it does not ask the
+user to copy a machine token. The prepared run enables only the missing
+services, recording and resuming each Service Usage operation before moving to
+the next. It does not create a project, link billing, or create paid resources.
 
 ## Plan and apply
 
-Planning is read-only. Review the authentication status, project id and number,
-location, observed DNS, exact releases, estimated cost, and every resource
-effect before approving it.
+Planning is read-only. The user-facing review contains the project, location,
+domain and DNS behavior, one of the two supported machine profiles, disk,
+estimated monthly cost, budget and continuing-billing warning. One natural-
+language confirmation authorizes that unchanged deployment intent.
 
 ```text
 dirextalk-deployer deploy plan --config <deployment.toml>
-dirextalk-deployer deploy apply --config <deployment.toml> --approve sha256:<plan-id>
 ```
 
-Apply accepts only the digest from the current plan. A changed configuration,
-principal, project identity, DNS observation, release, price input, or effect
-set requires a new plan and a new approval. Never approve a digest you have not
-just reviewed.
+The Skill passes the current plan binding to `deploy apply` internally and does
+not display it. A changed configuration, principal, project identity, DNS
+observation, release, price input, or effect set is not covered by the user's
+confirmation and must be summarized again.
 
 The deployer records each cloud mutation before executing it. If it stops or
 reports an infrastructure error, preserve the node state and resume it; do not
@@ -168,8 +163,13 @@ It requires an existing pending effect; it never advances an idle deployment.
 ## DNS waiting
 
 `dns_mode = "auto"` uses the longest matching existing public Cloud DNS zone
-when one is available. Otherwise, or with `dns_mode = "external"`, deployment
-stops with exit code `2` and prints exactly one required record:
+when one is available. The initial plan binds that zone and the observed A
+record values; after the reserved address is known, the deployer derives the
+exact A-record effect and continues without another user approval. A concurrent
+record change still fails closed.
+
+When no matching zone exists, or with `dns_mode = "external"`, deployment stops
+with exit code `2` and prints exactly one required record:
 
 ```text
 <domain>  A  <reserved-static-ipv4>
@@ -177,9 +177,9 @@ stops with exit code `2` and prints exactly one required record:
 
 Create that direct A record at the existing DNS provider, wait for authoritative
 and public-recursive resolution, and run `deploy resume` with the same config.
-Do not delete state or create a replacement VM while waiting. A conflicting A
-record is never overwritten under an old approval; review and approve a new
-plan if replacement is intended.
+Do not delete state or create a replacement VM while waiting. This is an
+external action request, not another deployment approval; resume the unchanged
+deployment after the record resolves.
 
 ## Verify and connect locally
 
@@ -206,13 +206,12 @@ the output.
 
 ## Destroy
 
-Destroy is also plan-bound. The first command is dry and returns the destroy
-plan digest; inspect the exact identities and retained resources before
-approving it.
+Destroy is also plan-bound. The first command is dry; inspect the exact
+identities and retained resources, obtain one natural-language destroy
+confirmation, then let the Skill pass the opaque plan binding internally.
 
 ```text
 dirextalk-deployer deploy destroy --config <deployment.toml>
-dirextalk-deployer deploy destroy --config <deployment.toml> --approve sha256:<destroy-plan-id>
 dirextalk-deployer deploy status --config <deployment.toml>
 ```
 
@@ -223,7 +222,6 @@ numeric-id-bound plan and approval:
 
 ```text
 dirextalk-deployer deploy destroy --config <deployment.toml> --purge-disk <numeric-disk-id>
-dirextalk-deployer deploy destroy --config <deployment.toml> --purge-disk <numeric-disk-id> --approve sha256:<purge-plan-id>
 ```
 
 External DNS and other user-owned DNS resources remain the operator's
