@@ -47,13 +47,20 @@ DNS continuation and resumptions that preserve the same intent; it does not
 cover a changed domain, project, region, machine profile, budget, unexpected
 DNS replacement, or a later destroy.
 
+For a first-time user who is missing an account, billing-enabled project, or
+domain, read [references/gcp-onboarding.md](references/gcp-onboarding.md) and
+guide only the next blocking setup action. Skip every onboarding step already
+proved by authenticated project inspection or information the user supplied.
+
 ## Lifecycle
 
-1. Ask only for missing user decisions. Always offer economy `e2-small`
-   (default; two shared vCPUs, 2 GiB) and standard `e2-custom-2-4096` (two fully
-   billable vCPUs, 4 GiB), ask for the monthly budget, and ask which long-lived
-   domain to use when none was supplied. Select or confirm the GCP region when
-   it is not already clear. Copy `examples/deployment.toml` outside the
+1. Ask only for missing user decisions. Use the onboarding reference when the
+   user still needs an account, project, billing, or domain. Always offer
+   economy `e2-small` (default; two shared vCPUs, 2 GiB) and standard
+   `e2-custom-2-4096` (two fully billable vCPUs, 4 GiB), ask for the monthly
+   budget, and ask which long-lived domain to use when none was supplied. Select
+   or confirm the GCP region when it is not already clear. Copy
+   `examples/deployment.toml` outside the
    repository and replace all example values. Use
    `operator_ssh_cidr = "0.0.0.0/0"` unless the user chooses a stable narrower
    IPv4 CIDR. Never add secrets to the config.
