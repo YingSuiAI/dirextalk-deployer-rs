@@ -18,7 +18,7 @@ for service in postgres coturn message-server agent extension-runner core-runner
   [[ "$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}|{{ index .Config.Labels "com.docker.compose.service" }}|{{ .State.Status }}|{{ .State.Health.Status }}' "$container")" == "$stack|$service|running|healthy" ]]
 done
 edge=$stack-edge
-caddy=$(docker ps --quiet \
+caddy=$(docker ps --no-trunc --quiet \
   --filter "label=com.docker.compose.project=$edge" \
   --filter 'label=com.docker.compose.service=caddy')
 [[ "$caddy" =~ ^[0-9a-f]{64}$ ]]
