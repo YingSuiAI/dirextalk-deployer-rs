@@ -422,14 +422,11 @@ fn validate_outer(manifest: &ReleaseManifest, tag: &str, key: &str) -> Result<()
         ));
     }
     let expected_assets = BTreeSet::from([
-        "agent_secret_materializer",
         "caddyfile",
-        "capability_ca_initializer",
-        "compose_file",
-        "message_server_entrypoint",
-        "message_server_initializer",
-        "postgres_entrypoint",
-        "postgres_initializer",
+        "edge_compose_override",
+        "product_bootstrap_reader",
+        "runtime_verifier",
+        "split_runtime_archive",
         "updater_unit",
     ]);
     if provenance

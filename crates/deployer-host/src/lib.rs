@@ -43,9 +43,16 @@ const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const RUNTIME_ROOT: &str = "/var/dirextalk-message-server";
 #[cfg(target_os = "linux")]
-const COMPOSE_PATH: &str = "/var/dirextalk-message-server/docker-compose.yml";
+const SPLIT_OUTPUT_DIR: &str = "/var/dirextalk-message-server/split";
 #[cfg(target_os = "linux")]
-const COMPOSE_PROJECT: &str = "dirextalk-p2p";
+const COMPOSE_PATH: &str = "/var/dirextalk-message-server/deploy/split-agent/compose.yaml";
+#[cfg(target_os = "linux")]
+const COMPOSE_PRODUCTION_PATH: &str =
+    "/var/dirextalk-message-server/deploy/split-agent/compose.production.yaml";
+#[cfg(target_os = "linux")]
+const COMPOSE_ENV_PATH: &str = "/var/dirextalk-message-server/split/.env";
+#[cfg(target_os = "linux")]
+const COMPOSE_MANIFEST_PATH: &str = "/var/dirextalk-message-server/split/.manifest";
 const UPDATER_CONFIG: &[u8] = br#"{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","watchdog_enabled":false}"#;
 pub const MAX_ACCOUNT_GENERATION: u64 = (1_u64 << 53) - 1;
 
@@ -305,28 +312,22 @@ pub struct BundleFile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleRole {
-    ComposeFile,
     Caddyfile,
-    MessageServerInitializer,
-    AgentSecretMaterializer,
-    MessageServerEntrypoint,
-    CapabilityCaInitializer,
-    PostgresEntrypoint,
-    PostgresInitializer,
+    EdgeComposeOverride,
+    ProductBootstrapReader,
+    RuntimeVerifier,
+    SplitRuntimeArchive,
     UpdaterBinary,
     UpdaterUnit,
 }
 
 impl BundleRole {
-    const REQUIRED: [Self; 10] = [
-        Self::ComposeFile,
+    const REQUIRED: [Self; 7] = [
         Self::Caddyfile,
-        Self::MessageServerInitializer,
-        Self::AgentSecretMaterializer,
-        Self::MessageServerEntrypoint,
-        Self::CapabilityCaInitializer,
-        Self::PostgresEntrypoint,
-        Self::PostgresInitializer,
+        Self::EdgeComposeOverride,
+        Self::ProductBootstrapReader,
+        Self::RuntimeVerifier,
+        Self::SplitRuntimeArchive,
         Self::UpdaterBinary,
         Self::UpdaterUnit,
     ];
@@ -339,14 +340,11 @@ impl BundleRole {
     #[must_use]
     pub const fn archive_path(self) -> &'static str {
         match self {
-            Self::ComposeFile => "runtime/docker-compose.yml",
             Self::Caddyfile => "runtime/Caddyfile",
-            Self::MessageServerInitializer => "runtime/initialize-message-server.sh",
-            Self::AgentSecretMaterializer => "runtime/materialize-agent-secrets.sh",
-            Self::MessageServerEntrypoint => "runtime/message-server-entrypoint.sh",
-            Self::CapabilityCaInitializer => "runtime/initialize-capability-ca.sh",
-            Self::PostgresEntrypoint => "runtime/postgres-entrypoint.sh",
-            Self::PostgresInitializer => "runtime/initialize-postgres.sh",
+            Self::EdgeComposeOverride => "runtime/edge-compose.override.yaml",
+            Self::ProductBootstrapReader => "runtime/read-product-bootstrap.sh",
+            Self::RuntimeVerifier => "runtime/verify-runtime.sh",
+            Self::SplitRuntimeArchive => "runtime/split-agent-runtime.tar.gz",
             Self::UpdaterBinary => "updater/dirextalk-updater",
             Self::UpdaterUnit => "updater/dirextalk-updater.service",
         }
@@ -355,14 +353,9 @@ impl BundleRole {
     const fn mode(self) -> u32 {
         match self {
             Self::UpdaterBinary => 0o755,
-            Self::MessageServerInitializer
-            | Self::AgentSecretMaterializer
-            | Self::MessageServerEntrypoint
-            | Self::CapabilityCaInitializer
-            | Self::PostgresEntrypoint
-            | Self::PostgresInitializer => 0o555,
-            Self::Caddyfile => 0o444,
-            _ => 0o644,
+            Self::ProductBootstrapReader | Self::RuntimeVerifier => 0o555,
+            Self::Caddyfile | Self::EdgeComposeOverride | Self::SplitRuntimeArchive => 0o444,
+            Self::UpdaterUnit => 0o644,
         }
     }
 }
@@ -433,6 +426,13 @@ impl ImageReference {
                 )
             },
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tagged_reference(&self) -> Option<String> {
+        self.tag
+            .as_ref()
+            .map(|tag| format!("{}:{tag}", self.repository))
     }
 
     fn validate_repository_and_tag(&self) -> Result<(), InstallError> {
@@ -511,14 +511,11 @@ pub enum FixedStep {
     PullAgentImage,
     PullCaddyImage,
     PullCoturnImage,
-    InstallComposeFile,
     InstallCaddyfile,
-    InstallMessageServerInitializer,
-    InstallAgentSecretMaterializer,
-    InstallMessageServerEntrypoint,
-    InstallCapabilityCaInitializer,
-    InstallPostgresEntrypoint,
-    InstallPostgresInitializer,
+    InstallEdgeComposeOverride,
+    InstallProductBootstrapReader,
+    InstallRuntimeVerifier,
+    InstallSplitRuntimeArchive,
     InstallUpdaterBinary,
     InstallUpdaterConfig,
     InstallUpdaterControlToken,
@@ -537,7 +534,7 @@ pub enum FixedStep {
 }
 
 impl FixedStep {
-    const ALL: [Self; 30] = [
+    const ALL: [Self; 27] = [
         Self::InstallDocker,
         Self::PullPostgresImage,
         Self::PullUtilityImage,
@@ -545,14 +542,11 @@ impl FixedStep {
         Self::PullAgentImage,
         Self::PullCaddyImage,
         Self::PullCoturnImage,
-        Self::InstallComposeFile,
         Self::InstallCaddyfile,
-        Self::InstallMessageServerInitializer,
-        Self::InstallAgentSecretMaterializer,
-        Self::InstallMessageServerEntrypoint,
-        Self::InstallCapabilityCaInitializer,
-        Self::InstallPostgresEntrypoint,
-        Self::InstallPostgresInitializer,
+        Self::InstallEdgeComposeOverride,
+        Self::InstallProductBootstrapReader,
+        Self::InstallRuntimeVerifier,
+        Self::InstallSplitRuntimeArchive,
         Self::InstallUpdaterBinary,
         Self::InstallUpdaterConfig,
         Self::InstallUpdaterControlToken,
@@ -577,14 +571,11 @@ impl FixedStep {
 
     const fn bundle_role(self) -> Option<BundleRole> {
         match self {
-            Self::InstallComposeFile => Some(BundleRole::ComposeFile),
             Self::InstallCaddyfile => Some(BundleRole::Caddyfile),
-            Self::InstallMessageServerInitializer => Some(BundleRole::MessageServerInitializer),
-            Self::InstallAgentSecretMaterializer => Some(BundleRole::AgentSecretMaterializer),
-            Self::InstallMessageServerEntrypoint => Some(BundleRole::MessageServerEntrypoint),
-            Self::InstallCapabilityCaInitializer => Some(BundleRole::CapabilityCaInitializer),
-            Self::InstallPostgresEntrypoint => Some(BundleRole::PostgresEntrypoint),
-            Self::InstallPostgresInitializer => Some(BundleRole::PostgresInitializer),
+            Self::InstallEdgeComposeOverride => Some(BundleRole::EdgeComposeOverride),
+            Self::InstallProductBootstrapReader => Some(BundleRole::ProductBootstrapReader),
+            Self::InstallRuntimeVerifier => Some(BundleRole::RuntimeVerifier),
+            Self::InstallSplitRuntimeArchive => Some(BundleRole::SplitRuntimeArchive),
             Self::InstallUpdaterBinary => Some(BundleRole::UpdaterBinary),
             Self::InstallUpdaterUnit => Some(BundleRole::UpdaterUnit),
             _ => None,
@@ -985,14 +976,11 @@ struct VerifiedBundle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleAssets {
-    pub compose_file: Vec<u8>,
     pub caddyfile: Vec<u8>,
-    pub message_server_initializer: Vec<u8>,
-    pub agent_secret_materializer: Vec<u8>,
-    pub message_server_entrypoint: Vec<u8>,
-    pub capability_ca_initializer: Vec<u8>,
-    pub postgres_entrypoint: Vec<u8>,
-    pub postgres_initializer: Vec<u8>,
+    pub edge_compose_override: Vec<u8>,
+    pub product_bootstrap_reader: Vec<u8>,
+    pub runtime_verifier: Vec<u8>,
+    pub split_runtime_archive: Vec<u8>,
     pub updater_binary: Vec<u8>,
     pub updater_unit: Vec<u8>,
     pub updater_version: String,
@@ -1014,14 +1002,11 @@ pub struct BundleBuildRequest {
     pub schema_version: u32,
     pub release: String,
     pub images: Vec<ImageReference>,
-    pub compose_path: PathBuf,
     pub caddyfile_path: PathBuf,
-    pub message_server_initializer_path: PathBuf,
-    pub agent_secret_materializer_path: PathBuf,
-    pub message_server_entrypoint_path: PathBuf,
-    pub capability_ca_initializer_path: PathBuf,
-    pub postgres_entrypoint_path: PathBuf,
-    pub postgres_initializer_path: PathBuf,
+    pub edge_compose_override_path: PathBuf,
+    pub product_bootstrap_reader_path: PathBuf,
+    pub runtime_verifier_path: PathBuf,
+    pub split_runtime_archive_path: PathBuf,
     pub updater_binary_path: PathBuf,
     pub updater_unit_path: PathBuf,
     pub updater_version: String,
@@ -1048,26 +1033,20 @@ pub fn build_bundle(
         return Err(InstallError::NonCanonicalImages);
     }
     let artifacts = [
-        (BundleRole::ComposeFile, assets.compose_file),
         (BundleRole::Caddyfile, assets.caddyfile),
         (
-            BundleRole::MessageServerInitializer,
-            assets.message_server_initializer,
+            BundleRole::EdgeComposeOverride,
+            assets.edge_compose_override,
         ),
         (
-            BundleRole::AgentSecretMaterializer,
-            assets.agent_secret_materializer,
+            BundleRole::ProductBootstrapReader,
+            assets.product_bootstrap_reader,
         ),
+        (BundleRole::RuntimeVerifier, assets.runtime_verifier),
         (
-            BundleRole::MessageServerEntrypoint,
-            assets.message_server_entrypoint,
+            BundleRole::SplitRuntimeArchive,
+            assets.split_runtime_archive,
         ),
-        (
-            BundleRole::CapabilityCaInitializer,
-            assets.capability_ca_initializer,
-        ),
-        (BundleRole::PostgresEntrypoint, assets.postgres_entrypoint),
-        (BundleRole::PostgresInitializer, assets.postgres_initializer),
         (BundleRole::UpdaterBinary, assets.updater_binary),
         (BundleRole::UpdaterUnit, assets.updater_unit),
     ];
@@ -1345,6 +1324,10 @@ impl InstallBackend for LinuxBackend {
                         "docker-compose-v2",
                         "curl",
                         "dnsutils",
+                        "jq",
+                        "openssl",
+                        "apparmor",
+                        "apparmor-utils",
                     ],
                 )?;
                 run_program("/usr/bin/systemctl", &["enable", "--now", "docker.service"])?;
@@ -1362,13 +1345,17 @@ impl InstallBackend for LinuxBackend {
                 }
                 let digest_reference = image.digest_reference();
                 run_program("/usr/bin/docker", &["pull", &digest_reference])?;
-            }
-            FixedStep::InstallComposeFile => {
-                install_file(
-                    input.artifact()?,
-                    "/var/dirextalk-message-server/docker-compose.yml",
-                    0o600,
-                )?;
+                if matches!(image.role, ImageRole::MessageServer | ImageRole::Agent) {
+                    let tagged_reference = image.tagged_reference().ok_or_else(|| {
+                        BackendError::Infrastructure(
+                            "application image lacks its immutable release tag".into(),
+                        )
+                    })?;
+                    run_program(
+                        "/usr/bin/docker",
+                        &["image", "tag", &digest_reference, &tagged_reference],
+                    )?;
+                }
             }
             FixedStep::InstallCaddyfile => {
                 install_file(
@@ -1377,34 +1364,29 @@ impl InstallBackend for LinuxBackend {
                     0o444,
                 )?;
             }
-            step @ (FixedStep::InstallMessageServerInitializer
-            | FixedStep::InstallAgentSecretMaterializer
-            | FixedStep::InstallMessageServerEntrypoint
-            | FixedStep::InstallCapabilityCaInitializer
-            | FixedStep::InstallPostgresEntrypoint
-            | FixedStep::InstallPostgresInitializer) => {
-                let destination = match step {
-                    FixedStep::InstallMessageServerInitializer => {
-                        "/var/dirextalk-message-server/runtime/initialize-message-server.sh"
-                    }
-                    FixedStep::InstallAgentSecretMaterializer => {
-                        "/var/dirextalk-message-server/runtime/materialize-agent-secrets.sh"
-                    }
-                    FixedStep::InstallMessageServerEntrypoint => {
-                        "/var/dirextalk-message-server/runtime/message-server-entrypoint.sh"
-                    }
-                    FixedStep::InstallCapabilityCaInitializer => {
-                        "/var/dirextalk-message-server/runtime/initialize-capability-ca.sh"
-                    }
-                    FixedStep::InstallPostgresEntrypoint => {
-                        "/var/dirextalk-message-server/runtime/postgres-entrypoint.sh"
-                    }
-                    FixedStep::InstallPostgresInitializer => {
-                        "/var/dirextalk-message-server/runtime/initialize-postgres.sh"
-                    }
-                    _ => unreachable!("guard restricts fixed helper step"),
-                };
-                install_file(input.artifact()?, destination, 0o555)?;
+            FixedStep::InstallEdgeComposeOverride => {
+                install_file(
+                    input.artifact()?,
+                    "/var/dirextalk-message-server/runtime/edge-compose.override.yaml",
+                    0o444,
+                )?;
+            }
+            FixedStep::InstallProductBootstrapReader => {
+                install_file(
+                    input.artifact()?,
+                    "/usr/local/libexec/dirextalk/read-product-bootstrap.sh",
+                    0o555,
+                )?;
+            }
+            FixedStep::InstallRuntimeVerifier => {
+                install_file(
+                    input.artifact()?,
+                    "/usr/local/libexec/dirextalk/verify-runtime.sh",
+                    0o555,
+                )?;
+            }
+            FixedStep::InstallSplitRuntimeArchive => {
+                install_split_runtime(input.artifact()?)?;
             }
             FixedStep::InstallUpdaterBinary => {
                 install_file(input.artifact()?, "/usr/local/bin/dirextalk-updater", 0o755)?;
@@ -1443,40 +1425,15 @@ impl InstallBackend for LinuxBackend {
                 verify_updater_binary(&runtime.request.updater)?;
             }
             FixedStep::StartMessageServer => {
-                run_compose(&[
-                    "up",
-                    "--detach",
-                    "--no-build",
-                    "--pull",
-                    "never",
-                    "--wait",
-                    "message-server",
-                ])?;
+                run_program(
+                    "/var/dirextalk-message-server/deploy/split-agent/scripts/start-local.sh",
+                    &[COMPOSE_ENV_PATH],
+                )?;
             }
             FixedStep::RefreshAgentToken => refresh_agent_token()?,
-            FixedStep::StartAgent => {
-                run_compose(&[
-                    "up",
-                    "--detach",
-                    "--no-build",
-                    "--pull",
-                    "never",
-                    "--wait",
-                    "agent",
-                ])?;
-            }
+            FixedStep::StartAgent => verify_agent_trio()?,
             FixedStep::VerifyDns => verify_dns(input.runtime()?.request)?,
-            FixedStep::StartCaddy => {
-                run_compose(&[
-                    "up",
-                    "--detach",
-                    "--no-build",
-                    "--pull",
-                    "never",
-                    "--wait",
-                    "caddy",
-                ])?;
-            }
+            FixedStep::StartCaddy => start_edge(input.runtime()?)?,
             FixedStep::VerifyRuntime => verify_runtime_services()?,
             FixedStep::VerifyHttps => verify_https(input.runtime()?)?,
             FixedStep::VerifyTurn => verify_turn_acceptance(input.runtime()?.request)?,
@@ -1492,6 +1449,8 @@ impl InstallBackend for LinuxBackend {
                         "pinned updater is not active".into(),
                     ));
                 }
+                verify_updater_control_api()?;
+                verify_update_scripts(runtime)?;
             }
             _ => return Err(BackendError::Infrastructure("invalid fixed step".into())),
         }
@@ -1504,164 +1463,226 @@ impl InstallBackend for LinuxBackend {
 }
 
 #[cfg(target_os = "linux")]
-fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
-    ensure_secure_directory(Path::new(RUNTIME_ROOT), 0o700)?;
-    ensure_secure_directory(Path::new("/var/dirextalk-message-server/runtime"), 0o700)?;
-    ensure_secure_directory(Path::new("/var/dirextalk-message-server/secrets"), 0o700)?;
-
-    let postgres_admin = read_or_create_hex_secret("postgres_admin_password", 24, 0o400)?;
-    let message_password = read_or_create_hex_secret("message_postgres_password", 24, 0o400)?;
-    let agent_password = read_or_create_hex_secret("agent_postgres_password", 24, 0o400)?;
-    let registration = read_or_create_hex_secret("message_registration_shared_secret", 32, 0o600)?;
-    let turn = read_or_create_hex_secret("turn_shared_secret", 32, 0o600)?;
-    let portal = read_or_create_numeric_secret("message_portal_password", 8)?;
-    let master = read_or_create_raw_secret("core_secret_master_key", 32)?;
-    let mcp_path = runtime_secret_path("message_mcp_token");
-    if mcp_path.exists() {
-        read_runtime_secret(&mcp_path, 4096)?;
-    } else {
-        create_secret_noclobber(&mcp_path, b"")?;
+fn install_split_runtime(bytes: &[u8]) -> Result<(), BackendError> {
+    const MAX_EXPANDED_BYTES: u64 = 16 * 1024 * 1024;
+    let mut expanded = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .take(MAX_EXPANDED_BYTES + 1)
+        .read_to_end(&mut expanded)
+        .map_err(|error| BackendError::Infrastructure(format!("decode split runtime: {error}")))?;
+    if expanded.len() as u64 > MAX_EXPANDED_BYTES {
+        return Err(BackendError::Infrastructure(
+            "split runtime archive exceeds its expanded size limit".into(),
+        ));
     }
-
-    let message_database = Zeroizing::new(format!(
-        "postgresql://dirextalk_message_server:{}@message-postgres:5432/dirextalk_message_server?sslmode=disable",
-        String::from_utf8_lossy(&message_password)
-    ));
-    let agent_database = Zeroizing::new(format!(
-        "postgresql://dirextalk_agent:{}@agent-postgres:5432/dirextalk_agent?sslmode=disable",
-        String::from_utf8_lossy(&agent_password)
-    ));
-    atomic_write(
-        &runtime_secret_path("message_database_url"),
-        message_database.as_bytes(),
-        0o600,
-    )?;
-    atomic_write(
-        &runtime_secret_path("agent_database_url"),
-        agent_database.as_bytes(),
-        0o600,
-    )?;
-
-    let turn_config = Zeroizing::new(render_turn_config(runtime.request, &turn));
-    atomic_write(
-        &runtime_secret_path("turnserver.conf"),
-        turn_config.as_bytes(),
-        0o600,
-    )?;
-
-    let message_instance = derived_instance_id(runtime.request.deployment_uuid, b"message-server");
-    let agent_instance = derived_instance_id(runtime.request.deployment_uuid, b"agent");
-    let env = render_runtime_env(runtime, message_instance, agent_instance)?;
-    atomic_write(
-        Path::new("/var/dirextalk-message-server/.env"),
-        env.as_bytes(),
-        0o600,
-    )?;
-    let agent_config = render_agent_config(runtime.request, agent_instance);
-    atomic_write(
-        Path::new("/var/dirextalk-message-server/agent-config.yaml"),
-        agent_config.as_bytes(),
-        0o600,
-    )?;
-
-    drop((postgres_admin, registration, portal, master));
+    ensure_secure_directory(Path::new(RUNTIME_ROOT), 0o700)?;
+    let prefix = Path::new("deploy/split-agent");
+    let required = BTreeSet::from([
+        "deploy/split-agent/SOURCE_FILES.sha256".to_owned(),
+        "deploy/split-agent/SOURCE_REVISION".to_owned(),
+        "deploy/split-agent/compose.production.yaml".to_owned(),
+        "deploy/split-agent/compose.yaml".to_owned(),
+        "deploy/split-agent/edge-compose.yaml".to_owned(),
+        "deploy/split-agent/scripts/prepare-runner-cgroups.sh".to_owned(),
+        "deploy/split-agent/scripts/provision-local.sh".to_owned(),
+        "deploy/split-agent/scripts/start-local.sh".to_owned(),
+        "deploy/split-agent/scripts/update-agent-local.sh".to_owned(),
+    ]);
+    let mut observed = BTreeSet::new();
+    let mut archive = tar::Archive::new(Cursor::new(expanded));
+    for entry in archive
+        .entries()
+        .map_err(|error| BackendError::Infrastructure(format!("read split runtime: {error}")))?
+    {
+        let mut entry = entry.map_err(|error| {
+            BackendError::Infrastructure(format!("read split runtime entry: {error}"))
+        })?;
+        let path = entry
+            .path()
+            .map_err(|error| {
+                BackendError::Infrastructure(format!("read split runtime path: {error}"))
+            })?
+            .into_owned();
+        if !path.starts_with(prefix)
+            || !matches!(
+                entry.header().entry_type(),
+                tar::EntryType::Regular | tar::EntryType::Directory
+            )
+        {
+            return Err(BackendError::Infrastructure(
+                "split runtime archive contains a non-canonical entry".into(),
+            ));
+        }
+        observed.insert(path.to_string_lossy().into_owned());
+        entry.unpack_in(RUNTIME_ROOT).map_err(|error| {
+            BackendError::Infrastructure(format!("install split runtime entry: {error}"))
+        })?;
+    }
+    if !required.is_subset(&observed) || observed.len() < 20 {
+        return Err(BackendError::Infrastructure(
+            "split runtime archive is incomplete".into(),
+        ));
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn render_turn_config(request: &InstallRequest, shared_secret: &[u8]) -> String {
-    format!(
-        "listening-port=3478\nmin-port=49160\nmax-port=49200\nrealm={}\nexternal-ip={}\nfingerprint\nuse-auth-secret\nstatic-auth-secret={}\nstale-nonce=600\nno-cli\nno-multicast-peers\nno-tls\nno-dtls\npidfile=/tmp/turnserver.pid\n",
-        request.domain,
-        request.public_ipv4,
-        String::from_utf8_lossy(shared_secret)
-    )
-}
+#[allow(clippy::too_many_lines)]
+fn materialize_runtime(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
+    ensure_secure_directory(Path::new(RUNTIME_ROOT), 0o700)?;
+    let split = Path::new("/var/dirextalk-message-server/deploy/split-agent");
+    let runner_root = Path::new("/usr/local/libexec/dirextalk/split-agent");
+    for (source, destination, mode) in [
+        (
+            "scripts/prepare-runner-cgroups.sh",
+            "scripts/prepare-runner-cgroups.sh",
+            0o555,
+        ),
+        (
+            "scripts/manage-runner-apparmor.sh",
+            "scripts/manage-runner-apparmor.sh",
+            0o555,
+        ),
+        (
+            "systemd/dirextalk-extension-runner@.service",
+            "systemd/dirextalk-extension-runner@.service",
+            0o444,
+        ),
+        (
+            "systemd/dirextalk-core-runner@.service",
+            "systemd/dirextalk-core-runner@.service",
+            0o444,
+        ),
+        (
+            "sysusers.d/dirextalk-split-agent.conf",
+            "sysusers.d/dirextalk-split-agent.conf",
+            0o444,
+        ),
+        (
+            "apparmor.d/dirextalk-runner-userns",
+            "apparmor.d/dirextalk-runner-userns",
+            0o444,
+        ),
+    ] {
+        let bytes = fs::read(split.join(source)).map_err(|error| {
+            BackendError::Infrastructure(format!("read split runner asset: {error}"))
+        })?;
+        install_file(
+            &bytes,
+            runner_root.join(destination).to_str().ok_or_else(|| {
+                BackendError::Infrastructure("split runner path is invalid".into())
+            })?,
+            mode,
+        )?;
+    }
+    run_program(
+        split
+            .join("scripts/prepare-host-dependencies.sh")
+            .to_str()
+            .ok_or_else(|| BackendError::Infrastructure("split helper path is invalid".into()))?,
+        &[],
+    )?;
 
-#[cfg(target_os = "linux")]
-fn render_runtime_env(
-    runtime: RuntimeSpec<'_>,
-    message_instance: Uuid,
-    agent_instance: Uuid,
-) -> Result<String, BackendError> {
+    let message_instance = derived_instance_id(runtime.request.deployment_uuid, b"message-server");
+    let agent_instance = derived_instance_id(runtime.request.deployment_uuid, b"agent");
+    let stack = split_stack_name(runtime.request.deployment_uuid);
+    let preparation = run_program(
+        "/usr/local/libexec/dirextalk/split-agent/scripts/prepare-runner-cgroups.sh",
+        &[&stack],
+    )?;
+    atomic_write(
+        Path::new("/var/dirextalk-message-server/runner-preparation.env"),
+        &preparation.stdout,
+        0o400,
+    )?;
+    let mut environment = parse_environment_receipt(&preparation.stdout)?;
     let image = |role| {
         runtime
             .images
             .get(&role)
-            .map(ImageReference::digest_reference)
             .ok_or_else(|| BackendError::Infrastructure("signed runtime image is missing".into()))
     };
-    Ok(format!(
-        "POSTGRES_IMAGE={}\nUTILITY_IMAGE={}\nMESSAGE_SERVER_IMAGE={}\nAGENT_IMAGE={}\nCADDY_IMAGE={}\nCOTURN_IMAGE={}\nDOMAIN={}\nMESSAGE_SERVER_INSTANCE_ID={}\nAGENT_INSTANCE_ID={}\nACCOUNT_GENERATION={}\nRELEASE_CATALOG_ORIGIN={}\n",
-        image(ImageRole::Postgres)?,
-        image(ImageRole::Utility)?,
-        image(ImageRole::MessageServer)?,
-        image(ImageRole::Agent)?,
-        image(ImageRole::Caddy)?,
-        image(ImageRole::Coturn)?,
-        runtime.request.domain,
-        message_instance,
-        agent_instance,
-        runtime.request.account_generation,
-        runtime.request.release_catalog_origin,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn render_agent_config(request: &InstallRequest, agent_instance: Uuid) -> String {
-    format!(
-        "instance_id: {agent_instance}\ndatabase_url_file: /run/secrets/database_url\ngrpc_listen: \":9443\"\nagent_http_enabled: true\nagent_http_listen: 0.0.0.0:8082\ntls_cert_file: /run/secrets/tls_cert\ntls_key_file: /run/secrets/tls_key\nservice_token_file: /run/secrets/service_token\ncore_voice_callback_relay_token_file: /run/secrets/voice_relay_token\nenable_health_service: true\nenable_reflection: false\ncapability_grant_public_key_file: /run/secrets/grant_public_key\ncapability_account_generation: {}\nproduct_capability_enabled: true\nproduct_capability_address: message-server:50053\nproduct_capability_ca_cert_file: /run/secrets/product_ca\nproduct_capability_tls_cert_file: /run/secrets/product_tls_cert\nproduct_capability_tls_key_file: /run/secrets/product_tls_key\nproduct_capability_token_file: /run/secrets/agent_to_ms_token\nproduct_capability_server_name: dirextalk-message-server\nproduct_capability_instance_id: {agent_instance}\nproduct_capability_account_generation: {}\ncore_task_max_concurrency: 4\ncore_task_lease_ttl: 30s\ncore_schedule_sweep_interval: 1s\ncore_shutdown_grace: 30s\ncore_extension_enabled: false\ncore_extension_staging_root: /var/lib/dirextalk-agent/extension-staging\ncore_message_mcp_enabled: true\ncore_message_mcp_endpoint: http://message-server:8008/mcp\ncore_message_mcp_token_file: /run/secrets/message_mcp_token\ncore_static_sites_enabled: false\ncore_workload_enabled: false\ncore_secret_master_key_file: /run/secrets/core_secret_master_key\ncore_secret_master_key_version: 1\ncore_knowledge_enabled: false\n",
-        request.account_generation, request.account_generation
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_secret_path(name: &str) -> PathBuf {
-    Path::new("/var/dirextalk-message-server/secrets").join(name)
-}
-
-#[cfg(target_os = "linux")]
-fn read_or_create_hex_secret(
-    name: &str,
-    random_bytes: usize,
-    mode: u32,
-) -> Result<Zeroizing<Vec<u8>>, BackendError> {
-    let path = runtime_secret_path(name);
-    if path.exists() {
-        let bytes = Zeroizing::new(
-            read_stable_regular(&path, Some(0), Some(mode), random_bytes * 2).map_err(|error| {
-                BackendError::Infrastructure(format!("read protected runtime state: {error}"))
+    let application = |role| {
+        let image = image(role)?;
+        Ok::<_, BackendError>((
+            image.tagged_reference().ok_or_else(|| {
+                BackendError::Infrastructure("application release tag is missing".into())
             })?,
-        );
-        if bytes.len() != random_bytes * 2
-            || !bytes
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-        {
-            return Err(BackendError::Infrastructure(format!(
-                "{name} has invalid protected state"
-            )));
-        }
-        return Ok(bytes);
-    }
-    let mut random = Zeroizing::new(vec![0_u8; random_bytes]);
-    fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut random))
-        .map_err(|error| BackendError::Infrastructure(format!("read OS RNG: {error}")))?;
-    let encoded = Zeroizing::new(hex::encode(&*random).into_bytes());
-    create_secret_noclobber_with_mode(&path, &encoded, mode)?;
-    Ok(encoded)
+            image.tag.clone().ok_or_else(|| {
+                BackendError::Infrastructure("application release version is missing".into())
+            })?,
+            image.source_revision.clone().ok_or_else(|| {
+                BackendError::Infrastructure("application source revision is missing".into())
+            })?,
+        ))
+    };
+    let (message_image, message_version, message_revision) = application(ImageRole::MessageServer)?;
+    let (agent_image, agent_version, agent_revision) = application(ImageRole::Agent)?;
+    environment.extend([
+        ("DIREXTALK_SPLIT_STACK_NAME".into(), stack),
+        ("DIREXTALK_SPLIT_COMPOSE_MODE".into(), "production".into()),
+        (
+            "DIREXTALK_MESSAGE_TLS_MODE".into(),
+            "edge-terminated".into(),
+        ),
+        (
+            "DIREXTALK_MESSAGE_SERVER_NAME".into(),
+            runtime.request.domain.clone(),
+        ),
+        ("DIREXTALK_CORE_EXTENSION_ENABLED".into(), "true".into()),
+        ("DIREXTALK_CORE_WORKLOAD_ENABLED".into(), "true".into()),
+        ("DIREXTALK_MESSAGE_SERVER_IMAGE".into(), message_image),
+        ("DIREXTALK_AGENT_IMAGE".into(), agent_image),
+        ("DIREXTALK_MESSAGE_SERVER_VERSION".into(), message_version),
+        ("DIREXTALK_MESSAGE_SOURCE_REVISION".into(), message_revision),
+        ("DIREXTALK_AGENT_VERSION".into(), agent_version),
+        ("DIREXTALK_AGENT_SOURCE_REVISION".into(), agent_revision),
+        (
+            "DIREXTALK_POSTGRES_IMAGE_IMMUTABLE".into(),
+            image(ImageRole::Postgres)?.digest_reference(),
+        ),
+        (
+            "DIREXTALK_UTILITY_IMAGE_IMMUTABLE".into(),
+            image(ImageRole::Utility)?.digest_reference(),
+        ),
+        (
+            "DIREXTALK_COTURN_IMAGE_IMMUTABLE".into(),
+            image(ImageRole::Coturn)?.digest_reference(),
+        ),
+        (
+            "DIREXTALK_RELEASE_CATALOG_ORIGIN".into(),
+            runtime.request.release_catalog_origin.clone(),
+        ),
+        (
+            "DIREXTALK_TURN_EXTERNAL_IP".into(),
+            runtime.request.public_ipv4.to_string(),
+        ),
+        (
+            "DIREXTALK_CLOUD_WORKER_HOST_REGION".into(),
+            "disabled".into(),
+        ),
+        (
+            "DIREXTALK_MESSAGE_SERVER_INSTANCE_ID".into(),
+            message_instance.to_string(),
+        ),
+        (
+            "DIREXTALK_AGENT_INSTANCE_ID".into(),
+            agent_instance.to_string(),
+        ),
+        (
+            "DIREXTALK_ACCOUNT_GENERATION".into(),
+            runtime.request.account_generation.to_string(),
+        ),
+    ]);
+    run_program_with_env(
+        "/var/dirextalk-message-server/deploy/split-agent/scripts/provision-local.sh",
+        &["/var/dirextalk-message-server/split"],
+        &environment,
+    )?;
+    Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn read_or_create_numeric_secret(
-    name: &str,
-    digits: usize,
-) -> Result<Zeroizing<Vec<u8>>, BackendError> {
-    read_or_create_numeric_secret_at(&runtime_secret_path(name), digits, 0)
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn read_or_create_numeric_secret_at(
     path: &Path,
     digits: usize,
@@ -1709,39 +1730,12 @@ fn read_or_create_numeric_secret_at(
     Ok(secret)
 }
 
-#[cfg(target_os = "linux")]
-fn read_or_create_raw_secret(name: &str, size: usize) -> Result<Zeroizing<Vec<u8>>, BackendError> {
-    let path = runtime_secret_path(name);
-    if path.exists() {
-        let bytes = Zeroizing::new(read_runtime_secret(&path, size)?);
-        if bytes.len() != size {
-            return Err(BackendError::Infrastructure(format!(
-                "{name} has invalid protected state"
-            )));
-        }
-        return Ok(bytes);
-    }
-    let mut bytes = Zeroizing::new(vec![0_u8; size]);
-    fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .map_err(|error| BackendError::Infrastructure(format!("read OS RNG: {error}")))?;
-    create_secret_noclobber(&path, &bytes)?;
-    Ok(bytes)
-}
-
-#[cfg(target_os = "linux")]
-fn read_runtime_secret(path: &Path, maximum: usize) -> Result<Vec<u8>, BackendError> {
-    read_stable_regular(path, Some(0), Some(0o600), maximum).map_err(|error| {
-        BackendError::Infrastructure(format!("read protected runtime state: {error}"))
-    })
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn create_secret_noclobber(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
     create_secret_noclobber_with_mode(path, bytes, 0o600)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn create_secret_noclobber_with_mode(
     path: &Path,
     bytes: &[u8],
@@ -1796,16 +1790,92 @@ fn derived_instance_id(deployment: Uuid, label: &[u8]) -> Uuid {
 }
 
 #[cfg(target_os = "linux")]
+fn split_stack_name(deployment: Uuid) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut encoded = String::with_capacity(26);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    for byte in deployment.as_bytes() {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            encoded.push(char::from(ALPHABET[((accumulator >> bits) & 31) as usize]));
+        }
+    }
+    if bits != 0 {
+        encoded.push(char::from(
+            ALPHABET[((accumulator << (5 - bits)) & 31) as usize],
+        ));
+    }
+    format!("d-{encoded}")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_environment_receipt(bytes: &[u8]) -> Result<BTreeMap<String, String>, BackendError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        BackendError::Infrastructure("runner preparation receipt is not UTF-8".into())
+    })?;
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            BackendError::Infrastructure("runner preparation receipt is malformed".into())
+        })?;
+        if !key.starts_with("DIREXTALK_")
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || value.is_empty()
+            || values.insert(key.to_owned(), value.to_owned()).is_some()
+        {
+            return Err(BackendError::Infrastructure(
+                "runner preparation receipt contains an invalid pair".into(),
+            ));
+        }
+    }
+    if values.len() < 20 {
+        return Err(BackendError::Infrastructure(
+            "runner preparation receipt is incomplete".into(),
+        ));
+    }
+    Ok(values)
+}
+
+#[cfg(target_os = "linux")]
 fn run_compose(arguments: &[&str]) -> Result<std::process::Output, BackendError> {
+    let project = read_split_control_pair(COMPOSE_MANIFEST_PATH, "stack_name")?;
     let mut fixed = vec![
         "compose",
+        "--env-file",
+        COMPOSE_ENV_PATH,
         "--project-name",
-        COMPOSE_PROJECT,
+        &project,
         "--file",
         COMPOSE_PATH,
+        "--file",
+        COMPOSE_PRODUCTION_PATH,
     ];
     fixed.extend_from_slice(arguments);
     run_program("/usr/bin/docker", &fixed)
+}
+
+#[cfg(target_os = "linux")]
+fn read_split_control_pair(path: &str, key: &str) -> Result<String, BackendError> {
+    let bytes = read_stable_regular(Path::new(path), Some(0), Some(0o400), 1024 * 1024)
+        .map_err(|error| BackendError::Infrastructure(format!("read split control: {error}")))?;
+    let prefix = format!("{key}=");
+    let text = String::from_utf8_lossy(&bytes);
+    let mut matches = text.lines().filter_map(|line| line.strip_prefix(&prefix));
+    let value = matches
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| BackendError::Infrastructure(format!("split control lacks {key}")))?;
+    if matches.next().is_some() {
+        return Err(BackendError::Infrastructure(format!(
+            "split control contains duplicate {key}"
+        )));
+    }
+    Ok(value.to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -1819,7 +1889,6 @@ struct BootstrapCredentials {
 #[cfg(target_os = "linux")]
 struct BootstrapSecrets {
     access_token: Zeroizing<String>,
-    agent_token: Zeroizing<String>,
     password: Zeroizing<String>,
 }
 
@@ -1873,7 +1942,6 @@ fn read_bootstrap_credentials() -> Result<BootstrapSecrets, BackendError> {
     }
     Ok(BootstrapSecrets {
         access_token: Zeroizing::new(credentials.access_token),
-        agent_token: Zeroizing::new(credentials.agent_token),
         password: Zeroizing::new(credentials.password),
     })
 }
@@ -1881,6 +1949,17 @@ fn read_bootstrap_credentials() -> Result<BootstrapSecrets, BackendError> {
 #[cfg(target_os = "linux")]
 fn verify_exact_container(
     id: &str,
+    service: &str,
+    require_healthy: bool,
+) -> Result<(), BackendError> {
+    let project = read_split_control_pair(COMPOSE_MANIFEST_PATH, "stack_name")?;
+    verify_project_container(id, &project, service, require_healthy)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_project_container(
+    id: &str,
+    project: &str,
     service: &str,
     require_healthy: bool,
 ) -> Result<(), BackendError> {
@@ -1902,7 +1981,7 @@ fn verify_exact_container(
         .pointer("/State/Health/Status")
         .and_then(serde_json::Value::as_str);
     if value.get("Id").and_then(serde_json::Value::as_str) != Some(id)
-        || label("com.docker.compose.project") != Some(COMPOSE_PROJECT)
+        || label("com.docker.compose.project") != Some(project)
         || label("com.docker.compose.service") != Some(service)
         || value
             .pointer("/State/Status")
@@ -1919,12 +1998,81 @@ fn verify_exact_container(
 
 #[cfg(target_os = "linux")]
 fn refresh_agent_token() -> Result<(), BackendError> {
-    let credentials = read_bootstrap_credentials()?;
-    atomic_write(
-        &runtime_secret_path("message_mcp_token"),
-        credentials.agent_token.as_bytes(),
-        0o600,
-    )
+    let _ = read_bootstrap_credentials()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_agent_trio() -> Result<(), BackendError> {
+    for service in ["agent", "extension-runner", "core-runner"] {
+        let output = run_compose(&["ps", "--quiet", service])?;
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(BackendError::Infrastructure(format!(
+                "{service} container identity is invalid"
+            )));
+        }
+        verify_exact_container(&id, service, true)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_edge(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
+    let stack = read_split_control_pair(COMPOSE_MANIFEST_PATH, "stack_name")?;
+    let static_sites = read_split_control_pair(COMPOSE_ENV_PATH, "DIREXTALK_STATIC_SITES_ROOT")?;
+    let caddy = runtime
+        .images
+        .get(&ImageRole::Caddy)
+        .ok_or_else(|| BackendError::Infrastructure("signed Caddy image is missing".into()))?;
+    let edge_project = format!("{stack}-edge");
+    let caddy_data = format!("{stack}-caddy-data");
+    let caddy_config = format!("{stack}-caddy-config");
+    run_program("/usr/bin/docker", &["volume", "create", &caddy_data])?;
+    run_program("/usr/bin/docker", &["volume", "create", &caddy_config])?;
+    let environment = BTreeMap::from([
+        ("DIREXTALK_EDGE_STACK_NAME".into(), edge_project.clone()),
+        (
+            "DIREXTALK_PUBLIC_DOMAIN".into(),
+            runtime.request.domain.clone(),
+        ),
+        (
+            "DIREXTALK_MESSAGE_PUBLIC_NETWORK".into(),
+            format!("{stack}-message-public"),
+        ),
+        (
+            "DIREXTALK_CADDY_IMAGE_IMMUTABLE".into(),
+            caddy.digest_reference(),
+        ),
+        ("DIREXTALK_CADDY_DATA_VOLUME".into(), caddy_data),
+        ("DIREXTALK_CADDY_CONFIG_VOLUME".into(), caddy_config),
+        (
+            "DIREXTALK_CADDYFILE".into(),
+            "/var/dirextalk-message-server/runtime/Caddyfile".into(),
+        ),
+        ("DIREXTALK_STATIC_SITES_ROOT".into(), static_sites),
+    ]);
+    run_program_with_env(
+        "/usr/bin/docker",
+        &[
+            "compose",
+            "--project-name",
+            &edge_project,
+            "--file",
+            "/var/dirextalk-message-server/deploy/split-agent/edge-compose.yaml",
+            "--file",
+            "/var/dirextalk-message-server/runtime/edge-compose.override.yaml",
+            "up",
+            "--detach",
+            "--no-build",
+            "--pull",
+            "never",
+            "--wait",
+            "caddy",
+        ],
+        &environment,
+    )?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2118,19 +2266,31 @@ fn verify_runtime_services() -> Result<(), BackendError> {
     let expected = BTreeSet::from([
         "postgres",
         "coturn",
-        "message-init",
+        "message-server-init",
         "message-server",
         "agent-secret-init",
         "agent-migrate",
         "agent",
-        "caddy",
+        "extension-runner",
+        "extension-socket-init",
+        "extension-runner-storage-init",
+        "core-runner",
+        "core-runner-socket-init",
+        "core-runner-storage-init",
     ]);
     if records.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
         return Err(BackendError::Infrastructure(
             "Compose service set is not canonical".into(),
         ));
     }
-    for service in ["postgres", "coturn", "message-server", "agent"] {
+    for service in [
+        "postgres",
+        "coturn",
+        "message-server",
+        "agent",
+        "extension-runner",
+        "core-runner",
+    ] {
         let value = &records[service];
         if json_string(value, "State") != Some("running")
             || json_string(value, "Health") != Some("healthy")
@@ -2140,10 +2300,15 @@ fn verify_runtime_services() -> Result<(), BackendError> {
             )));
         }
     }
-    if json_string(&records["caddy"], "State") != Some("running") {
-        return Err(BackendError::Infrastructure("caddy is not running".into()));
-    }
-    for service in ["message-init", "agent-secret-init", "agent-migrate"] {
+    for service in [
+        "message-server-init",
+        "agent-secret-init",
+        "agent-migrate",
+        "extension-socket-init",
+        "extension-runner-storage-init",
+        "core-runner-socket-init",
+        "core-runner-storage-init",
+    ] {
         let value = &records[service];
         let exit_code = value
             .get("ExitCode")
@@ -2155,6 +2320,26 @@ fn verify_runtime_services() -> Result<(), BackendError> {
             )));
         }
     }
+    let stack = read_split_control_pair(COMPOSE_MANIFEST_PATH, "stack_name")?;
+    let edge_project = format!("{stack}-edge");
+    let output = run_program(
+        "/usr/bin/docker",
+        &[
+            "ps",
+            "--quiet",
+            "--filter",
+            &format!("label=com.docker.compose.project={edge_project}"),
+            "--filter",
+            "label=com.docker.compose.service=caddy",
+        ],
+    )?;
+    let caddy_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if caddy_id.len() != 64 || !caddy_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BackendError::Infrastructure(
+            "caddy container identity is invalid".into(),
+        ));
+    }
+    verify_project_container(&caddy_id, &edge_project, "caddy", true)?;
     Ok(())
 }
 
@@ -2203,6 +2388,107 @@ fn verify_updater_binary(expected: &UpdaterIdentity) -> Result<(), BackendError>
         return Err(BackendError::Infrastructure(
             "installed updater digest changed".into(),
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_updater_control_api() -> Result<(), BackendError> {
+    let token = Zeroizing::new(
+        read_stable_regular(
+            Path::new("/etc/dirextalk-updater/control-token"),
+            Some(0),
+            Some(0o600),
+            64,
+        )
+        .map_err(|error| {
+            BackendError::Infrastructure(format!("read updater control token: {error}"))
+        })?,
+    );
+    if token.len() != 64
+        || !token
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(BackendError::Infrastructure(
+            "updater control token is invalid".into(),
+        ));
+    }
+    let config = Zeroizing::new(format!(
+        "header = \"X-Dirextalk-Control-Token: {}\"\nheader = \"Content-Type: application/json\"\ndata = \"{{}}\"\n",
+        String::from_utf8_lossy(&token)
+    ));
+    let output = run_program_with_input(
+        "/usr/bin/curl",
+        &[
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "--max-filesize",
+            "65536",
+            "--config",
+            "-",
+            "--unix-socket",
+            "/run/dirextalk-updater/http.sock",
+            "http://localhost/_dirextalk/updater/v1/control/status",
+        ],
+        config.as_bytes(),
+    )?;
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| BackendError::Infrastructure("updater status is invalid".into()))?;
+    if status.get("available").and_then(serde_json::Value::as_bool) != Some(true)
+        || status
+            .get("updater_ready")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || status
+            .get("desired_state")
+            .and_then(serde_json::Value::as_str)
+            != Some("running")
+        || status
+            .get("active_job")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(BackendError::Infrastructure(
+            "updater control API is not ready".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_update_scripts(runtime: RuntimeSpec<'_>) -> Result<(), BackendError> {
+    let version = |role| {
+        runtime
+            .images
+            .get(&role)
+            .and_then(|image| image.tag.as_deref())
+            .ok_or_else(|| BackendError::Infrastructure("runtime version is missing".into()))
+    };
+    let agent_version = version(ImageRole::Agent)?;
+    let message_version = version(ImageRole::MessageServer)?;
+    for (program, arguments) in [
+        (
+            "/var/dirextalk-message-server/deploy/split-agent/scripts/update-agent-local.sh",
+            vec![SPLIT_OUTPUT_DIR, agent_version, message_version],
+        ),
+        (
+            "/var/dirextalk-message-server/deploy/split-agent/scripts/update-message-server-local.sh",
+            vec![SPLIT_OUTPUT_DIR, message_version],
+        ),
+    ] {
+        let output = Command::new(program)
+            .args(arguments)
+            .output()
+            .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+        if output.status.code() != Some(3) {
+            return Err(BackendError::Infrastructure(format!(
+                "{program} did not confirm the installed update contract: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
     }
     Ok(())
 }
@@ -2292,6 +2578,24 @@ fn run_program(program: &str, arguments: &[&str]) -> Result<std::process::Output
     let output = Command::new(program)
         .args(arguments)
         .env("DEBIAN_FRONTEND", "noninteractive")
+        .output()
+        .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(command_failure(program, &output))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_program_with_env(
+    program: &str,
+    arguments: &[&str],
+    environment: &BTreeMap<String, String>,
+) -> Result<std::process::Output, BackendError> {
+    let output = Command::new(program)
+        .args(arguments)
+        .envs(environment)
         .output()
         .map_err(|error| BackendError::Infrastructure(error.to_string()))?;
     if output.status.success() {
@@ -2650,14 +2954,11 @@ mod tests {
             "v1.2.3",
             images("v1.2.3"),
             BundleAssets {
-                compose_file: b"services: {}".to_vec(),
                 caddyfile: b"{$DOMAIN}".to_vec(),
-                message_server_initializer: b"#!/bin/sh".to_vec(),
-                agent_secret_materializer: b"#!/bin/sh".to_vec(),
-                message_server_entrypoint: b"#!/bin/sh".to_vec(),
-                capability_ca_initializer: b"#!/bin/sh".to_vec(),
-                postgres_entrypoint: b"#!/bin/sh".to_vec(),
-                postgres_initializer: b"#!/bin/sh".to_vec(),
+                edge_compose_override: b"services: {}".to_vec(),
+                product_bootstrap_reader: b"#!/bin/sh".to_vec(),
+                runtime_verifier: b"#!/bin/sh".to_vec(),
+                split_runtime_archive: b"archive".to_vec(),
                 updater_binary: b"updater".to_vec(),
                 updater_unit: b"[Service]".to_vec(),
                 updater_version: "v1.0.19".into(),
@@ -2820,14 +3121,11 @@ mod tests {
                 "v1.2.3",
                 invalid_images,
                 BundleAssets {
-                    compose_file: b"services: {}".to_vec(),
                     caddyfile: b"{$DOMAIN}".to_vec(),
-                    message_server_initializer: b"#!/bin/sh".to_vec(),
-                    agent_secret_materializer: b"#!/bin/sh".to_vec(),
-                    message_server_entrypoint: b"#!/bin/sh".to_vec(),
-                    capability_ca_initializer: b"#!/bin/sh".to_vec(),
-                    postgres_entrypoint: b"#!/bin/sh".to_vec(),
-                    postgres_initializer: b"#!/bin/sh".to_vec(),
+                    edge_compose_override: b"services: {}".to_vec(),
+                    product_bootstrap_reader: b"#!/bin/sh".to_vec(),
+                    runtime_verifier: b"#!/bin/sh".to_vec(),
+                    split_runtime_archive: b"archive".to_vec(),
                     updater_binary: b"updater".to_vec(),
                     updater_unit: b"[Service]".to_vec(),
                     updater_version: "v1.0.19".into(),
@@ -2881,14 +3179,11 @@ mod tests {
             "stable-2026-08-20",
             resolved.clone(),
             BundleAssets {
-                compose_file: b"services: {}".to_vec(),
                 caddyfile: b"{$DOMAIN}".to_vec(),
-                message_server_initializer: b"#!/bin/sh".to_vec(),
-                agent_secret_materializer: b"#!/bin/sh".to_vec(),
-                message_server_entrypoint: b"#!/bin/sh".to_vec(),
-                capability_ca_initializer: b"#!/bin/sh".to_vec(),
-                postgres_entrypoint: b"#!/bin/sh".to_vec(),
-                postgres_initializer: b"#!/bin/sh".to_vec(),
+                edge_compose_override: b"services: {}".to_vec(),
+                product_bootstrap_reader: b"#!/bin/sh".to_vec(),
+                runtime_verifier: b"#!/bin/sh".to_vec(),
+                split_runtime_archive: b"archive".to_vec(),
                 updater_binary: b"updater".to_vec(),
                 updater_unit: b"[Service]".to_vec(),
                 updater_version: "v1.0.19".into(),
@@ -2909,14 +3204,11 @@ mod tests {
                 "stable-2026-08-20",
                 resolved,
                 BundleAssets {
-                    compose_file: b"services: {}".to_vec(),
                     caddyfile: b"{$DOMAIN}".to_vec(),
-                    message_server_initializer: b"#!/bin/sh".to_vec(),
-                    agent_secret_materializer: b"#!/bin/sh".to_vec(),
-                    message_server_entrypoint: b"#!/bin/sh".to_vec(),
-                    capability_ca_initializer: b"#!/bin/sh".to_vec(),
-                    postgres_entrypoint: b"#!/bin/sh".to_vec(),
-                    postgres_initializer: b"#!/bin/sh".to_vec(),
+                    edge_compose_override: b"services: {}".to_vec(),
+                    product_bootstrap_reader: b"#!/bin/sh".to_vec(),
+                    runtime_verifier: b"#!/bin/sh".to_vec(),
+                    split_runtime_archive: b"archive".to_vec(),
                     updater_binary: b"updater".to_vec(),
                     updater_unit: b"[Service]".to_vec(),
                     updater_version: "v1.0.19".into(),
@@ -2980,69 +3272,64 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn turn_contract_is_credential_backed_3478_without_tls_listener() {
-        let (request, _, _, _) = fixture();
-        let request: InstallRequest = parse_canonical_json(&request).unwrap();
-        let config = render_turn_config(
-            &request,
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        );
-        assert!(config.contains("listening-port=3478\n"));
-        assert!(config.contains("use-auth-secret\nstatic-auth-secret="));
-        assert!(config.contains("no-tls\nno-dtls\n"));
-        assert!(config.contains(&format!("external-ip={}\n", request.public_ipv4)));
-        assert!(!config.contains("5349"));
+    fn split_runtime_preserves_the_complete_agent_topology() {
+        let compose = include_str!("../../../runtime/split-agent/compose.yaml");
+        for service in ["agent", "extension-runner", "core-runner"] {
+            assert!(compose.contains(&format!("  {service}:\n")));
+        }
+        for contract in [
+            "DIREXTALK_CORE_EXTENSION_RUNNER_DIR",
+            "DIREXTALK_CORE_WORKLOAD_RUNNER_DIR",
+            "DIREXTALK_EXTENSION_CGROUP_ROOT",
+            "DIREXTALK_CORE_RUNNER_CGROUP_ROOT",
+            "dirextalk-runner-userns",
+            "agent_extension_state",
+            "core_runner_state",
+        ] {
+            assert!(compose.contains(contract), "missing {contract}");
+        }
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn agent_retained_worker_state_uses_the_persistent_staging_root() {
-        let (request, _, _, _) = fixture();
-        let request: InstallRequest = parse_canonical_json(&request).unwrap();
-        let config = render_agent_config(&request, Uuid::new_v4());
-        assert!(
-            config.contains(
-                "core_extension_staging_root: /var/lib/dirextalk-agent/extension-staging\n"
-            )
-        );
-        let compose = include_str!("../../../runtime/docker-compose.yml");
-        assert!(compose.contains("agent_core_data:/var/lib/dirextalk-agent/extension-staging"));
+    fn split_provisioner_enables_local_core_without_cloud_worker() {
+        let provisioner = include_str!("../../../runtime/split-agent/scripts/provision-local.sh");
+        for setting in [
+            "core_extension_enabled: $core_extension_enabled",
+            "core_static_sites_enabled: true",
+            "core_workload_enabled: $core_workload_enabled",
+            "core_knowledge_enabled: true",
+        ] {
+            assert!(provisioner.contains(setting), "missing {setting}");
+        }
+        assert!(provisioner.contains("DIREXTALK_CLOUD_WORKER_HOST_REGION"));
+        assert!(provisioner.contains("cloud_worker_host_region\" != disabled"));
+        let updater = include_str!("../../../runtime/split-agent/scripts/update-agent-local.sh");
+        assert!(updater.contains("if [ \"$host_region\" = disabled ]"));
     }
 
     #[test]
     fn runtime_bundle_roles_have_exact_paths_and_modes() {
         let expected = [
-            (BundleRole::ComposeFile, "runtime/docker-compose.yml", 0o644),
             (BundleRole::Caddyfile, "runtime/Caddyfile", 0o444),
             (
-                BundleRole::MessageServerInitializer,
-                "runtime/initialize-message-server.sh",
+                BundleRole::EdgeComposeOverride,
+                "runtime/edge-compose.override.yaml",
+                0o444,
+            ),
+            (
+                BundleRole::ProductBootstrapReader,
+                "runtime/read-product-bootstrap.sh",
                 0o555,
             ),
             (
-                BundleRole::AgentSecretMaterializer,
-                "runtime/materialize-agent-secrets.sh",
+                BundleRole::RuntimeVerifier,
+                "runtime/verify-runtime.sh",
                 0o555,
             ),
             (
-                BundleRole::MessageServerEntrypoint,
-                "runtime/message-server-entrypoint.sh",
-                0o555,
-            ),
-            (
-                BundleRole::CapabilityCaInitializer,
-                "runtime/initialize-capability-ca.sh",
-                0o555,
-            ),
-            (
-                BundleRole::PostgresEntrypoint,
-                "runtime/postgres-entrypoint.sh",
-                0o555,
-            ),
-            (
-                BundleRole::PostgresInitializer,
-                "runtime/initialize-postgres.sh",
-                0o555,
+                BundleRole::SplitRuntimeArchive,
+                "runtime/split-agent-runtime.tar.gz",
+                0o444,
             ),
             (
                 BundleRole::UpdaterBinary,
@@ -3192,6 +3479,6 @@ mod portable_compile_tests {
             .exit_code(),
             2
         );
-        assert_eq!(BundleRole::required().len(), 10);
+        assert_eq!(BundleRole::required().len(), 7);
     }
 }

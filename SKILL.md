@@ -47,13 +47,20 @@ DNS continuation and resumptions that preserve the same intent; it does not
 cover a changed domain, project, region, machine profile, budget, unexpected
 DNS replacement, or a later destroy.
 
+For a first-time user who is missing an account, billing-enabled project, or
+domain, read [references/gcp-onboarding.md](references/gcp-onboarding.md) and
+guide only the next blocking setup action. Skip every onboarding step already
+proved by authenticated project inspection or information the user supplied.
+
 ## Lifecycle
 
-1. Ask only for missing user decisions. Always offer economy `e2-small`
-   (default; two shared vCPUs, 2 GiB) and standard `e2-custom-2-4096` (two fully
-   billable vCPUs, 4 GiB), ask for the monthly budget, and ask which long-lived
-   domain to use when none was supplied. Select or confirm the GCP region when
-   it is not already clear. Copy `examples/deployment.toml` outside the
+1. Ask only for missing user decisions. Use the onboarding reference when the
+   user still needs an account, project, billing, or domain. Always offer
+   economy `e2-small` (default; two shared vCPUs, 2 GiB) and standard
+   `e2-custom-2-4096` (two fully billable vCPUs, 4 GiB), ask for the monthly
+   budget, and ask which long-lived domain to use when none was supplied. Select
+   or confirm the GCP region when it is not already clear. Copy
+   `examples/deployment.toml` outside the
    repository and replace all example values. Use
    `operator_ssh_cidr = "0.0.0.0/0"` unless the user chooses a stable narrower
    IPv4 CIDR. Never add secrets to the config.
@@ -88,9 +95,13 @@ DNS replacement, or a later destroy.
    the currently journaled effect and stop, use `deploy resume --pending-only`;
    it must not start a later effect or host installation, and an idle state is
    an action-required result rather than permission to advance.
-8. Run `deploy verify`, then `connect install`, `connect status`, and
-   `connect doctor` when `install_connect = true`. Verification must remain
-   read-only and must not send normal chat.
+8. A successful `deploy apply` or full `deploy resume` returns the service
+   domain, HTTPS URL, and eight-digit initial login password in every output
+   format. Display the URL and password explicitly in the deployment result;
+   do not hide them merely because the CLI used JSON. Then run `deploy verify`,
+   `connect install`, `connect status`, and `connect doctor` when
+   `install_connect = true`. Verification must remain read-only and must not
+   send normal chat.
 9. To stop the node, generate the destroy plan, explain retained resources,
    obtain one natural-language destroy confirmation, and pass its internal plan
    identifier without exposing it. Confirm deletion with status and GCP
@@ -103,11 +114,14 @@ than resetting state.
 ## Secrets and billing
 
 Never ask the user to paste authorization codes or tokens, SSH private keys,
-Matrix or agent tokens, the App initialization code, service-account keys, or
-payment data. Do not print, persist, or place secrets in arguments, config,
-reports, or chat. Authentication credentials remain in the restricted isolated
-Dirextalk gcloud configuration; generated node secrets remain in the restricted
-service directory.
+Matrix or agent tokens, service-account keys, or payment data. Do not print,
+persist, or place those secrets in arguments, config, reports, or chat.
+Authentication credentials remain in the restricted isolated Dirextalk gcloud
+configuration; generated node secrets remain in the restricted service
+directory. The initial App login password is the intentional exception: show
+it once with the service URL in the successful deployment result because the
+operator needs it for first login. Do not repeat it in later status, verify,
+diagnostic, failure, or progress output.
 
 `maximum_monthly_usd` limits the accepted estimate, not the GCP bill. Normal
 destroy retains the boot disk, which can keep billing until a separate

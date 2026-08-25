@@ -44,6 +44,29 @@ pub fn validate_service_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates a local node directory name, including canonical DNS names.
+///
+/// # Errors
+///
+/// Returns [`CoreError::InvalidServiceId`] when the name could escape or
+/// alias its deployment directory.
+pub fn validate_node_directory_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 253
+        || value == "."
+        || value == ".."
+        || value.starts_with(['.', '-'])
+        || value.ends_with(['.', '-'])
+        || value.contains("..")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+    {
+        return Err(CoreError::InvalidServiceId);
+    }
+    Ok(())
+}
+
 fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 40
@@ -72,8 +95,19 @@ impl NodePaths {
     /// Returns [`CoreError::InvalidServiceId`] when `service_id` is unsafe.
     pub fn new(nodes_root: impl AsRef<Path>, service_id: &str) -> Result<Self> {
         validate_service_id(service_id)?;
+        Self::new_named(nodes_root, service_id)
+    }
+
+    /// Builds paths below an explicit nodes root using a user-facing name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidServiceId`] when `directory_name` is not
+    /// a bounded path-safe name.
+    pub fn new_named(nodes_root: impl AsRef<Path>, directory_name: &str) -> Result<Self> {
+        validate_node_directory_name(directory_name)?;
         Ok(Self {
-            root: nodes_root.as_ref().join(service_id),
+            root: nodes_root.as_ref().join(directory_name),
         })
     }
 
@@ -134,5 +168,7 @@ mod tests {
     fn path_helpers_reject_traversal() {
         assert!(NodePaths::new("/tmp/nodes", "../production").is_err());
         assert!(NodePaths::new("/tmp/nodes", "prod/child").is_err());
+        assert!(NodePaths::new_named("/tmp/nodes", "node.example.com").is_ok());
+        assert!(NodePaths::new_named("/tmp/nodes", "../node.example.com").is_err());
     }
 }

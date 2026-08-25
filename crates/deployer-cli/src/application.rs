@@ -7,6 +7,7 @@ use deployer_core::{
     BootDiskDisposition, DeploymentConfig, DeploymentPlan, DeploymentState, PlanDigest,
     ProgressEvent, ProgressOperation, ProgressStatus,
 };
+use secrecy::ExposeSecret as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -166,6 +167,7 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                     };
                     completion_envelope(
                         command_name(cli),
+                        &config.domain,
                         Orchestrator::new(self.control, &store)
                             .apply(&plan, &approved)
                             .await?,
@@ -183,7 +185,11 @@ impl<'a, C: ControlPlane, F: StoreFactory> Application<'a, C, F> {
                             "The journaled effect was identity-verified and recorded; no later effect was started.",
                         ))
                     } else {
-                        completion_envelope(command_name(cli), orchestrator.resume(&config).await?)
+                        completion_envelope(
+                            command_name(cli),
+                            &config.domain,
+                            orchestrator.resume(&config).await?,
+                        )
                     }
                 }
                 DeployCommand::Status(args) => {
@@ -397,16 +403,25 @@ fn remove_oauth_principal(value: &mut Value) {
     }
 }
 
-fn completion_envelope(command: &str, completion: Completion) -> EngineResult<CommandEnvelope> {
+fn completion_envelope(
+    command: &str,
+    domain: &str,
+    completion: Completion,
+) -> EngineResult<CommandEnvelope> {
     match completion {
         Completion::Complete {
             initialization_code,
-        } => Ok(CommandEnvelope::success(
+        } => CommandEnvelope::success(
             command,
             "DEPLOY_COMPLETE",
-            "Dirextalk deployment and local verification are complete.",
+            "Dirextalk deployment and local verification are complete. Save the initial login password.",
         )
-        .with_human_initialization_code(initialization_code)),
+        .with_data(json!({
+            "service_domain": domain,
+            "service_url": format!("https://{domain}"),
+            "initial_login_password": initialization_code.expose_secret(),
+        }))
+        .map_err(|_| EngineError::Backend("completion output could not be encoded".into())),
         Completion::WaitingExternalDns { name, value } => CommandEnvelope::waiting(
             command,
             "DNS_RECORD_REQUIRED",
@@ -468,6 +483,7 @@ pub fn command_name(cli: &Cli) -> &'static str {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use secrecy::SecretString;
 
     use super::*;
     use crate::output::OutcomeStatus;
@@ -491,6 +507,35 @@ mod tests {
                 .expect("JSON")
                 .contains("secret")
         );
+    }
+
+    #[test]
+    fn deployment_completion_exposes_domain_url_and_initial_login_password() {
+        let envelope = completion_envelope(
+            "deploy.apply",
+            "a2.zhangsan.dev",
+            Completion::Complete {
+                initialization_code: SecretString::from("12345678".to_owned()),
+            },
+        )
+        .expect("completion envelope");
+
+        assert_eq!(envelope.code, "DEPLOY_COMPLETE");
+        assert_eq!(envelope.data["service_domain"], "a2.zhangsan.dev");
+        assert_eq!(envelope.data["service_url"], "https://a2.zhangsan.dev");
+        assert_eq!(envelope.data["initial_login_password"], "12345678");
+
+        for format in [
+            crate::cli::OutputFormat::Human,
+            crate::cli::OutputFormat::Json,
+            crate::cli::OutputFormat::Jsonl,
+        ] {
+            let mut rendered = Vec::new();
+            crate::output::render(&envelope, format, &mut rendered).expect("render");
+            let rendered = String::from_utf8(rendered).expect("UTF-8");
+            assert!(rendered.contains("a2.zhangsan.dev"));
+            assert!(rendered.contains("12345678"));
+        }
     }
 
     #[test]

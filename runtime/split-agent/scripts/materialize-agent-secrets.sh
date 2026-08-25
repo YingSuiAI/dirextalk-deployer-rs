@@ -7,8 +7,9 @@ for item in database_url core_secret_master_key message_mcp_token; do
 done
 install -m 0400 /bootstrap/capability/agent-server-cert.pem /out/tls_cert
 install -m 0400 /bootstrap/capability/agent-server-key.pem /out/tls_key
-# Materialize the fixed Message Server-to-Agent capability only as Agent's
-# internal service_token; Message Server never consumes this private copy.
+# Keep the established private-volume filename so existing nodes can update
+# without rotating the Agent Core service credential. It is materialized only
+# as Agent's internal service_token; Message Server never consumes it.
 install -m 0400 /bootstrap/capability/ms-to-agent.token /out/service_token
 install -m 0400 /bootstrap/capability/grant-public.key /out/grant_public_key
 install -m 0400 /bootstrap/capability/ca-cert.pem /out/product_ca

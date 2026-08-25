@@ -1,13 +1,17 @@
-{$DOMAIN} {
+{$DIREXTALK_PUBLIC_DOMAIN} {
 	handle /.well-known/matrix/server {
 		header Content-Type application/json
-		respond `{"m.server":"{$DOMAIN}:443"}` 200
+		respond `{"m.server":"{$DIREXTALK_PUBLIC_DOMAIN}:443"}` 200
 	}
 
 	handle /.well-known/matrix/client {
 		header Content-Type application/json
 		header Access-Control-Allow-Origin *
-		respond `{"m.homeserver":{"base_url":"https://{$DOMAIN}"}}` 200
+		respond `{"m.homeserver":{"base_url":"https://{$DIREXTALK_PUBLIC_DOMAIN}"}}` 200
+	}
+
+	handle /.well-known/portal/* {
+		reverse_proxy message-server:8008
 	}
 
 	handle /_dirextalk/updater/v1/jobs/* {
@@ -18,6 +22,36 @@
 		reverse_proxy agent:8082 {
 			flush_interval -1
 		}
+	}
+
+	handle /_matrix/* {
+		reverse_proxy message-server:8008
+	}
+
+	handle /_dendrite/* {
+		reverse_proxy message-server:8008
+	}
+
+	handle /_synapse/* {
+		reverse_proxy message-server:8008
+	}
+
+	handle /_p2p/* {
+		reverse_proxy message-server:8008
+	}
+
+	handle_path /.sites/* {
+		root * /srv/dirextalk-sites
+		header {
+			Content-Security-Policy "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; script-src 'none'; connect-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+			Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+			Cross-Origin-Resource-Policy "same-origin"
+			Cache-Control "public, max-age=31536000, immutable"
+		}
+		file_server
 	}
 
 	handle {

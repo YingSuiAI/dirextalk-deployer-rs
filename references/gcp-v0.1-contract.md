@@ -26,12 +26,17 @@ zone, domain, DNS mode (`auto`, `cloud_dns`, or `external`), machine type,
 boot-disk size/type, operator SSH CIDR, maximum monthly USD, stable or exact
 release selection, and local connect agent. Unknown fields are rejected.
 
-State lives under `~/.dirextalk/nodes/<service_id>/state.json`. It is sealed,
-locked, and atomically replaced. It records project identity, phase,
+State lives under `~/.dirextalk/nodes/<domain>/state.json`; its authenticated
+payload retains a distinct project-bound service id. It is sealed, locked, and
+atomically replaced. It records project identity, phase,
 `PendingEffect`, exact release, GCP resource references, SSH host identity,
 host receipt, redacted local-wiring status, and integrity digest. Secrets live
-only in their owning restrictive credential stores and are excluded from
-state, reports, stdout, and JSONL.
+only in their owning restrictive credential stores and are excluded from state
+and reports. The only deliberate credential output is the eight-digit initial
+App login password: a successful `deploy apply` or full `deploy resume` emits
+it together with `service_domain` and `service_url` in human, JSON, and JSONL
+output. It is absent from status, verification, diagnostics, failures, and
+progress events.
 
 `project prepare --project <id>` is a distinct dry-first workflow for exactly
 `serviceusage.googleapis.com`, `cloudresourcemanager.googleapis.com`,
@@ -82,6 +87,12 @@ only a strict request, invokes fixed programs with typed argv, writes a signed
 receipt, installs the canonical production topology, and installs the pinned
 `dirextalk-updater` with its resident watchdog disabled.
 
+The Agent runtime uses the original three-container topology: `agent`,
+`extension-runner`, and `core-runner`. Its protected environment, manifest,
+cleanup receipt, runner isolation, update scripts, volumes, and networks are
+installed together. Update readiness is checked through the updater control
+socket and both receipt-bound update adapters.
+
 Cloud DNS auto mode selects the longest matching existing public managed zone.
 The initial approved intent binds the zone identity and observed A-record set;
 after its exact static address receipt is persisted, the deployer derives and
@@ -97,3 +108,6 @@ the eight-digit App initialization code, real `agent_room_id`, a service-scoped
 `dirextalk-connect` daemon, HTTP MCP initialization, tool discovery, and a
 read-only MCP call. Cloud Worker is reported as
 `disabled_by_product_scope`. Normal chat messages are never sent by validation.
+On successful completion, the initialization code is labeled as the initial
+login password and returned with the service domain and HTTPS URL so the
+operator can sign in immediately.

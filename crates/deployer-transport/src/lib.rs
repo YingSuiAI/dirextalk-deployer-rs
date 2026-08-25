@@ -20,7 +20,6 @@ const IO_TIMEOUT: Duration = Duration::from_mins(1);
 const HOST_INSTALL_TIMEOUT: Duration = Duration::from_mins(30);
 const MAX_COMMAND_OUTPUT: usize = 1024 * 1024;
 const MAX_BOOTSTRAP_RECEIPT: usize = 64 * 1024;
-const PRODUCT_BOOTSTRAP_PATH: &str = "/var/dirextalk-message-server/p2p/bootstrap.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,7 +132,7 @@ impl FixedRemoteCommand {
                 request_sha256
             ),
             Self::VerifyCanonicalRuntime => String::from(
-                "/usr/bin/sudo --non-interactive /usr/bin/docker compose --project-name dirextalk-p2p --file /var/dirextalk-message-server/docker-compose.yml ps --format json",
+                "/usr/bin/sudo --non-interactive /usr/local/libexec/dirextalk/verify-runtime.sh",
             ),
             Self::VerifyHttps { name } => format!(
                 "/usr/bin/curl --fail --silent --show-error --max-time 10 https://{}/_matrix/client/versions",
@@ -378,8 +377,8 @@ impl HostTransport for SshClient {
 }
 
 fn product_bootstrap_command() -> String {
-    format!(
-        "/usr/bin/sudo --non-interactive /usr/bin/docker compose --project-name dirextalk-p2p --file /var/dirextalk-message-server/docker-compose.yml exec --no-TTY message-server /bin/cat {PRODUCT_BOOTSTRAP_PATH}"
+    String::from(
+        "/usr/bin/sudo --non-interactive /usr/local/libexec/dirextalk/read-product-bootstrap.sh",
     )
 }
 
@@ -565,7 +564,7 @@ mod tests {
     fn product_bootstrap_is_read_from_the_fixed_message_server_service() {
         assert_eq!(
             product_bootstrap_command(),
-            "/usr/bin/sudo --non-interactive /usr/bin/docker compose --project-name dirextalk-p2p --file /var/dirextalk-message-server/docker-compose.yml exec --no-TTY message-server /bin/cat /var/dirextalk-message-server/p2p/bootstrap.json"
+            "/usr/bin/sudo --non-interactive /usr/local/libexec/dirextalk/read-product-bootstrap.sh"
         );
     }
     use std::collections::VecDeque;

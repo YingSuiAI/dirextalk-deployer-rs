@@ -1,0 +1,9 @@
+services:
+  caddy:
+    volumes:
+      - type: bind
+        source: /run/dirextalk-updater
+        target: /run/dirextalk-updater
+        read_only: true
+        bind:
+          create_host_path: false

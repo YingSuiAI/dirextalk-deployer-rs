@@ -12,31 +12,21 @@ use std::process::Command;
 #[test]
 fn builder_reads_seed_from_restrictive_file_and_emits_redacted_report() {
     let directory = tempfile::tempdir().unwrap();
-    let compose = directory.path().join("docker-compose.yml");
     let caddyfile = directory.path().join("Caddyfile");
-    let message_server_initializer = directory.path().join("initialize-message-server.sh");
-    let agent_secret_materializer = directory.path().join("materialize-agent-secrets.sh");
-    let message_server_entrypoint = directory.path().join("message-server-entrypoint.sh");
-    let capability_ca_initializer = directory.path().join("initialize-capability-ca.sh");
-    let postgres_entrypoint = directory.path().join("postgres-entrypoint.sh");
-    let postgres_initializer = directory.path().join("initialize-postgres.sh");
+    let edge_compose_override = directory.path().join("edge-compose.override.yaml");
+    let product_bootstrap_reader = directory.path().join("read-product-bootstrap.sh");
+    let runtime_verifier = directory.path().join("verify-runtime.sh");
+    let split_runtime_archive = directory.path().join("split-agent-runtime.tar.gz");
     let updater = directory.path().join("dirextalk-updater");
     let unit = directory.path().join("dirextalk-updater.service");
     let seed = directory.path().join("release-signing.seed");
     let request_path = directory.path().join("request.json");
     let output_path = directory.path().join("release-bundle.tar");
-    fs::write(&compose, b"services: {}").unwrap();
     fs::write(&caddyfile, b"{$DOMAIN}").unwrap();
-    for helper in [
-        &message_server_initializer,
-        &agent_secret_materializer,
-        &message_server_entrypoint,
-        &capability_ca_initializer,
-        &postgres_entrypoint,
-        &postgres_initializer,
-    ] {
-        fs::write(helper, b"#!/bin/sh\nexit 0\n").unwrap();
-    }
+    fs::write(&edge_compose_override, b"services: {}").unwrap();
+    fs::write(&split_runtime_archive, b"archive").unwrap();
+    fs::write(&product_bootstrap_reader, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(&runtime_verifier, b"#!/bin/sh\nexit 0\n").unwrap();
     fs::write(&updater, b"updater-binary").unwrap();
     fs::write(&unit, b"[Service]").unwrap();
     fs::write(&seed, [7; 32]).unwrap();
@@ -72,14 +62,11 @@ fn builder_reads_seed_from_restrictive_file_and_emits_redacted_report() {
         schema_version: 1,
         release: "stable-2026-08-20".into(),
         images,
-        compose_path: compose,
         caddyfile_path: caddyfile,
-        message_server_initializer_path: message_server_initializer,
-        agent_secret_materializer_path: agent_secret_materializer,
-        message_server_entrypoint_path: message_server_entrypoint,
-        capability_ca_initializer_path: capability_ca_initializer,
-        postgres_entrypoint_path: postgres_entrypoint,
-        postgres_initializer_path: postgres_initializer,
+        edge_compose_override_path: edge_compose_override,
+        product_bootstrap_reader_path: product_bootstrap_reader,
+        runtime_verifier_path: runtime_verifier,
+        split_runtime_archive_path: split_runtime_archive,
         updater_binary_path: updater.clone(),
         updater_unit_path: unit,
         updater_version: "v1.0.19".into(),

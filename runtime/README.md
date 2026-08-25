@@ -1,25 +1,28 @@
 # Signed GCP runtime assets
 
-These files are the root-owned, GCP v0.1 production topology embedded in the
-signed Linux runtime bundle. They are not host lifecycle scripts. The six shell
-files are mounted only as fixed Compose `configs` and execute inside their
-declared containers.
+`split-agent/` is the single production runtime source used by the Rust GCP
+deployer. Release packaging creates a deterministic signed archive from this
+tree; the host installer expands that archive under
+`/var/dirextalk-message-server/deploy/split-agent`.
 
-The Compose project is always `dirextalk-p2p` and contains PostgreSQL, coturn,
-Message Server initialization/runtime, Agent secret initialization/migration/
-runtime, and Caddy. AWS Cloud Worker, GCP Cloud Worker, extension runner, and
-Core runner services are intentionally absent in v0.1. Cloud Worker remains
-`disabled_by_product_scope`.
+The application Compose project contains PostgreSQL, coturn, Message Server,
+the main Agent, `extension-runner`, `core-runner`, and their fixed initialization
+services. The two runners retain the original socket, persistent-volume,
+delegated cgroup-v2, systemd, UID and AppArmor contracts. The independent edge
+Compose project uses `Caddyfile` and `edge-compose.override.yaml` so it can reach
+the Message Server, Agent, static-site root and updater Unix socket.
 
-The deployer writes a protected `.env`, `agent-config.yaml`, and `secrets/`
-beside the installed `/var/dirextalk-message-server/docker-compose.yml` only
-after immutable project/host identity validation. `MESSAGE_SERVER_IMAGE`,
-`AGENT_IMAGE`, `POSTGRES_IMAGE`, `UTILITY_IMAGE`, `CADDY_IMAGE`, and
-`COTURN_IMAGE` must be the exact tag-and-digest references from the signed
-manifest. `DOMAIN` is the reviewed production domain. Secrets never belong in
-the `.env` file.
+`provision-local.sh` enables local extensions, workloads, static sites and
+knowledge. AWS Cloud Worker remains disabled for the GCP product scope; the
+protected `disabled` receipt is retained solely so Agent updates preserve that
+decision.
 
-Release CI parses the Compose template without interpolation and requires every
-service to use exactly one of those signed image variables. Local builds and
-unallowlisted images are rejected. Image layers are pulled by digest on the
-verified server and are never embedded in the release bundle.
+`read-product-bootstrap.sh` and `verify-runtime.sh` are fixed root-owned host
+entrypoints used by connect and verify. They resolve the generated split stack
+only from its protected `.env` and `.manifest`; callers cannot supply a Compose
+path, project or command.
+
+Release CI validates both Compose projects and requires every service image to
+come from the signed six-role image manifest. Application images are pulled by
+digest and bound to their exact version tags because the updater records and
+checks those immutable release identities.

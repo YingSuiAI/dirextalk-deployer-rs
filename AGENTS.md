@@ -32,9 +32,12 @@ cloud effects, host installation, local wiring, or destroy behavior.
   postcondition, revalidate project number plus the strongest immutable
   resource identity available.
 - Never log or copy gcloud credentials or access tokens, Matrix tokens, agent
-  tokens, private keys, the App initialization code, or conversation content
-  into deployment state, JSON/JSONL, or reports. Restrict the isolated
-  Dirextalk `CLOUDSDK_CONFIG` to its owning user.
+  tokens, private keys, or conversation content into deployment state,
+  JSON/JSONL, or reports. The sole deliberate credential output is the
+  eight-digit initial App login password in a successful `deploy apply` or
+  `deploy resume` completion envelope; emit it with the service domain and URL
+  in every output format, and nowhere else. Restrict the isolated Dirextalk
+  `CLOUDSDK_CONFIG` to its owning user.
 - A dry plan never mutates GCP. Apply and destroy require the exact current
   SHA-256 plan approval.
 - Keep generated files under `~/.dirextalk/nodes/<service_id>/`, use atomic

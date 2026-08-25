@@ -17,6 +17,7 @@ path = "src/bin/bundle_builder.rs"
 [dependencies]
 clap = { workspace = true }
 ed25519-dalek = "3.0.0"
+flate2 = "1.1.2"
 hex = { workspace = true }
 hmac = "0.13.0"
 serde = { workspace = true }
